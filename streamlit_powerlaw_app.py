@@ -1,13 +1,15 @@
+# streamlit_powerlaw_app.py  –  BTC Purchase Indicator
+# ---------------------------------------------------
 import io, requests, pandas as pd, numpy as np, streamlit as st
 import plotly.graph_objects as go
 from streamlit_plotly_events import plotly_events
 
-UA = {"User-Agent": "btc-pl-tool/1.0"}
-GENESIS   = pd.Timestamp("2009-01-03")
-FD_SUPPLY = 21_000_000              # fully‑diluted BTC
-GRID_D    = "M24"                   # vertical grid every 24 months
+UA         = {"User-Agent": "btc-pl-tool/1.0"}
+GENESIS    = pd.Timestamp("2009-01-03")
+FD_SUPPLY  = 21_000_000              # fully‑diluted BTC
+GRID_D     = "M24"                   # vertical grid every 2 years
 
-# ────────────────  three raw loaders  ────────────────
+# ─────────────────── raw loaders ────────────────────
 def _coinmetrics():
     url = ("https://api.coinmetrics.io/v4/timeseries/asset-metrics"
            "?assets=btc&metrics=PriceUSD&frequency=1d&start_time=2010-01-01")
@@ -21,7 +23,8 @@ def _coingecko():
     url = ("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
            "?vs_currency=usd&days=max&interval=daily")
     r = requests.get(url, headers=UA, timeout=15); r.raise_for_status()
-    df = pd.DataFrame(r.json()["prices"], columns=["ts", "Price"])
+    data = r.json()["prices"]
+    df = pd.DataFrame(data, columns=["ts", "Price"])
     df["Date"] = pd.to_datetime(df["ts"], unit="ms")
     return df[["Date", "Price"]]
 
@@ -31,19 +34,16 @@ def _stooq():
     df.columns = [c.lower() for c in df.columns]
     date_col  = [c for c in df.columns if "date"  in c][0]
     price_col = [c for c in df.columns if "close" in c or "price" in c][0]
-    clean = df[date_col].astype(str).str.replace(r"[^0-9\\-]", "", regex=True)
+    clean     = df[date_col].astype(str).str.replace(r"[^0-9\\-]", "", regex=True)
     df["Date"]  = pd.to_datetime(clean, format="%Y-%m-%d", errors="coerce")
     df["Price"] = pd.to_numeric(df[price_col], errors="coerce")
     return df.dropna(subset=["Date", "Price"]).sort_values("Date")[["Date", "Price"]]
 
-# ─────────────── diagnostic wrapper ────────────────
+# ────────────── diagnostic wrapper ──────────────
 def get_price_history() -> pd.DataFrame:
-    sources = [
-        ("CoinMetrics", _coinmetrics),
-        ("CoinGecko",   _coingecko),
-        ("Stooq CSV",   _stooq),
-    ]
-    for name, fn in sources:
+    for name, fn in [("CoinMetrics", _coinmetrics),
+                     ("CoinGecko",  _coingecko),
+                     ("Stooq CSV",  _stooq)]:
         try:
             df = fn()
             if not df.empty:
@@ -54,8 +54,6 @@ def get_price_history() -> pd.DataFrame:
     st.error("No price data from any source."); st.stop()
 
 # ───────────── power‑law helpers ─────────────
-def days_since_genesis(ts): return (ts - GENESIS).days
-
 def fit_power(df):
     X = np.log10((df["Date"] - GENESIS).dt.days.values)
     y = np.log10(df["Price"].values)
@@ -64,17 +62,17 @@ def fit_power(df):
     sigma   = np.std(y - mid_log)
     return mid_log, sigma
 
-# ─────────────  Streamlit UI  ─────────────
+# ───────────── Streamlit UI ─────────────
 st.set_page_config(page_title="BTC Purchase Indicator", layout="wide")
 
-raw = get_price_history()                         # ← now defined
+raw = get_price_history()                       # ← function is defined above
 mid_log, σ = fit_power(raw)
 
-# sidebar controls
-k        = st.sidebar.slider("σ band width", 0.5, 2.5, 1.0, 0.25)
-as_cap   = st.sidebar.toggle("Market‑Cap")        # your label
+# sidebar
+k      = st.sidebar.slider("σ band width", 0.5, 2.5, 1.0, 0.25)
+as_cap = st.sidebar.toggle("Market‑Cap")        # your label
 
-# compute bands
+# build bands
 raw["mid"]     = 10 ** mid_log
 raw["support"] = 10 ** (mid_log - σ * k)
 raw["resist"]  = 10 ** (mid_log + σ * k)
@@ -82,16 +80,15 @@ raw["resist"]  = 10 ** (mid_log + σ * k)
 df = raw.copy()
 y_title = "Price (USD)"
 if as_cap:
-    cols = ["Price", "mid", "support", "resist"]
-    df[cols] *= FD_SUPPLY
+    df[["Price", "mid", "support", "resist"]] *= FD_SUPPLY
     y_title = "Market‑Cap (USD)"
 
-# zone badge
+# zone
 p, s, r = df.iloc[-1][["Price", "support", "resist"]]
 zone = "🟢 Value" if p < s else "🔴 Frothy" if p > r else "⚪ Neutral"
 st.markdown(f"### **Current zone:** {zone}")
 
-# build figure
+# figure
 fig = go.Figure()
 fig.update_layout(
     template="plotly_dark",
@@ -111,10 +108,11 @@ fig.add_trace(go.Scatter(x=df["Date"], y=df["support"],
 fig.add_trace(go.Scatter(x=df["Date"], y=df["resist"],
                          name="+σ", line=dict(color="red", dash="dash")))
 
-# keep user zoom
+# zoom persistence
 if "xrange" in st.session_state:
     fig.update_xaxes(range=st.session_state["xrange"])
 
-ev = plotly_events(fig, override_height=620, key="evt", click_event=False)
-if ev and "xaxis.range[0]" in ev[0]:
-    st.session_state["xrange"] = [ev[0]["xaxis.range[0]"], ev[0]["xaxis.range[1]"]]
+events = plotly_events(fig, override_height=620, key="zoom", click_event=False)
+if events and "xaxis.range[0]" in events[0]:
+    st.session_state["xrange"] = [events[0]["xaxis.range[0]"],
+                                  events[0]["xaxis.range[1]"]]
