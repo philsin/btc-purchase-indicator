@@ -1,5 +1,6 @@
-streamlit>=1.30          # Streamlit runtime (already present but good to pin)
-pandas>=2.0              # data wrangling
-numpy>=1.24              # maths
-plotly>=5.18             # interactive chart
-requests>=2.31           # fetch CoinMetrics CSV
+streamlit>=1.30
+pandas>=2.0
+numpy>=1.24
+plotly>=5.18
+requests>=2.31
+streamlit-plotly-events>=0.0.6   # <‑‑ add this
