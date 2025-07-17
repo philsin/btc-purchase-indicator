@@ -12,6 +12,20 @@ FD_SUPPLY  = 21_000_000
 GRID_D     = "M24"                   # vertical grid every 2 years
 
 # ────── data loaders ─────────────────────────────────────────
+def get_price_history():
+    try:
+        df = _stooq()
+        if len(df) > 1000:
+            st.info(f"Loaded {len(df):,} rows from **Stooq CSV**")
+            return df
+        st.warning("Stooq returned <1000 rows, falling back to GitHub")
+    except Exception as e:
+        st.warning(f"Stooq failed → {e}")
+
+    df = _github()
+    st.info(f"Loaded {len(df):,} rows from **GitHub mirror**")
+    return df
+
 def _stooq():
     url = "https://stooq.com/q/d/l/?s=btcusd&i=d"
     df = pd.read_csv(url)
