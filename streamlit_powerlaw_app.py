@@ -92,17 +92,32 @@ fig = go.Figure(layout=dict(
     font=dict(family="Currency, monospace", size=12),
     xaxis=dict(type="date", title="Year", dtick=GRID_D,
                showgrid=True, gridwidth=0.5),
-    yaxis=dict(type="log",  title=y_title, tickformat="~,d",  # ← comma format
+    yaxis=dict(type="log",  title=y_title, tickformat=",d",   # comma format
                showgrid=True, gridwidth=0.5),
     plot_bgcolor="#111", paper_bgcolor="#111",
 ))
 
-# bands first
+# draw bands first (background)
 fig.add_trace(go.Scatter(x=df["Date"], y=df["mid"],
                          name="Mid‑line", line=dict(color="white", dash="dash")))
 fig.add_trace(go.Scatter(x=df["Date"], y=df["support"],
                          name="-σ", line=dict(color="green", dash="dash")))
 fig.add_trace(go.Scatter(x=df["Date"], y=df["resist"],
-                         name="+σ", line=dict(color="red", dash="dash")))
+                         name="+σ", line=dict(color="red",   dash="dash")))
 
-# BTC last
+# draw BTC last (foreground)
+fig.add_trace(go.Scatter(x=df["Date"], y=df["Price"],
+                         name="BTC", line=dict(color="gold", width=3)))
+
+# persistent zoom (optional)
+if "xrange" in st.session_state:
+    fig.update_xaxes(range=st.session_state["xrange"])
+
+# show the chart – this ALWAYS renders
+st.plotly_chart(fig, use_container_width=True)
+
+# to keep zoom between reruns, capture double‑click/box‑zoom events
+ev = plotly_events(fig, select_event=False, click_event=False, key="zoom")
+if ev and "xaxis.range[0]" in ev[0]:
+    st.session_state["xrange"] = [ev[0]["xaxis.range[0]"],
+                                  ev[0]["xaxis.range[1]"]]
