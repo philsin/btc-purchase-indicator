@@ -56,7 +56,7 @@ def fit_power(df):
 # ──────────── UI ─────────────
 st.set_page_config(page_title="BTC Purchase Indicator", layout="wide")
 
-raw = load_prices()
+raw = get_price_history()
 mid_log, σ = fit_power(raw)
 
 # sidebar
@@ -99,6 +99,24 @@ fig.add_trace(go.Scatter(x=df["Date"], y=df["support"],
                          name="-σ", line=dict(color="green", dash="dash")))
 fig.add_trace(go.Scatter(x=df["Date"], y=df["resist"],
                          name="+σ", line=dict(color="red", dash="dash")))
+
+### ─── diagnostic loader (drop‑in) ──────────────────────────────────
+def get_price_history() -> pd.DataFrame:
+    loaders = [
+        ("CoinMetrics", _coinmetrics),
+        ("CoinGecko",   _coingecko),
+        ("Stooq CSV",   _stooq),
+    ]
+    for name, fn in loaders:
+        try:
+            df = fn()
+            if not df.empty:
+                st.info(f"Loaded {len(df):,} rows from **{name}**")
+                return df
+        except Exception as e:
+            st.warning(f"{name} failed → {e}")
+    st.error("No price data from any source — check internet / rate‑limits.")
+    st.stop()
 
 # zoom persistence
 if "xrange" in st.session_state:
