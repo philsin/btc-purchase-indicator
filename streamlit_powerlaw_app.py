@@ -74,7 +74,7 @@ df["resist1"]  = 10 ** (mid_log + sigma)   # 1 σ above
 
 # ─── Sidebar controls ──────────────────────────────────────────────
 sigma_mult = st.sidebar.slider("σ band width", 0.5, 2.5, 1.0, 0.25)
-use_mcap   = st.sidebar.toggle("Show fully‑diluted Market‑Cap (21 M)")
+use_mcap   = st.sidebar.toggle("Show Market‑Cap")
 
 # ─── Data selection (Price vs Market‑Cap) ──────────────────────────
 if use_mcap:
