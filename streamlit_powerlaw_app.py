@@ -10,7 +10,7 @@ UA        = {"User-Agent": "btc-pl-tool/1.0"}
 GENESIS   = pd.Timestamp("2009-01-03")
 FD_SUPPLY = 21_000_000
 GRID_D    = "M24"                      # vertical grid every 2 years
-PROJ_END  = pd.Timestamp("2040‑12‑31")
+PROJ_END  = pd.Timestamp("2040-12-31")   # ← ordinary hyphens
 
 # ─── data loaders (Stooq → GitHub fallback) ─────────────────
 def _stooq():
