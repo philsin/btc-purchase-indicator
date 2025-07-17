@@ -117,7 +117,6 @@ fig = go.Figure(layout=dict(
     xaxis=dict(type="date", title="Year", dtick=GRID_D,
                showgrid=True, gridwidth=0.5),
     yaxis=dict(type="log",  title=y_title,
-               tickformat="$,d", tickprefix="$",
                showgrid=True, gridwidth=0.5),
     plot_bgcolor="#111", paper_bgcolor="#111",
 ))
