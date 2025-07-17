@@ -61,6 +61,30 @@ def get_price_history() -> pd.DataFrame:
             st.warning(f"{name} failed → {e}")
     st.error("No price data available."); st.stop()
 
+# ---- build figure ----
+fig = go.Figure(layout=dict(
+    template="plotly_dark",
+    font=dict(family="Currency, monospace", size=12),
+    xaxis=dict(type="date", title="Year", dtick=GRID_D,
+               showgrid=True, gridwidth=0.5),
+    yaxis=dict(type="log",  title=y_title,
+               showgrid=True, gridwidth=0.5),
+    plot_bgcolor="#111", paper_bgcolor="#111",
+))
+
+# 1️⃣ draw bands FIRST  (background)
+fig.add_trace(go.Scatter(x=df["Date"], y=df["mid"],
+                         name="Mid-line", line=dict(color="white", dash="dash")))
+fig.add_trace(go.Scatter(x=df["Date"], y=df["support"],
+                         name="-σ", line=dict(color="green", dash="dash")))
+fig.add_trace(go.Scatter(x=df["Date"], y=df["resist"],
+                         name="+σ", line=dict(color="red",   dash="dash")))
+
+# 2️⃣ draw BTC LAST  (foreground)
+fig.add_trace(go.Scatter(x=df["Date"], y=df["Price"],
+                         name="BTC", line=dict(color="gold", width=2.5)))
+
+
 # ────── power‑law helpers ────────────────────────────────────
 def fit_power(df):
     X = np.log10((df["Date"] - GENESIS).dt.days.values)
