@@ -1,22 +1,22 @@
 # ─────────────────────────────────────────────────────────────
 # streamlit_powerlaw_app.py  ·  BTC Purchase Indicator
-# full file – 2025‑07‑17
+# cleaned – commas on log axis
 # ─────────────────────────────────────────────────────────────
 import io, requests, pandas as pd, numpy as np, streamlit as st
 import plotly.graph_objects as go
 from streamlit_plotly_events import plotly_events
 
-UA         = {"User-Agent": "btc-pl-tool/1.0"}
-GENESIS    = pd.Timestamp("2009-01-03")
-FD_SUPPLY  = 21_000_000
-GRID_D     = "M24"                   # vertical grid every 24 months
+UA       = {"User-Agent": "btc-pl-tool/1.0"}
+GENESIS  = pd.Timestamp("2009-01-03")
+FD_SUPPLY = 21_000_000
+GRID_D   = "M24"
 
-# ────── data loaders ─────────────────────────────────────────
+# ─── data loaders (Stooq → GitHub fallback) ─────────────────
 def _stooq():
     url = "https://stooq.com/q/d/l/?s=btcusd&i=d"
     df = pd.read_csv(url)
     df.columns = [c.lower() for c in df.columns]
-    date_col  = [c for c in df.columns if "date"  in c][0]
+    date_col  = [c for c in df.columns if "date" in c][0]
     price_col = [c for c in df.columns if "close" in c or "price" in c][0]
 
     clean_date  = df[date_col].astype(str).str.replace(r"[^0-9\-]", "", regex=True)
@@ -36,8 +36,7 @@ def _github():
     df["Date"] = pd.to_datetime(df["Date"])
     return df[["Date", "Price"]]
 
-def get_price_history() -> pd.DataFrame:
-    # try Stooq first, fall back to GitHub mirror
+def get_price_history():
     try:
         df = _stooq()
         if len(df) > 1000:
@@ -51,55 +50,54 @@ def get_price_history() -> pd.DataFrame:
     st.info(f"Loaded {len(df):,} rows from **GitHub mirror**")
     return df
 
-# ────── power‑law helpers ────────────────────────────────────
+# ─── power‑law fit ───────────────────────────────────────────
 def fit_power(df):
-    X = np.log10((df["Date"] - GENESIS).dt.days.values)
-    y = np.log10(df["Price"].values)
+    X = np.log10((df["Date"] - GENESIS).dt.days)
+    y = np.log10(df["Price"])
     slope, intercept = np.polyfit(X, y, 1)
     mid_log = slope * X + intercept
     sigma   = np.std(y - mid_log)
     return mid_log, sigma
 
-# ────── Streamlit UI ─────────────────────────────────────────
+# ─── Streamlit layout ────────────────────────────────────────
 st.set_page_config(page_title="BTC Purchase Indicator", layout="wide")
 
 raw = get_price_history()
 mid_log, sigma = fit_power(raw)
-st.write("DEBUG σ =", sigma)   # ← delete after verifying
 
-# sidebar controls
+# sidebar
 k      = st.sidebar.slider("σ band width", 0.5, 2.5, 1.0, 0.25)
 as_cap = st.sidebar.toggle("Market‑Cap")
 
-# compute bands (enforce minimum σ so bands are always visible)
-sigma_vis  = max(sigma, 0.25)
+# bands
+sigma_vis = max(sigma, 0.25)
 raw["mid"]     = 10 ** mid_log
 raw["support"] = 10 ** (mid_log - sigma_vis * k)
 raw["resist"]  = 10 ** (mid_log + sigma_vis * k)
 
 df = raw.copy()
-y_title = "Price (USD)"
+y_title = "Price (USD)"
 if as_cap:
     df[["Price", "mid", "support", "resist"]] *= FD_SUPPLY
-    y_title = "Market‑Cap (USD)"
+    y_title = "Market‑Cap (USD)"
 
 # zone badge
 p, s, r = df.iloc[-1][["Price", "support", "resist"]]
-zone = "🟢 Value" if p < s else "🔴 Frothy" if p > r else "⚪ Neutral"
+zone = "🟢 Value" if p < s else "🔴 Frothy" if p > r else "⚪ Neutral"
 st.markdown(f"### **Current zone:** {zone}")
 
-# ────── figure build ─────────────────────────────────────────
+# ─── figure ──────────────────────────────────────────────────
 fig = go.Figure(layout=dict(
     template="plotly_dark",
     font=dict(family="Currency, monospace", size=12),
     xaxis=dict(type="date", title="Year", dtick=GRID_D,
                showgrid=True, gridwidth=0.5),
-    yaxis=dict(type="log",  title=y_title,
+    yaxis=dict(type="log",  title=y_title, tickformat="~,d",  # ← comma format
                showgrid=True, gridwidth=0.5),
     plot_bgcolor="#111", paper_bgcolor="#111",
 ))
 
-# bands first (background)
+# bands first
 fig.add_trace(go.Scatter(x=df["Date"], y=df["mid"],
                          name="Mid‑line", line=dict(color="white", dash="dash")))
 fig.add_trace(go.Scatter(x=df["Date"], y=df["support"],
@@ -107,16 +105,4 @@ fig.add_trace(go.Scatter(x=df["Date"], y=df["support"],
 fig.add_trace(go.Scatter(x=df["Date"], y=df["resist"],
                          name="+σ", line=dict(color="red", dash="dash")))
 
-# BTC last (foreground)
-fig.add_trace(go.Scatter(x=df["Date"], y=df["Price"],
-                         name="BTC", line=dict(color="gold", width=2.5)))
-
-# keep user zoom between reruns
-if "xrange" in st.session_state:
-    fig.update_xaxes(range=st.session_state["xrange"])
-
-ev = plotly_events(fig, override_height=620, key="zoom", click_event=False)
-if ev and "xaxis.range[0]" in ev[0]:
-    st.session_state["xrange"] = [ev[0]["xaxis.range[0]"],
-                                  ev[0]["xaxis.range[1]"]]
-# ─────────────────────────────────────────────────────────────
+# BTC last
