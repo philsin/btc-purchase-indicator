@@ -29,13 +29,6 @@ def fetch_prices() -> pd.DataFrame:
     except requests.RequestException:
         pass
 
-    # 3️⃣ Static mirror
-    gh = ("https://raw.githubusercontent.com/datasets/bitcoin-price/"
-          "master/data/bitcoin_price.csv")
-    df = pd.read_csv(gh)
-    df["Date"] = pd.to_datetime(df["Date"])
-    return df[["Date", "Closing Price (USD)"]].rename(columns={"Closing Price (USD)": "Price"})
-
 # ────────────────────── power‑law utilities ───────────────────────
 GENESIS = pd.Timestamp("2009-01-03")
 
