@@ -88,7 +88,7 @@ levels = {
     "Support":     -0.5,
     "PL Best Fit":  0.0,
     "Resistance":  +1.0,
-    "Top":         +2.0,
+    "Top":         +1.75,
 }
 colors = {
     "Base":        "red",
