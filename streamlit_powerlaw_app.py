@@ -123,4 +123,9 @@ if "xrange" in st.session_state:
 ev = plotly_events(fig, override_height=620, key="zoom", click_event=False)
 if ev and "xaxis.range[0]" in ev[0]:
     st.session_state["xrange"] = [ev[0]["xaxis.range[0]"], ev[0]["xaxis.range[1]"]]
+
+raw = get_price_history()
+mid_log, sigma = fit_power(raw)
+st.write("DEBUG  σ =", sigma)          # ← add this
+
 # ─────────────────────────────────────────────────────────────
