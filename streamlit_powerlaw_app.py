@@ -64,7 +64,7 @@ slope, intercept, σ = fit_power(hist)
 # ── anchor mid‑line to hit ~$500k on 2030‑01‑01 ──────────────
 anchor_date  = pd.Timestamp("2030-01-01")
 anchor_days  = (anchor_date - GENESIS).days
-target_price = 500_000     # USD
+target_price = 491_776     # USD
 
 target_log   = np.log10(target_price)
 intercept    = target_log - slope * np.log10(anchor_days)
