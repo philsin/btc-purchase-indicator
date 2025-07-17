@@ -1,32 +1,29 @@
 # ─────────────────────────────────────────────────────────────
-# streamlit_powerlaw_app.py  ·  BTC Purchase Indicator
-# fixed ±σ bands & custom zones
+# streamlit_powerlaw_app.py  ·  power‑law + fixed bands to 2040
 # ─────────────────────────────────────────────────────────────
 import io, requests, pandas as pd, numpy as np, streamlit as st
 import plotly.graph_objects as go
 from streamlit_plotly_events import plotly_events
+from datetime import datetime
 
 UA        = {"User-Agent": "btc-pl-tool/1.0"}
 GENESIS   = pd.Timestamp("2009-01-03")
 FD_SUPPLY = 21_000_000
-GRID_D    = "M24"          # vertical grid every 2 years
+GRID_D    = "M24"                      # vertical grid every 2 years
+PROJ_END  = pd.Timestamp("2040‑12‑31")
 
 # ─── data loaders (Stooq → GitHub fallback) ─────────────────
 def _stooq():
     url = "https://stooq.com/q/d/l/?s=btcusd&i=d"
     df = pd.read_csv(url)
     df.columns = [c.lower() for c in df.columns]
-    date_col  = [c for c in df.columns if "date"  in c][0]
+    date_col  = [c for c in df.columns if "date" in c][0]
     price_col = [c for c in df.columns if "close" in c or "price" in c][0]
 
-    clean_date  = df[date_col].astype(str).str.replace(r"[^0-9\-]", "", regex=True)
-    clean_price = (df[price_col].astype(str)
-                               .str.replace(",", "", regex=False)
-                               .str.replace(r"[^0-9.]", "", regex=True))
-
-    df = pd.DataFrame({"Date": clean_date, "Price": clean_price})
+    df = df.rename(columns={date_col: "Date", price_col: "Price"})
     df["Date"]  = pd.to_datetime(df["Date"], errors="coerce")
-    df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
+    df["Price"] = pd.to_numeric(df["Price"].astype(str)
+                                          .str.replace(",", ""), errors="coerce")
     return df.dropna().query("Price>0").sort_values("Date")
 
 def _github():
@@ -42,10 +39,8 @@ def get_price_history():
         if len(df) > 1000:
             st.info(f"Loaded {len(df):,} rows from **Stooq CSV**")
             return df
-        st.warning("Stooq returned <1000 rows, falling back to GitHub")
     except Exception as e:
         st.warning(f"Stooq failed → {e}")
-
     df = _github()
     st.info(f"Loaded {len(df):,} rows from **GitHub mirror**")
     return df
@@ -57,16 +52,22 @@ def fit_power(df):
     slope, intercept = np.polyfit(X, y, 1)
     mid_log = slope * X + intercept
     sigma   = np.std(y - mid_log)
-    return mid_log, sigma
+    return slope, intercept, sigma
 
 # ─── Streamlit page ──────────────────────────────────────────
 st.set_page_config(page_title="BTC Purchase Indicator", layout="wide")
 
-raw = get_price_history()
-mid_log, σ = fit_power(raw)
+hist = get_price_history()
+slope, intercept, σ = fit_power(hist)
 
-#  fixed bands
-σ_vis = max(σ, 0.25)
+# ─── build full timeline to 2040 ────────────────────────────
+future = pd.date_range(hist["Date"].iloc[-1], PROJ_END, freq="MS", closed="right")
+full   = pd.concat([hist, pd.DataFrame({"Date": future})], ignore_index=True)
+days   = (full["Date"] - GENESIS).dt.days
+mid_log = slope * np.log10(days) + intercept
+
+σ_vis = max(σ, 0.25)                  # ensure bands never collapse
+
 levels = {
     "Base":      -1.5,
     "Support":   -0.5,
@@ -76,38 +77,37 @@ levels = {
 }
 colors = {
     "Base":      "red",
-    "Support":   "rgba(255,100,100,1)",   # light red
+    "Support":   "rgba(255,100,100,1)",
     "PL Best Fit": "white",
-    "Resistance":"rgba(100,255,100,1)",   # light green
+    "Resistance":"rgba(100,255,100,1)",
     "Top":       "green",
 }
-styles = {n: ("dash" if n != "PL Best Fit" else "dash") for n in levels}
-
 for name, k in levels.items():
-    raw[name] = 10 ** (mid_log + σ_vis * k)
+    full[name] = 10 ** (mid_log + σ_vis * k)
 
-# optional Market‑Cap toggle
 as_cap = st.sidebar.toggle("Market‑Cap")
-df = raw.copy()
 y_title = "Price (USD)"
 if as_cap:
     band_cols = list(levels.keys())
-    df[["Price", *band_cols]] *= FD_SUPPLY
+    full[["Price", *band_cols]] = full[["Price", *band_cols]].fillna(method="ffill")
+    full[["Price", *band_cols]] *= FD_SUPPLY
     y_title = "Market‑Cap (USD)"
 
-# determine zone
-p = df.iloc[-1]["Price"]
-zones = [
-    ("SELL THE HOUSE!!",          -np.inf,       -1.5),
-    ("Buy",                       -1.5,          -0.5),
-    ("DCA",                       -0.5,           1.0),
-    ("Relax",                      1.0,           2.0),
-    ("Frothy",                     2.0,         np.inf),
-]
-for label, lo, hi in zones:
-    if lo*σ_vis + df.iloc[-1]["PL Best Fit"] < p <= hi*σ_vis + df.iloc[-1]["PL Best Fit"]:
-        zone = label
-        break
+# ─── zone badge based on latest row ─────────────────────────
+row = full.dropna(subset=["Price"]).iloc[-1]
+price = row["Price"]
+base, sup, res, top = row["Base"], row["Support"], row["Resistance"], row["Top"]
+
+if price < base:
+    zone = "SELL THE HOUSE!!"
+elif price < sup:
+    zone = "Buy"
+elif price < res:
+    zone = "DCA"
+elif price < top:
+    zone = "Relax"
+else:
+    zone = "Frothy"
 st.markdown(f"### **Current zone:** {zone}")
 
 # ─── figure ──────────────────────────────────────────────────
@@ -116,34 +116,25 @@ fig = go.Figure(layout=dict(
     font=dict(family="Currency, monospace", size=12),
     xaxis=dict(type="date", title="Year", dtick=GRID_D,
                showgrid=True, gridwidth=0.5),
-    yaxis=dict(type="log",  title=y_title,
-               tickformat="$,d",
+    yaxis=dict(type="log", title=y_title, tickformat="$,d",
                showgrid=True, gridwidth=0.5),
     plot_bgcolor="#111", paper_bgcolor="#111",
 ))
 
-# plot bands first
-for name, k in levels.items():
-    if name == "PL Best Fit":
-        continue
-    fig.add_trace(go.Scatter(
-        x=df["Date"], y=df[name],
-        name=name, line=dict(color=colors[name], dash=styles[name])
-    ))
+# bands (background)
+for name in ["Base", "Support", "Resistance", "Top"]:
+    fig.add_trace(go.Scatter(x=full["Date"], y=full[name],
+                             name=name, line=dict(color=colors[name], dash="dash")))
 
-# mid-line (white) on top of other bands
-fig.add_trace(go.Scatter(
-    x=df["Date"], y=df["PL Best Fit"],
-    name="PL Best Fit", line=dict(color="white", dash="dash")
-))
+# mid‑line
+fig.add_trace(go.Scatter(x=full["Date"], y=full["PL Best Fit"],
+                         name="PL Best Fit", line=dict(color="white", dash="dash")))
 
-# BTC price LAST (foreground)
-fig.add_trace(go.Scatter(
-    x=df["Date"], y=df["Price"],
-    name="BTC", line=dict(color="gold", width=3)
-))
+# BTC price last
+fig.add_trace(go.Scatter(x=hist["Date"], y=hist["Price"],
+                         name="BTC", line=dict(color="gold", width=3)))
 
-# keep zoom between reruns
+# persistent zoom
 if "xrange" in st.session_state:
     fig.update_xaxes(range=st.session_state["xrange"])
 
