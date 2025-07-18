@@ -123,7 +123,7 @@ for name in ["Bear", "Support"]:
                               name=f"{name} ({levels[name]:+.2f}σ)",
                               line=dict(color=colors[name], dash="dash")))
 fig1.add_trace(go.Scatter(x=hist["Date"], y=hist["Price"],
-                          name="BTC", line=dict(color="gold", width=3)))
+                          name="BTC", line=dict(color="gold", width=2)))
 
 if "xrange" in st.session_state:
     fig1.update_xaxes(range=st.session_state["xrange"])
