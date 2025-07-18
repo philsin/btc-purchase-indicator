@@ -114,7 +114,7 @@ if p < row["Support"]:
 elif p < row["Bear"]:
     zone = "Undervalued"
 elif p < row["Frothy"]:
-    zone = "Fair"
+    zone = "Fair Value"
 elif p < row["Top"]:
     zone = "Overvalued"
 else:
