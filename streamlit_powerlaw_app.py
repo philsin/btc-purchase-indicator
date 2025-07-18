@@ -86,6 +86,15 @@ colors = {
     "Frothy":      "rgba(100,255,100,1)",
     "Top":         "green",
 }
+
+labels = {
+    "Top":      "Top (+1.75σ)",
+    "Frothy":   "Frothy (+1.0σ)",
+    "Bear":     "Bear (-0.5σ)",
+    "Support":  "Support (-1.5σ)",
+    "PL Best Fit": "PL Best Fit"
+}
+
 for name, k in levels.items():
     full[name] = 10 ** (mid_log + σ_vis * k)
 
@@ -122,14 +131,6 @@ fig = go.Figure(layout=dict(
                showgrid=True, gridwidth=0.5),
     plot_bgcolor="#111", paper_bgcolor="#111",
 ))
-
-labels = {
-    "Top":      "Top (+1.75σ)",
-    "Frothy":   "Frothy (+1.0σ)",
-    "Bear":     "Bear (-0.5σ)",
-    "Support":  "Support (-1.5σ)",
-    "PL Best Fit": "PL Best Fit"
-}
 
 # legend: Top ▸ Frothy ▸ PL ▸ Bear ▸ Support ▸ BTC
 for name in ["Top", "Frothy"]:
