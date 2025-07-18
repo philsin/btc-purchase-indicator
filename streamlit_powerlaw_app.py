@@ -142,6 +142,16 @@ dma["50DMA"]  = dma["Price"].rolling(window=50).mean()
 dma["200DMA"] = dma["Price"].rolling(window=200).mean()
 dma = dma.dropna(subset=["50DMA", "200DMA"])
 
+# ── find dates where 200‑DMA crosses down through 50‑DMA
+cross_idx = dma.index[
+    (dma["200DMA"].shift(1) > dma["50DMA"].shift(1)) &   # 200 > 50 yesterday
+    (dma["200DMA"]        <= dma["50DMA"])               # 200 ≤ 50 today
+]
+
+cross_dates  = dma.loc[cross_idx, "Date"]
+cross_prices = dma.loc[cross_idx, "Price"]    # plot the marker at BTC price
+
+
 fig2 = go.Figure(layout=dict(
     template="plotly_dark",
     font=dict(family="Currency, monospace", size=12),
@@ -157,6 +167,11 @@ fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["50DMA"],
                           name="50‑DMA", line=dict(color="royalblue", width=1.5)))
 fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["Price"],
                           name="BTC", line=dict(color="gold", width=2)))
+fig2.add_trace(go.Scatter(x=cross_dates, y=cross_prices,
+                          name="Top Marker", mode="markers",
+                          marker=dict(symbol="diamond", color="red", size=9),
+))
+
 
 st.plotly_chart(fig2, use_container_width=True)
 # ─────────────────────────────────────────────────────────────
