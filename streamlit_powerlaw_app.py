@@ -154,7 +154,7 @@ for name in ["Bear", "Support"]:
     ))
 
 fig.add_trace(go.Scatter(x=hist["Date"], y=hist["Price"],
-                         name="BTC", line=dict(color="gold", width=3)))
+                         name="BTC", line=dict(color="gold", width=2)))
 
 # persistent zoom
 if "xrange" in st.session_state:
