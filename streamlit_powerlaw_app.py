@@ -176,7 +176,7 @@ fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["Price"],
                           name="BTC", line=dict(color="gold", width=2)))
 fig2.add_trace(go.Scatter(x=cross_dates, y=cross_prices,
                           name="Golden Cross", mode="markers",
-                          marker=dict(symbol="diamond", color="Gold", size=9),
+                          marker=dict(symbol="diamond", color="Green", size=9),
 ))
 
 
