@@ -143,14 +143,11 @@ dma["200DMA"] = dma["Price"].rolling(window=200).mean()
 dma = dma.dropna(subset=["50DMA", "200DMA"])
 
 # ── find dates where 200‑DMA crosses down through 50‑DMA
-cross_idx = dma.index[
-    (dma["200DMA"].shift(1) > dma["50DMA"].shift(1)) &   # 200 > 50 yesterday
-    (dma["200DMA"]        <= dma["50DMA"])               # 200 ≤ 50 today
-]
+diff = dma["200DMA"] - dma["50DMA"]
+cross_mask = (diff.shift(1) > 0) & (diff < 0)   # sign flips + → −
 
-cross_dates  = dma.loc[cross_idx, "Date"]
-cross_prices = dma.loc[cross_idx, "Price"]    # plot the marker at BTC price
-
+cross_dates  = dma.loc[cross_mask, "Date"]
+cross_prices = dma.loc[cross_mask, "Price"]      # put marker at BTC price
 
 fig2 = go.Figure(layout=dict(
     template="plotly_dark",
