@@ -150,7 +150,7 @@ prev_diff = diff.shift(1)
 cross_core = (prev_diff > 0) & (diff < 0)
 
 # 2. AND 200 DMA had been above 50 DMA for each of the prior 100 days
-above_100  = (prev_diff.rolling(window=100, min_periods=100)
+above_100  = (prev_diff.rolling(window=50, min_periods=50)
                         .apply(lambda x: (x > 0).all(), raw=True)
                         .astype(bool))
 
