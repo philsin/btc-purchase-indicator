@@ -1,9 +1,10 @@
 # ─────────────────────────────────────────────────────────────
 # streamlit_powerlaw_app.py  ·  BTC Purchase Indicator
-#  ▸ fixed bands  ▸ projection to 2040  ▸ 50‑DMA / 200‑DMA chart
+#  ▸ fixed bands  ▸ projection to 2040  ▸ DMA chart from 1‑Apr‑2012
 # ─────────────────────────────────────────────────────────────
 import io, requests, pandas as pd, numpy as np, streamlit as st
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from streamlit_plotly_events import plotly_events
 
 UA         = {"User-Agent": "btc-pl-tool/1.0"}
@@ -11,6 +12,7 @@ GENESIS    = pd.Timestamp("2009-01-03")
 FD_SUPPLY  = 21_000_000
 GRID_D     = "M24"
 PROJ_END   = pd.Timestamp("2040-12-31")
+DMA_START  = pd.Timestamp("2012-04-01")
 
 # ─── data loaders ────────────────────────────────────────────
 def _stooq():
@@ -61,7 +63,7 @@ future = pd.date_range(hist["Date"].iloc[-1] + pd.offsets.MonthBegin(1),
 full = pd.concat([hist, pd.DataFrame({"Date": future})], ignore_index=True)
 days = (full["Date"] - GENESIS).dt.days
 mid_log = slope * np.log10(days) + intercept
-σ_vis = max(σ, 0.25)
+σ_vis   = max(σ, 0.25)
 
 levels = {
     "Support":     -1.5,
@@ -103,7 +105,7 @@ else:
     zone = "TO THE MOON"
 st.markdown(f"### **Current zone:** {zone}")
 
-# ─── Chart 1: Power‑law bands ────────────────────────────────
+# ─── Chart 1: power‑law bands ───────────────────────────────
 fig1 = go.Figure(layout=dict(
     template="plotly_dark",
     font=dict(family="Currency, monospace", size=12),
@@ -114,7 +116,7 @@ fig1 = go.Figure(layout=dict(
 
 for name in ["Top", "Frothy"]:
     fig1.add_trace(go.Scatter(x=full["Date"], y=full[name],
-                              name=f"{name} (+{levels[name]:.2f}σ)".replace("+-","-"),
+                              name=f"{name} ({levels[name]:+.2f}σ)".replace("+-","-"),
                               line=dict(color=colors[name], dash="dash")))
 fig1.add_trace(go.Scatter(x=full["Date"], y=full["PL Best Fit"],
                           name="PL Best Fit", line=dict(color="white", dash="dash")))
@@ -125,19 +127,20 @@ for name in ["Bear", "Support"]:
 fig1.add_trace(go.Scatter(x=hist["Date"], y=hist["Price"],
                           name="BTC", line=dict(color="gold", width=2)))
 
+# keep zoom
 if "xrange" in st.session_state:
     fig1.update_xaxes(range=st.session_state["xrange"])
 st.plotly_chart(fig1, use_container_width=True)
 
-# capture zoom for persistence
 ev = plotly_events(fig1, select_event=False, click_event=False, key="zoom")
 if ev and "xaxis.range[0]" in ev[0]:
     st.session_state["xrange"] = [ev[0]["xaxis.range[0]"], ev[0]["xaxis.range[1]"]]
 
-# ─── Chart 2: BTC price + 50‑DMA & 200‑DMA ───────────────────
-hist_ma = hist.copy()
-hist_ma["50DMA"]  = hist_ma["Price"].rolling(window=50).mean()
-hist_ma["200DMA"] = hist_ma["Price"].rolling(window=200).mean()
+# ─── Chart 2: BTC, 50‑DMA, 200‑DMA (from 2012‑04‑01) ─────────
+dma = hist[hist["Date"] >= DMA_START].copy()
+dma["50DMA"]  = dma["Price"].rolling(window=50).mean()
+dma["200DMA"] = dma["Price"].rolling(window=200).mean()
+dma = dma.dropna(subset=["50DMA", "200DMA"])
 
 fig2 = go.Figure(layout=dict(
     template="plotly_dark",
@@ -148,12 +151,12 @@ fig2 = go.Figure(layout=dict(
     plot_bgcolor="#111", paper_bgcolor="#111",
 ))
 
-fig2.add_trace(go.Scatter(x=hist_ma["Date"], y=hist_ma["Price"],
-                          name="BTC", line=dict(color="gold", width=2.5)))
-fig2.add_trace(go.Scatter(x=hist_ma["Date"], y=hist_ma["50DMA"],
-                          name="50‑DMA", line=dict(color="royalblue", width=2)))
-fig2.add_trace(go.Scatter(x=hist_ma["Date"], y=hist_ma["200DMA"],
-                          name="200‑DMA", line=dict(color="purple", width=2)))
+fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["200DMA"],
+                          name="200‑DMA", line=dict(color="purple", width=1.5)))
+fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["50DMA"],
+                          name="50‑DMA", line=dict(color="royalblue", width=1.5)))
+fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["Price"],
+                          name="BTC", line=dict(color="gold", width=2)))
 
 st.plotly_chart(fig2, use_container_width=True)
 # ─────────────────────────────────────────────────────────────
