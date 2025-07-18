@@ -87,14 +87,14 @@ levels = {
     "Base":        -1.5,
     "Support":     -0.5,
     "PL Best Fit":  0.0,
-    "Resistance":  +1.0,
+    "Frothy":      +1.0,
     "Top":         +1.75,
 }
 colors = {
     "Base":        "red",
     "Support":     "rgba(255,100,100,1)",
     "PL Best Fit": "white",
-    "Resistance":  "rgba(100,255,100,1)",
+    "Frothy":      "rgba(100,255,100,1)",
     "Top":         "green",
 }
 for name, k in levels.items():
