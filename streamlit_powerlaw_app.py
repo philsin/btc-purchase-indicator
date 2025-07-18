@@ -124,12 +124,12 @@ fig = go.Figure(layout=dict(
 ))
 
 # legend / drawing order: Top ▸ Frothy ▸ PL ▸ Bear ▸ Support ▸ BTC
-for name in ["Top", "Frothy"]:
+for name in ["Top  (+1.75σ)", "Frothy (+1.0σ)"]:
     fig.add_trace(go.Scatter(x=full["Date"], y=full[name],
                              name=name, line=dict(color=colors[name], dash="dash")))
 fig.add_trace(go.Scatter(x=full["Date"], y=full["PL Best Fit"],
                          name="PL Best Fit", line=dict(color="white", dash="dash")))
-for name in ["Bear", "Support"]:
+for name in ["Bear (-0.5σ)", "Support (-1.5σ)"]:
     fig.add_trace(go.Scatter(x=full["Date"], y=full[name],
                              name=name, line=dict(color=colors[name], dash="dash")))
 fig.add_trace(go.Scatter(x=hist["Date"], y=hist["Price"],
