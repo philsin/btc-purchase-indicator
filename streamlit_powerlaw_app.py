@@ -147,7 +147,7 @@ diff = dma["200DMA"] - dma["50DMA"]
 cross_mask = (diff.shift(1) > 0) & (diff < 0)   # sign flips + → −
 
 cross_dates  = dma.loc[cross_mask, "Date"]
-cross_prices = dma.loc[cross_mask, "Price"]      # put marker at BTC price
+cross_prices = dma.loc[cross_mask, "200MDA"]      # put marker at BTC price
 
 fig2 = go.Figure(layout=dict(
     template="plotly_dark",
