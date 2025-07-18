@@ -112,7 +112,7 @@ if as_cap:
 # ─── zone badge based on latest row ─────────────────────────
 row   = full.dropna(subset=["Price"]).iloc[-1]
 p     = row["Price"]
-base, sup, res, top = row["Base"], row["Support"], row["Resistance"], row["Top"]
+base, sup, res, top = row["Base"], row["Support"], row["Frothy"], row["Top"]
 
 if p < base:
     zone = "SELL THE HOUSE!!"
@@ -138,7 +138,7 @@ fig = go.Figure(layout=dict(
 ))
 
 # bands first
-for name in ["Base", "Support", "Resistance", "Top"]:
+for name in ["Base", "Support", "Frothy", "Top"]:
     fig.add_trace(go.Scatter(x=full["Date"], y=full[name],
                              name=name, line=dict(color=colors[name], dash="dash")))
 # mid‑line
