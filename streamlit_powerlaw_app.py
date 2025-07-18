@@ -84,15 +84,15 @@ mid_log = slope * np.log10(days) + intercept
 σ_vis   = max(σ, 0.25)                      # never collapse the bands
 
 levels = {
-    "Base":        -1.5,
-    "Support":     -0.5,
+    "Support":     -1.5,
+    "Bear":        -0.5,
     "PL Best Fit":  0.0,
     "Frothy":      +1.0,
     "Top":         +1.75,
 }
 colors = {
-    "Base":        "red",
-    "Support":     "rgba(255,100,100,1)",
+    "Support":      "red",
+    "Bear":         "rgba(255,100,100,1)",
     "PL Best Fit": "white",
     "Frothy":      "rgba(100,255,100,1)",
     "Top":         "green",
@@ -112,18 +112,18 @@ if as_cap:
 # ─── zone badge based on latest row ─────────────────────────
 row   = full.dropna(subset=["Price"]).iloc[-1]
 p     = row["Price"]
-base, sup, res, top = row["Base"], row["Support"], row["Frothy"], row["Top"]
+base, sup, res, top = row["Support"], row["Bear"], row["Frothy"], row["Top"]
 
 if p < base:
     zone = "SELL THE HOUSE!!"
 elif p < sup:
-    zone = "Buy"
+    zone = "Undervalued"
 elif p < res:
-    zone = "DCA"
+    zone = "Fair"
 elif p < top:
-    zone = "Relax"
+    zone = "Overvalued"
 else:
-    zone = "Frothy"
+    zone = "TO THE MOON"
 st.markdown(f"### **Current zone:** {zone}")
 
 # ─── figure ──────────────────────────────────────────────────
@@ -138,7 +138,7 @@ fig = go.Figure(layout=dict(
 ))
 
 # bands first
-for name in ["Base", "Support", "Frothy", "Top"]:
+for name in ["Support", "Bear", "Frothy", "Top"]:
     fig.add_trace(go.Scatter(x=full["Date"], y=full[name],
                              name=name, line=dict(color=colors[name], dash="dash")))
 # mid‑line
