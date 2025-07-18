@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 from streamlit_plotly_events import plotly_events
 
 UA         = {"User-Agent": "btc-pl-tool/1.0"}
-GENESIS    = pd.Timestamp("20010-01-01")
+GENESIS    = pd.Timestamp("2010-01-01")
 FD_SUPPLY  = 21_000_000
 GRID_D     = "M24"                      # vertical grid every 2 years
 PROJ_END   = pd.Timestamp("2040-12-31")
