@@ -5,22 +5,19 @@
 import io, requests, pandas as pd, numpy as np, streamlit as st
 import plotly.graph_objects as go
 from streamlit_plotly_events import plotly_events
-from datetime import datetime
 
 UA         = {"User-Agent": "btc-pl-tool/1.0"}
 GENESIS    = pd.Timestamp("2009-01-03")
 FD_SUPPLY  = 21_000_000
-GRID_D     = "M24"                      # vertical grid every 2 years
-PROJ_END   = pd.Timestamp("2040-12-31") # ASCII hyphens
+GRID_D     = "M24"                      # vertical grid every 2 years
+PROJ_END   = pd.Timestamp("2040-12-31")
 
 # ─── data loaders (Stooq → GitHub fallback) ─────────────────
 def _stooq():
-    url = "https://stooq.com/q/d/l/?s=btcusd&i=d"
-    df = pd.read_csv(url)
+    df = pd.read_csv("https://stooq.com/q/d/l/?s=btcusd&i=d")
     df.columns = [c.lower() for c in df.columns]
     date_col  = [c for c in df.columns if "date"  in c][0]
     price_col = [c for c in df.columns if "close" in c or "price" in c][0]
-
     df = df.rename(columns={date_col: "Date", price_col: "Price"})
     df["Date"]  = pd.to_datetime(df["Date"], errors="coerce")
     df["Price"] = pd.to_numeric(df["Price"].astype(str)
@@ -38,50 +35,42 @@ def get_price_history():
     try:
         df = _stooq()
         if len(df) > 1000:
-            st.info(f"Loaded {len(df):,} rows from **Stooq CSV**")
             return df
-    except Exception as e:
-        st.warning(f"Stooq failed → {e}")
-    df = _github()
-    st.info(f"Loaded {len(df):,} rows from **GitHub mirror**")
-    return df
+    except Exception:
+        pass
+    return _github()
 
 # ─── power‑law fit ───────────────────────────────────────────
 def fit_power(df):
     X = np.log10((df["Date"] - GENESIS).dt.days)
     y = np.log10(df["Price"])
     slope, intercept = np.polyfit(X, y, 1)
-    mid_log = slope * X + intercept
-    sigma   = np.std(y - mid_log)
+    sigma            = np.std(y - (slope * X + intercept))
     return slope, intercept, sigma
 
 # ─── Streamlit layout ────────────────────────────────────────
 st.set_page_config(page_title="BTC Purchase Indicator", layout="wide")
 
-hist = get_price_history()                   # ← make sure this line exists
+hist = get_price_history()
 slope, intercept, σ = fit_power(hist)
 
-# ── anchor mid‑line to hit ~$500k on 2030‑01‑01 ──────────────
+# anchor mid‑line at ≈ $492 k on 1‑Jan‑2030
 anchor_date  = pd.Timestamp("2030-01-01")
 anchor_days  = (anchor_date - GENESIS).days
-target_price = 491_776     # USD
+intercept    = np.log10(491_776) - slope * np.log10(anchor_days)
 
-target_log   = np.log10(target_price)
-intercept    = target_log - slope * np.log10(anchor_days)
-# mid_log will be rebuilt below with this new intercept
-
-# ─── build full timeline to 2040 ────────────────────────────
+# timeline until 2040
 future = pd.date_range(
-    hist["Date"].iloc[-1] + pd.offsets.MonthBegin(1),  # first day next month
+    hist["Date"].iloc[-1] + pd.offsets.MonthBegin(1),
     PROJ_END,
     freq="MS",
-    inclusive="both"      # works on pandas <1.4 and >=1.4
+    inclusive="both"          # pandas 1.3+ / 1.4+ compatible
 )
 full = pd.concat([hist, pd.DataFrame({"Date": future})], ignore_index=True)
 
-days = (full["Date"] - GENESIS).dt.days
+days    = (full["Date"] - GENESIS).dt.days
 mid_log = slope * np.log10(days) + intercept
-σ_vis   = max(σ, 0.25)                      # never collapse the bands
+σ_vis   = max(σ, 0.25)
 
 levels = {
     "Support":     -1.5,
@@ -91,8 +80,8 @@ levels = {
     "Top":         +1.75,
 }
 colors = {
-    "Support":      "red",
-    "Bear":         "rgba(255,100,100,1)",
+    "Support":     "red",
+    "Bear":        "rgba(255,100,100,1)",
     "PL Best Fit": "white",
     "Frothy":      "rgba(100,255,100,1)",
     "Top":         "green",
@@ -101,29 +90,26 @@ for name, k in levels.items():
     full[name] = 10 ** (mid_log + σ_vis * k)
 
 # Market‑Cap toggle
-as_cap = st.sidebar.toggle("Market‑Cap")
+as_cap  = st.sidebar.toggle("Market‑Cap")
 y_title = "Price (USD)"
 if as_cap:
-    band_cols = list(levels.keys())
-    full[["Price", *band_cols]] = full[["Price", *band_cols]].fillna(method="ffill")
-    full[["Price", *band_cols]] *= FD_SUPPLY
+    cols = ["Price", *levels.keys()]
+    full[cols] = full[cols].fillna(method="ffill") * FD_SUPPLY
     y_title = "Market‑Cap (USD)"
 
-# ─── zone badge based on latest row ─────────────────────────
-row   = full.dropna(subset=["Price"]).iloc[-1]
-p     = row["Price"]
-base, sup, res, top = row["Support"], row["Bear"], row["Frothy"], row["Top"]
-
-if p < base:
+# zone badge
+row = full.dropna(subset=["Price"]).iloc[-1]
+p   = row["Price"]
+if p < row["Support"]:
     zone = "SELL THE HOUSE!!"
-elif p < sup:
+elif p < row["Bear"]:
     zone = "Undervalued"
-elif p < res:
+elif p < row["Frothy"]:
     zone = "Fair"
-elif p < top:
+elif p < row["Top"]:
     zone = "Overvalued"
 else:
-    zone = "TO THE MOON"
+    zone = "TO THE MOON"
 st.markdown(f"### **Current zone:** {zone}")
 
 # ─── figure ──────────────────────────────────────────────────
@@ -137,14 +123,15 @@ fig = go.Figure(layout=dict(
     plot_bgcolor="#111", paper_bgcolor="#111",
 ))
 
-# bands first
-for name in ["Support", "Bear", "Frothy", "Top"]:
+# legend / drawing order: Top ▸ Frothy ▸ PL ▸ Bear ▸ Support ▸ BTC
+for name in ["Top", "Frothy"]:
     fig.add_trace(go.Scatter(x=full["Date"], y=full[name],
                              name=name, line=dict(color=colors[name], dash="dash")))
-# mid‑line
 fig.add_trace(go.Scatter(x=full["Date"], y=full["PL Best Fit"],
                          name="PL Best Fit", line=dict(color="white", dash="dash")))
-# BTC price last
+for name in ["Bear", "Support"]:
+    fig.add_trace(go.Scatter(x=full["Date"], y=full[name],
+                             name=name, line=dict(color=colors[name], dash="dash")))
 fig.add_trace(go.Scatter(x=hist["Date"], y=hist["Price"],
                          name="BTC", line=dict(color="gold", width=3)))
 
