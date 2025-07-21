@@ -156,56 +156,76 @@ dma["G50"]     = dma["BTCG"].rolling(50).mean()
 dma["G200"]    = dma["BTCG"].rolling(200).mean()
 dma = dma.dropna()
 
-# crossover markers (USD)
-diff = dma["BTC_200"] - dma["BTC_50"]
-cross = (diff.shift(1) > 0) & (diff < 0) & (diff.shift(1).rolling(100).apply(lambda x:(x>0).all()).astype(bool))
-cross_dates  = dma.loc[cross, "Date"]
-cross_prices = dma.loc[cross, "BTC"]
+# --- crossover markers (USD) ---
+diff_usd = dma["BTC_200"] - dma["BTC_50"]
+usd_cross = (
+    (diff_usd.shift(1) > 0) & (diff_usd < 0) &                       # sign +→−
+    (diff_usd.shift(1).rolling(100).apply(lambda x: (x > 0).all())   # 100 days
+              .astype(bool))
+)
+usd_dates  = dma.loc[usd_cross, "Date"]
+usd_price  = dma.loc[usd_cross, "BTC"]
+
+# --- crossover markers (Gold) ---
+diff_gld = dma["G200"] - dma["G50"]
+gld_cross = (
+    (diff_gld.shift(1) > 0) & (diff_gld < 0) &
+    (diff_gld.shift(1).rolling(100).apply(lambda x: (x > 0).all())
+              .astype(bool))
+)
+gld_dates  = dma.loc[gld_cross, "Date"]
+gld_price  = dma.loc[gld_cross, "BTCG"]
 
 fig2 = go.Figure(layout=dict(
     template="plotly_dark",
     font=dict(family="Currency, monospace", size=12),
-
     xaxis=dict(type="date", title="Year", dtick=GRID_D,
                showgrid=True, gridwidth=0.5),
 
-    # left axis – USD
-    yaxis=dict(type="log", title="BTC Price (USD)",
-               tickformat="$,d",
+    # left axis – USD prices
+    yaxis=dict(type="log", title="BTC Price (USD)", tickformat="$,d",
                showgrid=True, gridwidth=0.5),
 
-    # right axis – ounces of gold
+    # right axis – BTC in oz Gold
     yaxis2=dict(type="log", title="BTC Price (oz Gold)",
-                tickvals=[0.01, 0.1, 1, 10],         # choose the span you need
+                tickvals=[0.01, 0.1, 1, 10],
                 ticktext=["0.01", "0.1", "1", "10"],
                 overlaying="y", side="right",
-
-                # draw its own grid so every label gets a line
                 showgrid=True, gridwidth=0.5,
                 gridcolor="rgba(255,255,255,0.2)"),
 
     plot_bgcolor="#111", paper_bgcolor="#111",
 ))
 
-# Gold‑denominated traces
+# ── Gold traces first (soft → bright)
 fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["G200"],
-                          name="200‑DMA Gold", line=dict(color="lightsalmon", width=1.5), yaxis="y2"))
+                          name="200‑DMA Gold",   yaxis="y2",
+                          line=dict(color="khaki", width=1.5)))
 fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["G50"],
-                          name="50‑DMA Gold",  line=dict(color="darkorange", width=1.5),  yaxis="y2"))
+                          name="50‑DMA Gold",    yaxis="y2",
+                          line=dict(color="goldenrod", width=1.5)))
 fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["BTCG"],
-                          name="BTC Gold",     line=dict(color="gold", width=2),          yaxis="y2"))
+                          name="BTC Gold",       yaxis="y2",
+                          line=dict(color="gold", width=2)))
 
-# USD traces
+# Top‑Marker (Gold)
+fig2.add_trace(go.Scatter(x=gld_dates, y=gld_price,
+                          name="Top Marker (Gold)", mode="markers", yaxis="y2",
+                          marker=dict(symbol="diamond", color="darkorange", size=9)))
+
+# ── USD traces (soft → bright greens)
 fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["BTC_200"],
-                          name="200‑DMA USD", line=dict(color="mediumvioletred", width=1.5)))
+                          name="200‑DMA USD", line=dict(color="lightgreen", width=1.5)))
 fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["BTC_50"],
-                          name="50‑DMA USD",  line=dict(color="mediumorchid", width=1.5)))
+                          name="50‑DMA USD",  line=dict(color="mediumseagreen", width=1.5)))
 fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["BTC"],
-                          name="BTC USD",     line=dict(color="purple", width=2)))
-fig2.add_trace(go.Scatter(x=cross_dates, y=cross_prices,
-                          name="Top Marker", mode="markers",
-                          marker=dict(symbol="diamond", color="red", size=9)))
+                          name="BTC USD",     line=dict(color="limegreen", width=2)))
 
+# Top‑Marker (USD)
+fig2.add_trace(go.Scatter(x=usd_dates, y=usd_price,
+                          name="Top Marker (USD)", mode="markers",
+                          marker=dict(symbol="diamond", color="forestgreen", size=9)))
 
 st.plotly_chart(fig2, use_container_width=True)
+
 # ─────────────────────────────────────────────────────────────
