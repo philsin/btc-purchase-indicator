@@ -1,10 +1,9 @@
 # ─────────────────────────────────────────────────────────────
 # streamlit_powerlaw_app.py  ·  BTC Purchase Indicator
-#  ▸ fixed bands  ▸ projection to 2040  ▸ DMA chart from 1‑Apr‑2012
+#  ▸ power‑law bands  ▸ DMA chart with BTC/USD & BTC/Gold
 # ─────────────────────────────────────────────────────────────
 import io, requests, pandas as pd, numpy as np, streamlit as st
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from streamlit_plotly_events import plotly_events
 
 UA         = {"User-Agent": "btc-pl-tool/1.0"}
@@ -15,34 +14,45 @@ PROJ_END   = pd.Timestamp("2040-12-31")
 DMA_START  = pd.Timestamp("2012-04-01")
 
 # ─── data loaders ────────────────────────────────────────────
-def _stooq():
+def _btc_stooq():
     df = pd.read_csv("https://stooq.com/q/d/l/?s=btcusd&i=d")
     df.columns = [c.lower() for c in df.columns]
     df = df.rename(columns={c: "Date"  for c in df.columns if "date"  in c})
-    df = df.rename(columns={c: "Price" for c in df.columns if "close" in c or "price" in c})
+    df = df.rename(columns={c: "BTC"   for c in df.columns if "close" in c or "price" in c})
     df["Date"]  = pd.to_datetime(df["Date"], errors="coerce")
-    df["Price"] = pd.to_numeric(df["Price"].astype(str).str.replace(",", ""), errors="coerce")
-    return df.dropna().query("Price>0").sort_values("Date")
+    df["BTC"]   = pd.to_numeric(df["BTC"].astype(str).str.replace(",", ""), errors="coerce")
+    return df.dropna().query("BTC>0").sort_values("Date")
 
-def _github():
-    raw = "https://raw.githubusercontent.com/datasets/bitcoin-price/master/data/bitcoin_price.csv"
-    df  = pd.read_csv(raw).rename(columns={"Closing Price (USD)": "Price"})
+def _gold_stooq():
+    df = pd.read_csv("https://stooq.com/q/d/l/?s=xauusd&i=d")  # LBMA USD/oz
+    df.columns = [c.lower() for c in df.columns]
+    df = df.rename(columns={c: "Date" for c in df.columns if "date"  in c})
+    df = df.rename(columns={c: "Gold" for c in df.columns if "close" in c or "price" in c})
+    df["Date"]  = pd.to_datetime(df["Date"], errors="coerce")
+    df["Gold"]  = pd.to_numeric(df["Gold"].astype(str).str.replace(",", ""), errors="coerce")
+    return df.dropna().sort_values("Date")
+
+def _gold_lbma():
+    url = "https://raw.githubusercontent.com/koindata/gold-prices/master/data/gold.csv"
+    df  = pd.read_csv(url)
     df["Date"] = pd.to_datetime(df["Date"])
-    return df[["Date", "Price"]]
+    df = df.rename(columns={"USD (PM)": "Gold"})
+    return df[["Date", "Gold"]].dropna()
 
-def get_price_history():
+def load_prices():
+    btc = _btc_stooq()
     try:
-        df = _stooq()
-        if len(df) > 1000:
-            return df
+        gold = _gold_stooq()
+        if len(gold) < 1000:
+            raise ValueError
     except Exception:
-        pass
-    return _github()
+        gold = _gold_lbma()
+    return btc.merge(gold, on="Date", how="inner")
 
 # ─── power‑law fit ───────────────────────────────────────────
 def fit_power(df):
     X = np.log10((df["Date"] - GENESIS).dt.days)
-    y = np.log10(df["Price"])
+    y = np.log10(df["BTC"])
     slope, intercept = np.polyfit(X, y, 1)
     sigma            = np.std(y - (slope * X + intercept))
     return slope, intercept, sigma
@@ -50,17 +60,17 @@ def fit_power(df):
 # ─── Streamlit layout ────────────────────────────────────────
 st.set_page_config(page_title="BTC Purchase Indicator", layout="wide")
 
-hist = get_price_history()
-slope, intercept, σ = fit_power(hist)
+data = load_prices()
+slope, intercept, σ = fit_power(data)
 
 # anchor mid‑line
 anchor_date  = pd.Timestamp("2030-01-01")
 intercept    = np.log10(491_776) - slope * np.log10((anchor_date - GENESIS).days)
 
-# projection to 2040
-future = pd.date_range(hist["Date"].iloc[-1] + pd.offsets.MonthBegin(1),
+# extend timeline
+future = pd.date_range(data["Date"].iloc[-1] + pd.offsets.MonthBegin(1),
                        PROJ_END, freq="MS", inclusive="both")
-full = pd.concat([hist, pd.DataFrame({"Date": future})], ignore_index=True)
+full = pd.concat([data, pd.DataFrame({"Date": future})], ignore_index=True)
 days = (full["Date"] - GENESIS).dt.days
 mid_log = slope * np.log10(days) + intercept
 σ_vis   = max(σ, 0.25)
@@ -86,19 +96,20 @@ for name, k in levels.items():
 as_cap  = st.sidebar.toggle("Market‑Cap")
 y_title = "Price (USD)"
 if as_cap:
-    cols = ["Price", *levels.keys()]
+    cols = ["BTC", *levels.keys()]
     full[cols] = full[cols].fillna(method="ffill") * FD_SUPPLY
+    data["BTC"] *= FD_SUPPLY
     y_title = "Market‑Cap (USD)"
 
 # zone badge
-row = full.dropna(subset=["Price"]).iloc[-1]
-p   = row["Price"]
+row = full.dropna(subset=["BTC"]).iloc[-1]
+p   = row["BTC"]
 if p < row["Support"]:
     zone = "SELL THE HOUSE!!"
 elif p < row["Bear"]:
     zone = "Undervalued"
 elif p < row["Frothy"]:
-    zone = "Fair Value"
+    zone = "Fair"
 elif p < row["Top"]:
     zone = "Overvalued"
 else:
@@ -124,7 +135,7 @@ for name in ["Bear", "Support"]:
     fig1.add_trace(go.Scatter(x=full["Date"], y=full[name],
                               name=f"{name} ({levels[name]:+.2f}σ)",
                               line=dict(color=colors[name], dash="dash")))
-fig1.add_trace(go.Scatter(x=hist["Date"], y=hist["Price"],
+fig1.add_trace(go.Scatter(x=data["Date"], y=data["BTC"],
                           name="BTC", line=dict(color="gold", width=2)))
 
 # keep zoom
@@ -136,49 +147,53 @@ ev = plotly_events(fig1, select_event=False, click_event=False, key="zoom")
 if ev and "xaxis.range[0]" in ev[0]:
     st.session_state["xrange"] = [ev[0]["xaxis.range[0]"], ev[0]["xaxis.range[1]"]]
 
-# ─── Chart 2: BTC, 50‑DMA, 200‑DMA (from 2012‑04‑01) ─────────
-dma = hist[hist["Date"] >= DMA_START].copy()
-dma["50DMA"]  = dma["Price"].rolling(window=50).mean()
-dma["200DMA"] = dma["Price"].rolling(window=200).mean()
-dma = dma.dropna(subset=["50DMA", "200DMA"])
+# ─── Chart 2: BTC/USD & BTC/Gold DMA ─────────────────────────
+dma = data[data["Date"] >= DMA_START].copy()
+dma["BTC_50"]  = dma["BTC"].rolling(50).mean()
+dma["BTC_200"] = dma["BTC"].rolling(200).mean()
+dma["BTCG"]    = dma["BTC"] / dma["Gold"]
+dma["G50"]     = dma["BTCG"].rolling(50).mean()
+dma["G200"]    = dma["BTCG"].rolling(200).mean()
+dma = dma.dropna()
 
-# ── find dates where 200‑DMA crosses down through 50‑DMA
-diff = dma["200DMA"] - dma["50DMA"]            # positive ⇒ 200 > 50
-prev_diff = diff.shift(1)
-
-# 1. sign flips from + to −   (200 DMA was above, now below/equal)
-cross_core = (prev_diff > 0) & (diff < 0)
-
-# 2. AND 200 DMA had been above 50 DMA for each of the prior 100 days
-above_100  = (prev_diff.rolling(window=50, min_periods=50)
-                        .apply(lambda x: (x > 0).all(), raw=True)
-                        .astype(bool))
-
-cross_mask = cross_core & above_100
-
-cross_dates  = dma.loc[cross_mask, "Date"]
-cross_prices = dma.loc[cross_mask, "200DMA"]
+# crossover markers (USD)
+diff = dma["BTC_200"] - dma["BTC_50"]
+cross = (diff.shift(1) > 0) & (diff < 0) & (diff.shift(1).rolling(100).apply(lambda x:(x>0).all()).astype(bool))
+cross_dates  = dma.loc[cross, "Date"]
+cross_prices = dma.loc[cross, "BTC"]
 
 fig2 = go.Figure(layout=dict(
     template="plotly_dark",
     font=dict(family="Currency, monospace", size=12),
     xaxis=dict(type="date", title="Year", dtick=GRID_D, showgrid=True, gridwidth=0.5),
-    yaxis=dict(type="log", title="Price (USD)", tickformat="$,d",
+    yaxis=dict(type="log", title="BTC Price (USD)", tickformat="$,d",
                showgrid=True, gridwidth=0.5),
+    yaxis2=dict(type="log", title="BTC Price (oz Gold)", tickformat=",d",
+                overlaying="y", side="right", showgrid=False),
     plot_bgcolor="#111", paper_bgcolor="#111",
 ))
 
-fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["200DMA"],
-                          name="200‑DMA", line=dict(color="purple", width=1.5)))
-fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["50DMA"],
-                          name="50‑DMA", line=dict(color="royalblue", width=1.5)))
-fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["Price"],
-                          name="BTC", line=dict(color="gold", width=2)))
+# USD traces
+fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["BTC_200"],
+                          name="200‑DMA USD", line=dict(color="purple", width=1.5)))
+fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["BTC_50"],
+                          name="50‑DMA USD",  line=dict(color="royalblue", width=1.5)))
+fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["BTC"],
+                          name="BTC USD",     line=dict(color="gold", width=2)))
 fig2.add_trace(go.Scatter(x=cross_dates, y=cross_prices,
-                          name="Golden Cross", mode="markers",
-                          marker=dict(symbol="diamond", color="Green", size=9),
-))
+                          name="Top Marker", mode="markers",
+                          marker=dict(symbol="diamond", color="red", size=9)))
 
+# Gold‑denominated traces (use y axis 2)
+fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["G200"],
+                          name="200‑DMA Gold", line=dict(color="mediumorchid", width=1.5),
+                          yaxis="y2"))
+fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["G50"],
+                          name="50‑DMA Gold",  line=dict(color="deepskyblue", width=1.5),
+                          yaxis="y2"))
+fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["BTCG"],
+                          name="BTC Gold",     line=dict(color="darkorange", width=2),
+                          yaxis="y2"))
 
 st.plotly_chart(fig2, use_container_width=True)
 # ─────────────────────────────────────────────────────────────
