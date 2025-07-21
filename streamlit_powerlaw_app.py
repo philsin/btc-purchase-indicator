@@ -109,7 +109,7 @@ if p < row["Support"]:
 elif p < row["Bear"]:
     zone = "Undervalued"
 elif p < row["Frothy"]:
-    zone = "Fair"
+    zone = "Fair Value"
 elif p < row["Top"]:
     zone = "Overvalued"
 else:
@@ -165,35 +165,47 @@ cross_prices = dma.loc[cross, "BTC"]
 fig2 = go.Figure(layout=dict(
     template="plotly_dark",
     font=dict(family="Currency, monospace", size=12),
-    xaxis=dict(type="date", title="Year", dtick=GRID_D, showgrid=True, gridwidth=0.5),
-    yaxis=dict(type="log", title="BTC Price (USD)", tickformat="$,d",
+
+    xaxis=dict(type="date", title="Year", dtick=GRID_D,
                showgrid=True, gridwidth=0.5),
-    yaxis2=dict(type="log", title="BTC Price (oz Gold)", tickformat=",d",
-                overlaying="y", side="right", showgrid=False),
+
+    # left axis – USD
+    yaxis=dict(type="log", title="BTC Price (USD)",
+               tickformat="$,d",
+               showgrid=True, gridwidth=0.5),
+
+    # right axis – ounces of gold
+    yaxis2=dict(type="log", title="BTC Price (oz Gold)",
+                tickvals=[0.01, 0.1, 1, 10],         # choose the span you need
+                ticktext=["0.01", "0.1", "1", "10"],
+                overlaying="y", side="right",
+
+                # draw its own grid so every label gets a line
+                showgrid=True, gridwidth=0.5,
+                gridcolor="rgba(255,255,255,0.2)"),
+
     plot_bgcolor="#111", paper_bgcolor="#111",
 ))
 
+# Gold‑denominated traces
+fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["G200"],
+                          name="200‑DMA Gold", line=dict(color="lightsalmon", width=1.5), yaxis="y2"))
+fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["G50"],
+                          name="50‑DMA Gold",  line=dict(color="darkorange", width=1.5),  yaxis="y2"))
+fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["BTCG"],
+                          name="BTC Gold",     line=dict(color="gold", width=2),          yaxis="y2"))
+
 # USD traces
 fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["BTC_200"],
-                          name="200‑DMA USD", line=dict(color="purple", width=1.5)))
+                          name="200‑DMA USD", line=dict(color="mediumvioletred", width=1.5)))
 fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["BTC_50"],
-                          name="50‑DMA USD",  line=dict(color="royalblue", width=1.5)))
+                          name="50‑DMA USD",  line=dict(color="mediumorchid", width=1.5)))
 fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["BTC"],
-                          name="BTC USD",     line=dict(color="gold", width=2)))
+                          name="BTC USD",     line=dict(color="purple", width=2)))
 fig2.add_trace(go.Scatter(x=cross_dates, y=cross_prices,
                           name="Top Marker", mode="markers",
                           marker=dict(symbol="diamond", color="red", size=9)))
 
-# Gold‑denominated traces (use y axis 2)
-fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["G200"],
-                          name="200‑DMA Gold", line=dict(color="mediumorchid", width=1.5),
-                          yaxis="y2"))
-fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["G50"],
-                          name="50‑DMA Gold",  line=dict(color="deepskyblue", width=1.5),
-                          yaxis="y2"))
-fig2.add_trace(go.Scatter(x=dma["Date"], y=dma["BTCG"],
-                          name="BTC Gold",     line=dict(color="darkorange", width=2),
-                          yaxis="y2"))
 
 st.plotly_chart(fig2, use_container_width=True)
 # ─────────────────────────────────────────────────────────────
