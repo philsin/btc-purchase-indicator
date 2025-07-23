@@ -34,7 +34,7 @@ def _gold_stooq():
 
 def _gold_lbma():
     url = "https://raw.githubusercontent.com/koindata/gold-prices/master/data/gold.csv"
-    df  = pd.read_csv(url)
+    df  = pd.read_csv(url) 
     df["Date"] = pd.to_datetime(df["Date"])
     df = df.rename(columns={"USD (PM)": "Gold"})
     return df[["Date", "Gold"]].dropna()
