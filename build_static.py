@@ -163,17 +163,15 @@ def fig_powerlaw(df_all, denom="USD"):
         )
         yvals = df_all
     else:
-        # Gold oz per BTC: oz/BTC = Gold_USD_per_oz / BTC_USD
+        # inside fig_powerlaw(...), denom == "Gold"
         df = df_all.copy()
-        df["BTC_gold"] = df["Gold"] / df["BTC"]
+        # BTC in USD over Gold USD/oz  →  oz/BTC
+        df["BTC_gold"] = df["BTC"] / df["Gold"]
         for c in ["PL Best Fit", "Top", "Frothy", "Bear", "Support"]:
-            df[f"{c} (Gold)"] = df["Gold"] / df[c]
-        yseries = dict(
-            price=("BTC_gold", COLORS["price"], 2.0),
-            bands=[("Top (Gold)", COLORS["top"]), ("Frothy (Gold)", COLORS["frothy"]),
-                   ("PL Best Fit (Gold)", COLORS["mid"]), ("Bear (Gold)", COLORS["bear"]),
-                   ("Support (Gold)", COLORS["support"])],
-            ytitle="Gold oz / BTC", tickformat=",d",
+            df[f"{c} (Gold)"] = df[c] / df["Gold"]
+            yseries = dict(
+            ...
+        ytitle="Gold oz / BTC", tickformat=",d",
         )
         yvals = df
 
@@ -228,8 +226,10 @@ def fig_dma(df_all, denom="USD"):
             ("BTC",       "BTC USD",     COLORS["price"], 2.2),
         ]
     else:
+        # inside fig_dma(...), denom == "Gold"
         ser = df_all.copy()
-        ser["BTC_gold"] = ser["Gold"] / ser["BTC"]
+        # BTC in USD over Gold USD/oz  →  oz/BTC
+        ser["BTC_gold"] = ser["BTC"] / ser["Gold"]
         ser["G50"]      = ser["BTC_gold"].rolling(50).mean()
         ser["G200"]     = ser["BTC_gold"].rolling(200).mean()
         ser = ser.dropna(subset=["G50","G200"])
