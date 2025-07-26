@@ -156,10 +156,13 @@ def fit_power(df_btc: pd.DataFrame) -> tuple[float,float,float]:
 
 def add_sigma_bands_over(dates: pd.Series, m: float, b: float, sigma: float) -> pd.DataFrame:
     """Compute PL mid & bands over an arbitrary date index."""
-    x = log_days(dates)
+    d = pd.to_datetime(dates)              # ensure pandas datetime
+    x = log_days(d)                        # log10(days since genesis)
     mid_log = m * x + b
-    out = pd.DataFrame({"Date": pd.to_datetime(dates).to_pydatetime()})
+
+    out = pd.DataFrame({"Date": d})        # keep as pandas Timestamps
     out["PL Best Fit"] = 10 ** mid_log
+
     sig = max(0.25, sigma)
     for name, k in LEVELS.items():
         if name == "PL Best Fit":
