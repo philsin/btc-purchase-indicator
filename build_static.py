@@ -23,6 +23,7 @@ import os, io, json, math, pathlib, requests
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import plotly.io as pio  
 
 # ---------- constants ----------
 UA = {"User-Agent": "btc-pl-pages/1.0"}
@@ -295,7 +296,7 @@ def page_html(fig, usd_df, bands_usd, gld_df=None, bands_gld=None) -> str:
 
     PACK = {"usd": p_usd, "gold": p_gld}
     pack_json = json.dumps(PACK, separators=(",", ":"))
-    fig_json  = go.io.to_json(fig, pretty=False)
+    fig_json  = pio.to_json(fig, pretty=False)
 
     TEMPLATE = r"""
 <!doctype html>
