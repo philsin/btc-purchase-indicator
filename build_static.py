@@ -1,8 +1,9 @@
 # build_static.py
 # Build a static 2-page site (index + DMA) into ./dist for GitHub Pages
-# - Power-law chart uses log(time) on x axis (days since 2009-01-03)
-# - USD / Gold denomination dropdown for BOTH charts
-# - Per-line checkboxes kept for manual visibility control
+# - Power-law chart uses log(time) on X (days since 2009-01-03), with year labels
+# - USD / Gold denomination dropdown on BOTH charts (+ per-line checkboxes)
+# - Robust CSV loaders (Stooq → GitHub/LBMA fallback)
+# - No double-brace dicts inside f-strings (avoid unhashable type errors)
 
 import io
 from pathlib import Path
@@ -15,7 +16,6 @@ import plotly.io as pio
 # ───────────────── constants ─────────────────
 UA        = {"User-Agent": "btc-pl-tool/1.0"}
 GENESIS   = pd.Timestamp("2009-01-03")
-FD_SUPPLY = 21_000_000
 PROJ_END  = pd.Timestamp("2040-12-31")
 DMA_START = pd.Timestamp("2012-04-01")
 
@@ -32,19 +32,20 @@ LEVELS = {  # fixed sigma bands
 
 # ───────────────── utils ─────────────────
 def log_days(dates) -> np.ndarray:
-    """log10 of days since GENESIS (robust for Series and Index)."""
+    """log10 of days since GENESIS (robust for Series / Index)."""
     d = pd.to_datetime(dates)
     delta = d - GENESIS
-    # convert timedeltas to float days for both Series and Index
     days = np.asarray(delta / np.timedelta64(1, "D")).astype(float)
-    days = np.where(days < 1.0, 1.0, days)  # guard 0/neg
+    days = np.where(days < 1.0, 1.0, days)  # guard against 0/neg
     return np.log10(days)
 
 def year_ticks(end_year: int):
-    """Year labels: every year 2012→2020, then every other year afterward."""
-    yrs = list(range(2012, 2021)) + list(range(2022, end_year + 1, 2))
-    dv  = pd.to_datetime([f"{y}-01-01" for y in yrs])
-    tv  = log_days(dv)
+    """Year labels: every year 2012→2020, then every other year."""
+    yrs = list(range(2012, 2021))
+    if end_year >= 2022:
+        yrs += list(range(2022, end_year + 1, 2))
+    dv = pd.to_datetime([f"{y}-01-01" for y in yrs])
+    tv = log_days(dv)
     return tv.tolist(), [str(y) for y in yrs]
 
 # ───────────────── data loaders ─────────────────
@@ -71,11 +72,13 @@ def load_btc() -> pd.DataFrame:
     try:
         df = _btc_stooq()
         if len(df) > 0:
-            print(f"[build] BTC from Stooq: {len(df)} rows"); return df
+            print(f"[build] BTC from Stooq: {len(df)} rows")
+            return df
     except Exception as e:
         print(f"[build] Stooq BTC failed: {e}")
     df = _btc_github()
-    print(f"[build] BTC from GitHub CSV: {len(df)} rows"); return df
+    print(f"[build] BTC from GitHub CSV: {len(df)} rows")
+    return df
 
 def _gold_stooq() -> pd.DataFrame:
     url = "https://stooq.com/q/d/l/?s=xauusd&i=d"
@@ -100,16 +103,18 @@ def load_gold() -> pd.DataFrame:
     try:
         g = _gold_stooq()
         if len(g) > 1000:
-            print(f"[build] Gold from Stooq: {len(g)} rows"); return g
+            print(f"[build] Gold from Stooq: {len(g)} rows")
+            return g
         print("[build] Stooq XAUUSD too short → LBMA mirror")
     except Exception as e:
         print(f"[build] Stooq Gold failed: {e}")
     g = _gold_lbma()
-    print(f"[build] Gold from LBMA: {len(g)} rows"); return g
+    print(f"[build] Gold from LBMA: {len(g)} rows")
+    return g
 
 # ───────────────── power-law & projections ─────────────────
 def fit_power(df: pd.DataFrame):
-    X = log_days(df["Date"])
+    X = log_days(df["Date"])        # ← log-time on X
     y = np.log10(df["BTC"])
     slope, intercept = np.polyfit(X, y, 1)
     sigma = np.std(y - (slope * X + intercept))
@@ -128,19 +133,19 @@ def project_monthly(last_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.Datet
 # ───────────────── figures ─────────────────
 def make_powerlaw_fig(full: pd.DataFrame,
                       data: pd.DataFrame,
-                      full_usd_bands: dict,
-                      data_gold_bands: dict,
+                      bands_usd_full: dict,
+                      bands_gold_data: dict,
                       denom_default="USD") -> go.Figure:
-    # x is log-time for both USD and Gold traces
-    x_full  = log_days(full["Date"])
-    x_data  = log_days(data["Date"])
-    end_year = min(2040, full["Date"].dt.year.max())
+    # X is log-time for both groups
+    x_full = log_days(full["Date"])
+    x_data = log_days(data["Date"])
+    end_year = int(min(2040, full["Date"].dt.year.max()))
     tickvals, ticktext = year_ticks(end_year)
 
     fig = go.Figure(layout=dict(
         template="plotly_dark",
         font=dict(family="Currency, monospace", size=12),
-        xaxis=dict(type="linear", title="Year",
+        xaxis=dict(type="linear", title="Year (log-time)",
                    tickmode="array", tickvals=tickvals, ticktext=ticktext,
                    showgrid=True, gridwidth=0.6),
         yaxis=dict(type="log", title="Price (USD / oz Gold)",
@@ -149,42 +154,36 @@ def make_powerlaw_fig(full: pd.DataFrame,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
     ))
 
-    # Trace index plan (for dropdown wiring):
-    # USD:  Top(0) Frothy(1) PL(2) Bear(3) Support(4) BTC(5)
-    # Gold: Top(6) Frothy(7) PL(8) Bear(9) Support(10) BTC(11)
-
-    # USD bands (full timeline incl. projection)
+    # Trace indices plan:
+    # USD group: 0..5  | Gold group: 6..11
     color_usd = {"Top":"green","Frothy":"rgba(100,255,100,1)","PL Best Fit":"white",
                  "Bear":"rgba(255,100,100,1)","Support":"red"}
     for nm in ["Top","Frothy","PL Best Fit","Bear","Support"]:
-        fig.add_trace(go.Scatter(x=x_full, y=full_usd_bands[nm],
+        fig.add_trace(go.Scatter(x=x_full, y=bands_usd_full[nm],
                                  name=f"{nm} (USD)", line=dict(color=color_usd[nm], dash="dash"),
                                  visible=True))
     fig.add_trace(go.Scatter(x=x_data, y=data["BTC"],
                              name="BTC (USD)", line=dict(color="gold", width=2),
                              visible=True))
 
-    # Gold bands (historical only; no future projection → NaN masked naturally)
     color_gld = {"Top":"#ffd54f","Frothy":"#ffeb3b","PL Best Fit":"#fff8e1",
                  "Bear":"#ffcc80","Support":"#ffb74d"}
     for nm in ["Top","Frothy","PL Best Fit","Bear","Support"]:
-        fig.add_trace(go.Scatter(x=x_data, y=data_gold_bands[nm],
+        fig.add_trace(go.Scatter(x=x_data, y=bands_gold_data[nm],
                                  name=f"{nm} (Gold)", line=dict(color=color_gld[nm], dash="dash"),
                                  visible=False))
     fig.add_trace(go.Scatter(x=x_data, y=data["BTCG"],
                              name="BTC (Gold)", line=dict(color="#ffc107", width=2),
                              visible=False))
 
-    # Adjust default group visibility
     if denom_default.upper() == "GOLD":
-        for i in range(0, 6):
-            fig.data[i].visible = "legendonly"
-        for i in range(6, 12):
-            fig.data[i].visible = True
+        for i in range(0, 6):  fig.data[i].visible = "legendonly"
+        for i in range(6, 12): fig.data[i].visible = True
 
     return fig
 
 def rolling_markers(d: pd.DataFrame):
+    """Top markers: 200DMA crosses down through 50DMA after ≥100 days above."""
     diff = d["BTC_200"] - d["BTC_50"]
     was_above = diff.shift(1) > 0
     was_above_100 = was_above.rolling(100).apply(lambda x: (x > 0).all(), raw=False).astype(bool)
@@ -291,54 +290,55 @@ def build():
     btc  = load_btc()
     gold = load_gold()
     data = pd.merge(btc, gold, on="Date", how="inner")
+    data = data.sort_values("Date").reset_index(drop=True)
+    data["BTCG"] = data["BTC"] / data["Gold"]
 
     # Power-law fit & anchor (~$500k on 2030-01-01)
     slope, intercept, sigma = fit_power(data)
     intercept = anchor_intercept(slope, pd.Timestamp("2030-01-01"), 491_776)
     sigma_vis = max(sigma, 0.25)
 
-    # Projection (USD only)
+    # Projection (USD only) on monthly dates
     future = project_monthly(data["Date"].iloc[-1], PROJ_END)
     full = pd.concat([data[["Date","BTC"]], pd.DataFrame({"Date": future})], ignore_index=True)
 
-    # USD bands on full timeline (including projection)
+    # USD bands full timeline
     x_full = log_days(full["Date"])
     mid_log_full = slope * x_full + intercept
     bands_usd_full = {nm: 10 ** (mid_log_full + sigma_vis * k) for nm, k in LEVELS.items()}
 
-    # Gold-denominated bands (historical only) by dividing USD bands by gold
+    # Gold-denominated bands (historical only)
     x_data = log_days(data["Date"])
     mid_log_data = slope * x_data + intercept
     bands_usd_data = {nm: 10 ** (mid_log_data + sigma_vis * k) for nm, k in LEVELS.items()}
-    data = data.copy()
-    data["BTCG"] = data["BTC"] / data["Gold"]
     bands_gold_data = {nm: bands_usd_data[nm] / data["Gold"].to_numpy() for nm in LEVELS}
 
-    # Zone using latest historical USD point
-    latest = data.iloc[-1]
-    # sample bands on that date
-    x_latest = log_days([latest["Date"]])[0]
+    # Zone (USD) at latest historical point
+    x_latest = log_days([data["Date"].iloc[-1]])[0]
     pl_latest = slope * x_latest + intercept
     ref = {nm: 10 ** (pl_latest + sigma_vis * k) for nm, k in LEVELS.items()}
-    p = latest["BTC"]
+    p = data["BTC"].iloc[-1]
     if p < ref["Support"]: zone = "SELL THE HOUSE!!"
     elif p < ref["Bear"]:  zone = "Undervalued"
     elif p < ref["Frothy"]:zone = "Fair Value"
     elif p < ref["Top"]:   zone = "Overvalued"
     else:                  zone = "TO THE MOON"
 
-    # Figures
+    # Figures → HTML (build outside f-strings)
     fig1 = make_powerlaw_fig(full, data, bands_usd_full, bands_gold_data, denom_default="USD")
-    fig1_html = pio.to_html(fig1, include_plotlyjs=False, full_html=False, config={"displaylogo": False}, div_id="plfig")
+    fig1_html = pio.to_html(fig1, include_plotlyjs=False, full_html=False,
+                            config={"displaylogo": False}, div_id="plfig")
 
     dma = data[data["Date"] >= DMA_START].copy()
     dma["BTC_50"]  = dma["BTC"].rolling(50).mean()
     dma["BTC_200"] = dma["BTC"].rolling(200).mean()
     dma["G50"]     = dma["BTCG"].rolling(50).mean()
     dma["G200"]    = dma["BTCG"].rolling(200).mean()
-    dma = dma.dropna()
+    dma = dma.dropna().reset_index(drop=True)
+
     fig2 = make_dma_fig(dma, denom_default="USD")
-    fig2_html = pio.to_html(fig2, include_plotlyjs=False, full_html=False, config={"displaylogo": False}, div_id="dmafig")
+    fig2_html = pio.to_html(fig2, include_plotlyjs=False, full_html=False,
+                            config={"displaylogo": False}, div_id="dmafig")
 
     # ----- index.html (power-law) -----
     index_controls = """
@@ -418,7 +418,7 @@ document.addEventListener('DOMContentLoaded', function(){
     dma_body = f"""
 <h1>BTC USD &amp; Gold — 50/200 DMA</h1>
 {dma_controls}
-<div class="panel">{pio.to_html(fig2, include_plotlyjs=False, full_html=False, config={{"displaylogo": False}}, div_id="dmafig")}</div>
+<div class="panel">{fig2_html}</div>
 """
     (DIST / "dma.html").write_text(wrap_html("BTC — USD & Gold DMA", dma_body), encoding="utf-8")
 
