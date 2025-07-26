@@ -418,7 +418,7 @@ def index_html(fig1_div: str, arrays_js: str) -> str:
 
 <script>
 const PL_ARRAYS = {arrays_js};
-document.addEventListener('DOMContentLoaded', function(){ setDenom('plfig','USD'); initSlider('plfig', PL_ARRAYS, 'USD'); });
+document.addEventListener('DOMContentLoaded', function(){{ setDenom('plfig','USD'); initSlider('plfig', PL_ARRAYS, 'USD'); }});
 </script>
 </body></html>"""
 
@@ -450,7 +450,7 @@ def dma_html(fig2_div: str) -> str:
 </div>
 
 <script>
-document.addEventListener('DOMContentLoaded', function(){ setDenom('dmafig','USD'); });
+document.addEventListener('DOMContentLoaded', function(){{ setDenom('dmafig','USD'); }});
 </script>
 </body></html>"""
 
