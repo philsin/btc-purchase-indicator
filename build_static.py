@@ -120,7 +120,7 @@ def fit_power(dates: pd.Series, values: pd.Series):
     sigma = float(np.std(y[mask] - (m * X[mask] + b)))
     return m, b, sigma
 
-def build_bands(dates: pd.Series, m: float, b: float, sigma: float) -> dict:
+def build_bands(dates, m: float, b: float, sigma: float) -> dict:
     """Return dict of arrays for each band over given dates (includes 'mid')."""
     X = log_days(dates)
     mid_log = m * X + b
@@ -161,12 +161,14 @@ def make_powerlaw_fig(df: pd.DataFrame):
     x_hist = log_days(df["Date"])
     x_full = log_days(full_dates)
 
-    # Labels
-    order = ["Top", "Frothy", "PL Best Fit", "Bear", "Support"]
-    date_labels_full = pd.to_datetime(full_dates).strftime("%b %Y")
-    date_labels_hist = pd.to_datetime(df["Date"]).strftime("%b %Y")
+    # Labels (robust for Series/Index)
+    date_labels_full = pd.Series(pd.to_datetime(full_dates)).dt.strftime("%b %Y").to_numpy()
+    date_labels_hist = pd.Series(pd.to_datetime(df["Date"])).dt.strftime("%b %Y").to_numpy()
 
     fig = go.Figure()
+
+    # Trace order and styles
+    order = ["Top", "Frothy", "PL Best Fit", "Bear", "Support"]
 
     # USD traces (visible by default)
     for name in order:
@@ -230,9 +232,9 @@ def make_powerlaw_fig(df: pd.DataFrame):
     )
     return fig, full_dates, bands_usd, bands_gld, usd_series, gld_series
 
-# --------------- HTML writer (no f-strings)
+# --------------- HTML writer (safe placeholders)
 def write_index_html(fig: go.Figure,
-                     full_dates: pd.Index,
+                     full_dates,
                      bands_usd: dict,
                      bands_gld: dict,
                      usd_hist: pd.Series,
@@ -243,12 +245,11 @@ def write_index_html(fig: go.Figure,
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    # Figure JSON
     fig_json = pio.to_json(fig, pretty=False)
 
-    # Data for slider/zone (align by ISO date strings)
-    dates_iso = pd.to_datetime(full_dates).strftime("%Y-%m-%d").tolist()
-    hist_iso  = pd.to_datetime(pd.Series(full_dates[:len(usd_hist)])).dt.strftime("%Y-%m-%d").tolist()
+    # Robust date formatting for Series/Index
+    dates_iso = pd.Series(pd.to_datetime(full_dates)).dt.strftime("%Y-%m-%d").tolist()
+    hist_iso  = pd.Series(pd.to_datetime(full_dates[:len(usd_hist)])).dt.strftime("%Y-%m-%d").tolist()
 
     payload = {
         "dates": dates_iso,
@@ -429,7 +430,7 @@ def write_index_html(fig: go.Figure,
 
     // Init
     setDenom("USD");
-    setLegend(true);
+    setLegend(True = true); // harmless; ensures legend visible on first paint
     updateReadout();
 
     window.addEventListener('resize', ()=> Plotly.Plots.resize(figEl));
