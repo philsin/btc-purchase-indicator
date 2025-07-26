@@ -274,16 +274,17 @@ def make_powerlaw_figure(df, denom="USD"):
 # ---------------------- page writer ----------------------
 def page_html(fig, usd_df, bands_usd, gld_df, bands_gld):
     """Return full HTML with controls + JS to switch denomination, legend, and zone."""
-    # pack arrays for JS (aligned on full timeline used in bands frames)
     full_dates = pd.to_datetime(bands_usd["Date"])
     full_iso   = full_dates.dt.strftime("%Y-%m-%d").tolist()
 
-    # For zone slider we need bands & prices aligned by date (both USD & Gold)
-    usd_hist_iso = usd_df["Date"].dt.strftime("%Y-%m-%d").tolist()
+    # USD history
+    usd_hist_iso   = usd_df["Date"].dt.strftime("%Y-%m-%d").tolist()
     usd_hist_price = usd_df["BTC"].astype(float).round(6).tolist()
 
-    gld_hist_series = (usd_df["BTC"] / usd_df["Gold"]).astype(float)
-    gld_hist_price  = gld_hist_series.round(6).tolist()
+    # GOLD history (oz/BTC) aligned to USD dates
+    gld_aligned      = gld_df.set_index("Date").reindex(usd_df["Date"]).fillna(method="ffill")
+    gld_hist_series  = gld_aligned["GLD"].astype(float)
+    gld_hist_price   = gld_hist_series.round(6).tolist()
 
     pack = dict(
         full_dates = full_iso,
@@ -294,16 +295,14 @@ def page_html(fig, usd_df, bands_usd, gld_df, bands_gld):
         gld_bands = {k: bands_gld[k].astype(float).round(6).tolist() for k in LEVELS},
     )
 
-    # Initial zone (today) in USD
+    # initial zone (today) in USD
     last_date = usd_df["Date"].iloc[-1]
-    # Locate nearest index in full_dates
     idx = int(np.searchsorted(full_dates.values, last_date.to_datetime64(), side="right") - 1)
     last_price = float(usd_df["BTC"].iloc[-1])
     row_bands = {k: float(bands_usd[k].iloc[idx]) for k in LEVELS}
     zone, dot_fg, chip_bg = zone_for(last_price, row_bands)
 
-    # JSON blobs
-    PJSON = json.dumps(pack, separators=(",", ":"))
+    PJSON   = json.dumps(pack, separators=(",", ":"))
     FIGJSON = fig.to_json()
 
     html = dedent("""
