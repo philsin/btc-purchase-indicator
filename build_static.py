@@ -32,10 +32,13 @@ LEVELS = {  # fixed sigma bands
 
 # ───────────────── utils ─────────────────
 def log_days(dates) -> np.ndarray:
-    """log10 of days since GENESIS (for log-time x-axis)."""
+    """log10 of days since GENESIS (robust for Series and Index)."""
     d = pd.to_datetime(dates)
-    days = (d - GENESIS).dt.days   # <-- use .dt.days (not .days)
-    return np.log10(np.maximum(days, 1))  # guard against 0/neg
+    delta = d - GENESIS
+    # convert timedeltas to float days for both Series and Index
+    days = np.asarray(delta / np.timedelta64(1, "D")).astype(float)
+    days = np.where(days < 1.0, 1.0, days)  # guard 0/neg
+    return np.log10(days)
 
 def year_ticks(end_year: int):
     """Year labels: every year 2012→2020, then every other year afterward."""
