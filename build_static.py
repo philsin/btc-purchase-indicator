@@ -136,27 +136,29 @@ def css():
 
 def shell(title: str, body: str, back_href: str | None, fav_path: str | None):
     back_html = f'<a class="back" href="{back_href}">← Back</a>' if back_href else ""
-    fav_html  = ""
+    fav_html = ""
     if fav_path:
-        fav_html = f"""
+        # Use doubled braces to emit literal { } in the JS
+        fav_html = """
         <div id="fav" class="fav">☆ Favorite</div>
         <script>
           const key='btcpi_favorite';
           const favEl=document.getElementById('fav');
-          function update(){
+          function update(){{
             const val=localStorage.getItem(key);
-            if(val==='{fav_path}'){{favEl.classList.add('on'); favEl.textContent='★ Favorite';}}
-            else{{favEl.classList.remove('on'); favEl.textContent='☆ Favorite';}}
-          }
+            if(val==='{{FAV}}'){{ favEl.classList.add('on'); favEl.textContent='★ Favorite'; }}
+            else{{ favEl.classList.remove('on'); favEl.textContent='☆ Favorite'; }}
+          }}
           favEl.onclick=()=>{{
             const val=localStorage.getItem(key);
-            if(val==='{fav_path}') localStorage.removeItem(key);
-            else localStorage.setItem(key,'{fav_path}');
+            if(val==='{{FAV}}') localStorage.removeItem(key);
+            else localStorage.setItem(key,'{{FAV}}');
             update();
           }};
           update();
         </script>
-        """
+        """.replace("{{FAV}}", fav_path)
+
     return f"""<!doctype html>
 <html lang="en"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
