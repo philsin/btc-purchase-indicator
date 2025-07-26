@@ -2,7 +2,7 @@
 # ─────────────────────────────────────────────────────────────
 # build_static.py  ·  BTC Purchase Indicator (static Plotly)
 #  - Power-law on log-time (days since 2009-01-03)
-#  - Denomination switch: USD/BTC or BTC/oz Gold
+#  - Denomination switch: USD/BTC or Gold oz/BTC
 #  - Bands projected monthly to 2040-12
 #  - Safe HTML embed (no f-strings in HTML/JS)
 # ─────────────────────────────────────────────────────────────
@@ -146,7 +146,7 @@ def year_ticks(start=2012, dense_until=2020, end=2040):
 def make_powerlaw_fig(df: pd.DataFrame):
     # Series
     usd_series = df["BTC"].astype(float)                  # USD / BTC
-    gld_series = (df["Gold"] / df["BTC"]).astype(float)   # BTC / oz Gold
+    gld_series = (df["BTC"] / df["Gold"]).astype(float)   # Gold oz / BTC  ← (desired)
 
     # Fits
     m_usd, b_usd, s_usd = fit_power(df["Date"], usd_series)
@@ -195,24 +195,24 @@ def make_powerlaw_fig(df: pd.DataFrame):
         visible=True
     ))
 
-    # Gold traces (hidden initially) — BTC per oz Gold
+    # Gold traces (hidden initially) — Gold oz per BTC
     for name in order:
-        label = name + " (BTC/oz)"
+        label = name + " (oz/BTC)"
         y = bands_gld["mid"] if name == "PL Best Fit" else bands_gld[name]
         fig.add_trace(go.Scatter(
             x=x_full, y=y, mode="lines",
             line=dict(color=COLORS[name], width=2, dash=DASHES[name]),
             name=label, legendgroup="GLD",
             customdata=date_labels_full,
-            hovertemplate=label + " | (%{customdata}, %{y:,.6f} BTC/oz)<extra></extra>",
+            hovertemplate=label + " | (%{customdata}, %{y:,.6f} oz/BTC)<extra></extra>",
             visible=False
         ))
     fig.add_trace(go.Scatter(
         x=x_hist, y=gld_series, mode="lines",
         line=dict(color=COLORS["BTC"], width=2.5),
-        name="BTC (BTC/oz)", legendgroup="GLD",
+        name="BTC (oz/BTC)", legendgroup="GLD",
         customdata=date_labels_hist,
-        hovertemplate="BTC | (%{customdata}, %{y:,.6f} BTC/oz)<extra></extra>",
+        hovertemplate="BTC | (%{customdata}, %{y:,.6f} oz/BTC)<extra></extra>",
         visible=False
     ))
 
@@ -317,7 +317,7 @@ def write_index_html(fig: go.Figure,
         <label for="denom">Denomination</label>
         <select id="denom" style="min-width:9.2rem;">
           <option value="USD" selected>USD</option>
-          <option value="Gold">BTC / oz Gold</option>
+          <option value="Gold">Gold oz / BTC</option>
         </select>
       </div>
       <button class="btn" id="legendBtn">Legend</button>
@@ -375,17 +375,17 @@ def write_index_html(fig: go.Figure,
       GLD_IDX.forEach(i => vis[i] = !usdOn);
       Plotly.restyle(figEl, {"visible": vis});
       Plotly.relayout(figEl, {
-        "yaxis.title.text": (usdOn ? "USD / BTC" : "BTC / oz Gold"),
+        "yaxis.title.text": (usdOn ? "USD / BTC" : "Gold oz / BTC"),
         "yaxis.tickformat": (usdOn ? "$,d" : ",.6f")
       });
       updateReadout();
     }
 
     function fmtUSD(v){ return (v==null||!isFinite(v)) ? "—" : "$"+Math.round(v).toLocaleString(); }
-    function fmtBTCoz(v){
+    function fmtOzBTC(v){
       if (v==null || !isFinite(v)) return "—";
-      const n = Math.round(v * 1e6) / 1e6;  // 6 dp typical for BTC fractions
-      return n.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:6}) + " BTC/oz";
+      const n = Math.round(v * 1e6) / 1e6;
+      return n.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:6}) + " oz/BTC";
     }
 
     function zoneFor(val, bands){
@@ -434,7 +434,7 @@ def write_index_html(fig: go.Figure,
 
       dateRead.textContent = (denom==="USD")
         ? (dISO + " · " + fmtUSD(price))
-        : (dISO + " · " + fmtBTCoz(price));
+        : (dISO + " · " + fmtOzBTC(price));
     }
 
     denomSel.addEventListener('change', (e)=> setDenom(e.target.value));
