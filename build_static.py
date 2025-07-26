@@ -1,4 +1,7 @@
 import os, pandas as pd, numpy as np, plotly.graph_objects as go
+from pathlib import Path
+OUT = Path("dist")
+OUT.mkdir(parents=True, exist_ok=True)
 
 # ───────── Settings ─────────
 GENESIS    = pd.Timestamp("2009-01-03")
