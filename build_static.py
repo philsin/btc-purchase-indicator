@@ -199,17 +199,16 @@ def make_powerlaw_fig(df: pd.DataFrame) -> go.Figure:
     for name in ["Top","Frothy","PL Best Fit","Bear","Support"]:
         y = bands_usd["mid"] if name == "PL Best Fit" else bands_usd[name]
         fig.add_trace(go.Scatter(
-            x=x_full, y=y, mode="lines",
-            line=dict(color=colors[name], width=2, dash=dashes[name]),
-            name=f"{leg[name]} (USD)",
-            legendgroup="USD", hovertemplate=f"{name} | %{{customdata}}<extra></extra>",
-            visible=True,  # default visible for USD
-            customdata=[None]*len(y)
-        ))
+    x=..., y=...,
+    name=name_usd,
+    line=dict(color=..., dash="dash"),
+    hovertemplate=f"{name_usd} | %{{x|%b %Y}}, %{{y:$,.0f}}<extra></extra>"
+))
     fig.add_trace(go.Scatter(
         x=x_hist, y=usd_series, mode="lines",
         line=dict(color=colors["BTC"], width=2.5),
-        name="BTC (USD)", legendgroup="USD", hovertemplate="BTC | $%{y:,.0f}<extra></extra>",
+        name="BTC (USD)", legendgroup="USD", 
+        hovertemplate="BTC | %{x|%b %Y}, %{y:$,.0f}<extra></extra>"
         visible=True
     ))
 
@@ -217,17 +216,16 @@ def make_powerlaw_fig(df: pd.DataFrame) -> go.Figure:
     for name in ["Top","Frothy","PL Best Fit","Bear","Support"]:
         y = bands_gld["mid"] if name == "PL Best Fit" else bands_gld[name]
         fig.add_trace(go.Scatter(
-            x=x_full, y=y, mode="lines",
-            line=dict(color=colors[name], width=2, dash=dashes[name]),
-            name=f"{leg[name]} (Gold)", legendgroup="GLD",
-            hovertemplate=f"{name} | %{ { } }<extra></extra>",  # will be overridden in JS
-            visible=False
-        ))
-    fig.add_trace(go.Scatter(
+        x=..., y=...,
+        name=name_gld,
+        line=dict(color=..., dash="dash"),
+        hovertemplate=f"{name_gld} | %{{x|%b %Y}}, %{{y:,.2f}} oz<extra></extra>"
+    ))
+        fig.add_trace(go.Scatter(
         x=x_hist, y=gld_series, mode="lines",
         line=dict(color=colors["BTC"], width=2.5),
         name="BTC (Gold)", legendgroup="GLD",
-        hovertemplate=f"{name} | %{y:.2f} oz<extra></extra>",
+        hovertemplate="BTC | %{x|%b %Y}, %{y:,.2f} oz<extra></extra>"
         visible=False
     ))
 
