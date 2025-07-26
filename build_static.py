@@ -97,9 +97,17 @@ def load_btc_gold() -> pd.DataFrame:
     return df
 
 # --------------- math: power-law fit on log-time
-def log_days(dates: pd.Series) -> np.ndarray:
-    # log10 of days since genesis; treat <=0 as NaN
-    days = (pd.to_datetime(dates) - GENESIS).dt.days.to_numpy()
+def log_days(dates) -> np.ndarray:
+    """Return log10(days since GENESIS) for Series or Index safely."""
+    td = pd.to_datetime(dates) - GENESIS
+    if isinstance(td, pd.Series):
+        days = td.dt.days.to_numpy()
+    elif isinstance(td, pd.TimedeltaIndex):
+        # TimedeltaIndex exposes .days directly (ndarray)
+        days = td.days.astype(float)
+    else:
+        # Fallback for ndarray/list of timedeltas
+        days = (np.asarray(td) / np.timedelta64(1, "D")).astype(float)
     days = np.where(days <= 0, np.nan, days)
     return np.log10(days)
 
@@ -219,7 +227,7 @@ def make_powerlaw_fig(df: pd.DataFrame) -> go.Figure:
         x=x_hist, y=gld_series, mode="lines",
         line=dict(color=colors["BTC"], width=2.5),
         name="BTC (Gold)", legendgroup="GLD",
-        hovertemplate="BTC | %{y:,.2f} oz<extra></extra>",
+        hovertemplate=f"{name} | %{y:.2f} oz<extra></extra>",
         visible=False
     ))
 
@@ -290,14 +298,14 @@ def write_index_html(fig: go.Figure,
     arrays_json = json.dumps(PL_ARRAYS, separators=(",",":"))
 
     html = f"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>{page_title}</title>
-<link rel="preconnect" href="https://cdn.plot.ly">
-<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
-<style>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width,initial-scale=1"/>
+    <title>{page_title}</title>
+    <link rel="preconnect" href="https://cdn.plot.ly">
+    <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+    <style>
   :root {{
     color-scheme: dark;
     --bg:#0f1116; --fg:#e7e9ee; --muted:#8e95a5; --card:#151821;
@@ -322,9 +330,9 @@ def write_index_html(fig: go.Figure,
   .slider {{ width:100%; }}
   #fig {{ height:70vh; min-height:430px; }}
   .spacer {{ height:10px; }}
-</style>
-</head>
-<body>
+    </style>
+    </head>
+    <body>
   <div class="wrap">
     <h1>BTC Purchase Indicator</h1>
 
