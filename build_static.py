@@ -202,13 +202,13 @@ def make_powerlaw_fig(df: pd.DataFrame) -> go.Figure:
     x=..., y=...,
     name=name_usd,
     line=dict(color=..., dash="dash"),
-    hovertemplate=f"{name_usd} | %{{x|%b %Y}}, %{{y:$,.0f}}<extra></extra>"
+    hovertemplate=f"{name_usd} | %{{x|%b %Y}}, %{{y:$,.0f}}<extra></extra>",
 ))
     fig.add_trace(go.Scatter(
         x=x_hist, y=usd_series, mode="lines",
         line=dict(color=colors["BTC"], width=2.5),
         name="BTC (USD)", legendgroup="USD", 
-        hovertemplate="BTC | %{x|%b %Y}, %{y:$,.0f}<extra></extra>"
+        hovertemplate="BTC | %{x|%b %Y}, %{y:$,.0f}<extra></extra>",
         visible=True
     ))
 
@@ -219,13 +219,13 @@ def make_powerlaw_fig(df: pd.DataFrame) -> go.Figure:
         x=..., y=...,
         name=name_gld,
         line=dict(color=..., dash="dash"),
-        hovertemplate=f"{name_gld} | %{{x|%b %Y}}, %{{y:,.2f}} oz<extra></extra>"
+        hovertemplate=f"{name_gld} | %{{x|%b %Y}}, %{{y:,.2f}} oz<extra></extra>",
     ))
         fig.add_trace(go.Scatter(
         x=x_hist, y=gld_series, mode="lines",
         line=dict(color=colors["BTC"], width=2.5),
         name="BTC (Gold)", legendgroup="GLD",
-        hovertemplate="BTC | %{x|%b %Y}, %{y:,.2f} oz<extra></extra>"
+        hovertemplate="BTC | %{x|%b %Y}, %{y:,.2f} oz<extra></extra>",
         visible=False
     ))
 
