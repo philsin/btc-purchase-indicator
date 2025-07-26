@@ -52,7 +52,11 @@ def fit_power_usd(df):
     return m, b, sigma
 
 def log_days(dates):
-    return np.log10((pd.to_datetime(dates) - GENESIS).dt.days)
+    """Log10 of day-count since GENESIS for any date-like (Series, Index, list)."""
+    td = pd.to_datetime(dates) - GENESIS          # Timedelta[ns] (Series/Index)
+    days = (td / np.timedelta64(1, 'D')).astype(float)  # convert to float days
+    days = np.clip(days, 1.0, None)               # avoid log10(0)
+    return np.log10(days)
 
 def year_ticks(end_year=2040):
     yrs = list(range(2012, min(2020, end_year)+1)) + list(range(2022, end_year+1, 2))
