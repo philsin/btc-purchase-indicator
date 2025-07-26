@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # ─────────────────────────────────────────────────────────────
 # build_static.py  ·  BTC Purchase Indicator (static Plotly)
+#  - Power-law on log-time (days since 2009-01-03)
+#  - Denomination switch: USD/BTC or BTC/oz Gold
+#  - Bands projected monthly to 2040-12
+#  - Safe HTML embed (no f-strings in HTML/JS)
 # ─────────────────────────────────────────────────────────────
 
 from pathlib import Path
@@ -92,7 +96,7 @@ def load_btc_gold() -> pd.DataFrame:
     except Exception:
         gold = _gold_lbma()
 
-    # Align to BTC calendar; forward-fill gold
+    # Align to BTC calendar; forward-fill gold to BTC dates
     gold_ff = gold.set_index("Date").reindex(btc["Date"]).ffill().reset_index()
     gold_ff = gold_ff.rename(columns={"index":"Date"})
     df = btc.merge(gold_ff, on="Date", how="left").dropna()
@@ -141,8 +145,8 @@ def year_ticks(start=2012, dense_until=2020, end=2040):
 # --------------- figure
 def make_powerlaw_fig(df: pd.DataFrame):
     # Series
-    usd_series = df["BTC"].astype(float)                 # USD / BTC
-    gld_series = (df["Gold"] / df["BTC"]).astype(float)  # Gold oz / BTC
+    usd_series = df["BTC"].astype(float)                  # USD / BTC
+    gld_series = (df["Gold"] / df["BTC"]).astype(float)   # BTC / oz Gold
 
     # Fits
     m_usd, b_usd, s_usd = fit_power(df["Date"], usd_series)
@@ -191,24 +195,24 @@ def make_powerlaw_fig(df: pd.DataFrame):
         visible=True
     ))
 
-    # Gold traces (hidden initially)
+    # Gold traces (hidden initially) — BTC per oz Gold
     for name in order:
-        label = name + " (Gold)"
+        label = name + " (BTC/oz)"
         y = bands_gld["mid"] if name == "PL Best Fit" else bands_gld[name]
         fig.add_trace(go.Scatter(
             x=x_full, y=y, mode="lines",
             line=dict(color=COLORS[name], width=2, dash=DASHES[name]),
             name=label, legendgroup="GLD",
             customdata=date_labels_full,
-            hovertemplate=label + " | (%{customdata}, %{y:,.2f} oz)<extra></extra>",
+            hovertemplate=label + " | (%{customdata}, %{y:,.6f} BTC/oz)<extra></extra>",
             visible=False
         ))
     fig.add_trace(go.Scatter(
         x=x_hist, y=gld_series, mode="lines",
         line=dict(color=COLORS["BTC"], width=2.5),
-        name="BTC (Gold)", legendgroup="GLD",
+        name="BTC (BTC/oz)", legendgroup="GLD",
         customdata=date_labels_hist,
-        hovertemplate="BTC | (%{customdata}, %{y:,.2f} oz)<extra></extra>",
+        hovertemplate="BTC | (%{customdata}, %{y:,.6f} BTC/oz)<extra></extra>",
         visible=False
     ))
 
@@ -232,7 +236,7 @@ def make_powerlaw_fig(df: pd.DataFrame):
     )
     return fig, full_dates, bands_usd, bands_gld, usd_series, gld_series
 
-# --------------- HTML writer (safe placeholders)
+# --------------- HTML writer (safe placeholders; no f-strings)
 def write_index_html(fig: go.Figure,
                      full_dates,
                      bands_usd: dict,
@@ -249,6 +253,7 @@ def write_index_html(fig: go.Figure,
 
     # Robust date formatting for Series/Index
     dates_iso = pd.Series(pd.to_datetime(full_dates)).dt.strftime("%Y-%m-%d").tolist()
+    # historical dates are the first N items of full_dates, where N=len(usd_hist)
     hist_iso  = pd.Series(pd.to_datetime(full_dates[:len(usd_hist)])).dt.strftime("%Y-%m-%d").tolist()
 
     payload = {
@@ -310,9 +315,9 @@ def write_index_html(fig: go.Figure,
       <div class="chip"><span id="zoneDot" class="dot"></span> <b>Price Zone:</b> <span id="zoneTxt" style="margin-left:6px">—</span></div>
       <div class="row" style="gap:8px;">
         <label for="denom">Denomination</label>
-        <select id="denom" style="min-width:6.5rem;">
+        <select id="denom" style="min-width:9.2rem;">
           <option value="USD" selected>USD</option>
-          <option value="Gold">Gold</option>
+          <option value="Gold">BTC / oz Gold</option>
         </select>
       </div>
       <button class="btn" id="legendBtn">Legend</button>
@@ -339,11 +344,11 @@ def write_index_html(fig: go.Figure,
     const figEl = document.getElementById('fig');
     Plotly.newPlot(figEl, FIG.data, FIG.layout, {displaylogo:false, responsive:true});
 
-    // Identify USD vs Gold traces by name
+    // Identify USD vs Gold traces by legendgroup
     const USD_IDX = [], GLD_IDX = [];
     (FIG.data||[]).forEach((tr,i)=>{
-      const nm = (tr.name||"");
-      if (/\(Gold\)/.test(nm)) GLD_IDX.push(i); else USD_IDX.push(i);
+      const grp = (tr.legendgroup||"");
+      if (grp === "GLD") GLD_IDX.push(i); else USD_IDX.push(i);
     });
 
     // Controls
@@ -369,12 +374,19 @@ def write_index_html(fig: go.Figure,
       USD_IDX.forEach(i => vis[i] = usdOn);
       GLD_IDX.forEach(i => vis[i] = !usdOn);
       Plotly.restyle(figEl, {"visible": vis});
-      Plotly.relayout(figEl, {"yaxis.title.text": (usdOn ? "USD / BTC" : "Gold oz / BTC")});
+      Plotly.relayout(figEl, {
+        "yaxis.title.text": (usdOn ? "USD / BTC" : "BTC / oz Gold"),
+        "yaxis.tickformat": (usdOn ? "$,d" : ",.6f")
+      });
       updateReadout();
     }
 
     function fmtUSD(v){ return (v==null||!isFinite(v)) ? "—" : "$"+Math.round(v).toLocaleString(); }
-    function fmtOZ(v){  return (v==null||!isFinite(v)) ? "—" : (Math.round(v*100)/100).toLocaleString()+" oz"; }
+    function fmtBTCoz(v){
+      if (v==null || !isFinite(v)) return "—";
+      const n = Math.round(v * 1e6) / 1e6;  // 6 dp typical for BTC fractions
+      return n.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:6}) + " BTC/oz";
+    }
 
     function zoneFor(val, bands){
       if (val==null) return "—";
@@ -422,7 +434,7 @@ def write_index_html(fig: go.Figure,
 
       dateRead.textContent = (denom==="USD")
         ? (dISO + " · " + fmtUSD(price))
-        : (dISO + " · " + fmtOZ(price));
+        : (dISO + " · " + fmtBTCoz(price));
     }
 
     denomSel.addEventListener('change', (e)=> setDenom(e.target.value));
@@ -430,7 +442,7 @@ def write_index_html(fig: go.Figure,
 
     // Init
     setDenom("USD");
-    setLegend(True = true); // harmless; ensures legend visible on first paint
+    setLegend(true);
     updateReadout();
 
     window.addEventListener('resize', ()=> Plotly.Plots.resize(figEl));
