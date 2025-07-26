@@ -154,9 +154,11 @@ def _btc_stooq():
 
 def _btc_github():
     raw = "https://raw.githubusercontent.com/datasets/bitcoin-price/master/data/bitcoin_price.csv"
-    df  = pd.read_csv(raw, headers=UA).rename(columns={"Closing Price (USD)": "BTC"})
+    r = requests.get(raw, headers=UA, timeout=30)
+    r.raise_for_status()
+    df = pd.read_csv(io.StringIO(r.text)).rename(columns={"Closing Price (USD)": "BTC"})
     df["Date"] = pd.to_datetime(df["Date"])
-    return df[["Date","BTC"]]
+    return df[["Date", "BTC"]]
 
 def load_btc():
     try:
@@ -178,10 +180,12 @@ def _gold_stooq():
 
 def _gold_lbma():
     url = "https://raw.githubusercontent.com/koindata/gold-prices/master/data/gold.csv"
-    df  = pd.read_csv(url, headers=UA)
+    r = requests.get(url, headers=UA, timeout=30)
+    r.raise_for_status()
+    df = pd.read_csv(io.StringIO(r.text))
     df["Date"] = pd.to_datetime(df["Date"])
     df = df.rename(columns={"USD (PM)": "Gold"})
-    return df[["Date","Gold"]].dropna()
+    return df[["Date", "Gold"]].dropna()
 
 def load_gold():
     try:
