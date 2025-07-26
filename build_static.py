@@ -1,5 +1,7 @@
 # build_static.py — static site for GitHub Pages
-# Adds "View at date" slider: zone badge updates for the selected past date.
+# Power-law (log-time) + DMA pages, with denomination switch:
+#   USD  → axis "USD / BTC"
+#   Gold → axis "Gold oz / BTC"  (oz of gold per 1 BTC)
 import io
 from pathlib import Path
 import requests
@@ -134,14 +136,15 @@ def make_powerlaw_fig(full, data, bands_usd_full, bands_gold_hist):
         xaxis=dict(type="linear", title="Year (log-time)",
                    tickmode="array", tickvals=tickvals, ticktext=ticktext,
                    showgrid=True, gridwidth=0.6),
-        yaxis=dict(type="log", title="Price (USD / BTC per oz)",
+        # default; JS switches title per denomination
+        yaxis=dict(type="log", title="USD / BTC",
                    tickformat="$,d", showgrid=True, gridwidth=0.6),
         plot_bgcolor="#111", paper_bgcolor="#111",
         margin=dict(l=60,r=40,t=16,b=48),
-        showlegend=False  # hidden until user clicks "Legend"
+        showlegend=False
     ))
 
-    # USD (0..5)
+    # USD traces (0..5)
     color_usd = {"Top":"green","Frothy":"rgba(100,255,100,1)","PL Best Fit":"white",
                  "Bear":"rgba(255,100,100,1)","Support":"red"}
     for nm in ["Top","Frothy","PL Best Fit","Bear","Support"]:
@@ -152,15 +155,16 @@ def make_powerlaw_fig(full, data, bands_usd_full, bands_gold_hist):
                              name="BTC (USD)", line=dict(color="gold", width=2),
                              visible=True))
 
-    # Gold (6..11)  — BTC per oz
+    # Gold oz/BTC traces (6..11)
     color_g = {"Top":"#ffd54f","Frothy":"#ffeb3b","PL Best Fit":"#fff8e1",
                "Bear":"#ffcc80","Support":"#ffb74d"}
     for nm in ["Top","Frothy","PL Best Fit","Bear","Support"]:
         fig.add_trace(go.Scatter(x=x_data, y=bands_gold_hist[nm],
-                                 name=f"{nm} (Gold)", line=dict(color=color_g[nm], dash="dash"),
+                                 name=f"{nm} (Gold oz/BTC)",
+                                 line=dict(color=color_g[nm], dash="dash"),
                                  visible=False))
-    fig.add_trace(go.Scatter(x=x_data, y=data["BTC_per_oz"],
-                             name="BTC (per oz)", line=dict(color="#ffc107", width=2),
+    fig.add_trace(go.Scatter(x=x_data, y=data["OZ_per_BTC"],
+                             name="BTC (Gold oz/BTC)", line=dict(color="#ffc107", width=2),
                              visible=False))
     return fig
 
@@ -169,8 +173,8 @@ def make_dma_fig(dma):
         template="plotly_dark",
         font=dict(family="Currency, monospace", size=12),
         xaxis=dict(type="date", title="Year", showgrid=True, gridwidth=0.5),
-        yaxis=dict(type="log", title="BTC Price (USD)", tickformat="$,d", showgrid=True, gridwidth=0.6),
-        yaxis2=dict(type="log", title="BTC per oz (Gold)", tickformat=",d",
+        yaxis=dict(type="log", title="USD / BTC", tickformat="$,d", showgrid=True, gridwidth=0.6),
+        yaxis2=dict(type="log", title="Gold oz / BTC", tickformat=",d",
                     overlaying="y", side="right", showgrid=False),
         plot_bgcolor="#111", paper_bgcolor="#111",
         margin=dict(l=60,r=40,t=16,b=48),
@@ -183,13 +187,12 @@ def make_dma_fig(dma):
                              line=dict(color="#43a047", width=1.5), visible=True))
     fig.add_trace(go.Scatter(x=dma["Date"], y=dma["BTC"],     name="BTC USD",
                              line=dict(color="#66bb6a", width=2), visible=True))
-    # marker placeholder (added by JS in this static build if desired)
-    # Gold 4..7
-    fig.add_trace(go.Scatter(x=dma["Date"], y=dma["G200"], name="200-DMA Gold",
+    # Gold 4..7 (oz/BTC)
+    fig.add_trace(go.Scatter(x=dma["Date"], y=dma["OZ200"], name="200-DMA Gold (oz/BTC)",
                              line=dict(color="#ffd54f", width=1.5), yaxis="y2", visible=False))
-    fig.add_trace(go.Scatter(x=dma["Date"], y=dma["G50"],  name="50-DMA Gold",
+    fig.add_trace(go.Scatter(x=dma["Date"], y=dma["OZ50"],  name="50-DMA Gold (oz/BTC)",
                              line=dict(color="#ffeb3b", width=1.5), yaxis="y2", visible=False))
-    fig.add_trace(go.Scatter(x=dma["Date"], y=dma["BTC_per_oz"], name="BTC per oz",
+    fig.add_trace(go.Scatter(x=dma["Date"], y=dma["OZ_per_BTC"], name="Gold oz / BTC",
                              line=dict(color="#ffc107", width=2), yaxis="y2", visible=False))
     return fig
 
@@ -222,9 +225,9 @@ function setDenom(figId, denom){
   Plotly.restyle(figId, {'visible': gVis},  goldIdx);
   if(figId==='plfig'){
     if(denom==='USD'){
-      Plotly.relayout(figId, {'yaxis.title.text':'Price (USD / BTC per oz)','yaxis.tickformat':'$,d'});
+      Plotly.relayout(figId, {'yaxis.title.text':'USD / BTC','yaxis.tickformat':'$,d'});
     }else{
-      Plotly.relayout(figId, {'yaxis.title.text':'BTC per oz (Gold)','yaxis.tickformat':',d'});
+      Plotly.relayout(figId, {'yaxis.title.text':'Gold oz / BTC','yaxis.tickformat':',d'});
     }
   }
 }
@@ -257,20 +260,21 @@ function bindPowerlawInteractions(store){
     const d = sel.value;
     const i = parseInt(slider.value,10);
     const date = store.dates[i];
-    let price, sup,bear,fro,top;
+    let price, sup,bear,fro,top, txt;
     if(d==='USD'){
       price = store.price_usd[i];
       sup = store.usd.Support[i]; bear = store.usd.Bear[i];
       fro = store.usd["Frothy"][i]; top = store.usd["Top"][i];
+      txt = '$'+price.toLocaleString();
     }else{
-      price = store.price_gold[i];
+      price = store.price_gold[i]; // oz/BTC
       sup = store.gold.Support[i]; bear = store.gold.Bear[i];
       fro = store.gold["Frothy"][i]; top = store.gold["Top"][i];
+      txt = (Math.round(price)).toLocaleString()+' oz/BTC';
     }
     const zone = zoneFrom(price, sup, bear, fro, top);
     updateBadge(zone);
-    label.innerHTML = `<span class="small">${date} · ${d==='USD' ? '$'+price.toLocaleString() : (Math.round(price)).toLocaleString()+' BTC/oz'}</span>`;
-    // vertical guide on x (log-time)
+    label.innerHTML = `<span class="small">${date} · ${txt}</span>`;
     Plotly.relayout('plfig', {shapes: [{
       type:'line', xref:'x', yref:'paper', x0: store.xlog[i], x1: store.xlog[i], y0:0, y1:1,
       line:{color:'#888', width:1, dash:'dot'}
@@ -278,7 +282,6 @@ function bindPowerlawInteractions(store){
   }
   sel.addEventListener('change', ()=>{ setDenom('plfig', sel.value); apply(); });
   slider.addEventListener('input', apply);
-  // initial
   setDenom('plfig', sel.value);
   slider.value = store.dates.length-1;
   apply();
@@ -308,7 +311,9 @@ def build():
     btc  = load_btc()
     gold = load_gold()
     data = pd.merge(btc, gold, on="Date", how="inner").sort_values("Date").reset_index(drop=True)
-    data["BTC_per_oz"] = data["Gold"] / data["BTC"]
+
+    # Gold denomination series: oz of gold per BTC
+    data["OZ_per_BTC"] = data["BTC"] / data["Gold"]
 
     # power-law (USD)
     slope, intercept, sigma = fit_power(data)
@@ -324,11 +329,13 @@ def build():
     mid_full = slope * x_full + intercept
     bands_usd_full = {nm: 10 ** (mid_full + sigma_vis * k) for nm,k in LEVELS.items()}
 
-    # Bands – historical arrays for USD & Gold (for zone slider)
+    # Bands – historical arrays for USD & (oz/BTC)
     x_data = log_days(data["Date"])
     mid_data = slope * x_data + intercept
-    bands_usd_hist = {nm: 10 ** (mid_data + sigma_vis * k) for nm,k in LEVELS.items()}
-    bands_gold_hist = {nm: data["Gold"].to_numpy() / bands_usd_hist[nm] for nm in LEVELS}
+    bands_usd_hist  = {nm: 10 ** (mid_data + sigma_vis * k) for nm,k in LEVELS.items()}
+    # oz/BTC = (USD/BTC) / (USD/oz)
+    gold_arr = data["Gold"].to_numpy()
+    bands_gold_hist = {nm: bands_usd_hist[nm] / gold_arr for nm in LEVELS}
 
     # default zone at latest (USD)
     ref = {nm: bands_usd_hist[nm][-1] for nm in LEVELS}
@@ -347,23 +354,27 @@ def build():
     dma = data[data["Date"] >= DMA_START].copy()
     dma["BTC_50"]  = dma["BTC"].rolling(50).mean()
     dma["BTC_200"] = dma["BTC"].rolling(200).mean()
-    dma["G50"]     = dma["BTC_per_oz"].rolling(50).mean()
-    dma["G200"]    = dma["BTC_per_oz"].rolling(200).mean()
+    # oz/BTC DMAs
+    dma["OZ_per_BTC"] = dma["OZ_per_BTC"].astype(float)
+    dma["OZ50"]  = dma["OZ_per_BTC"].rolling(50).mean()
+    dma["OZ200"] = dma["OZ_per_BTC"].rolling(200).mean()
     dma = dma.dropna().reset_index(drop=True)
+
     fig2 = make_dma_fig(dma)
     fig2_html = pio.to_html(fig2, include_plotlyjs=False, full_html=False,
                             config={"displaylogo": False}, div_id="dmafig")
 
-    # ── data blob for JS (power-law slider)
+    # ── data blob for power-law slider
     store = {
         "dates": data["Date"].dt.strftime("%Y-%m-%d").tolist(),
         "xlog":  log_days(data["Date"]).tolist(),
-        "price_usd": data["BTC"].round(2).tolist(),
-        "price_gold": data["BTC_per_oz"].round(0).tolist(),
-        "usd": {k: np.asarray(v).round(2).tolist() for k,v in bands_usd_hist.items()},
-        "gold": {k: np.asarray(v).round(2).tolist() for k,v in bands_gold_hist.items()},
+        "price_usd": data["BTC"].round(2).tolist(),                 # USD/BTC
+        "price_gold": data["OZ_per_BTC"].round(2).tolist(),          # oz/BTC
+        "usd": {k: np.asarray(v).round(2).tolist() for k,v in {**bands_usd_hist}.items()},
+        "gold": {k: np.asarray(v).round(2).tolist() for k,v in {**bands_gold_hist}.items()},
     }
     data_js = f"const PL_STORE = {store};"
+
     # ── index.html
     index_controls_top = """
 <div class="controls">
@@ -385,7 +396,6 @@ def build():
   <span id="selLabel" class="small"></span>
 </div>
 """
-    # set correct max in a tiny inline script
     bottom_script = f"<script>document.getElementById('dateidx').max={len(store['dates'])-1};</script>"
 
     index_body = f"""
@@ -393,18 +403,16 @@ def build():
 {zone_badge_html(zone)}
 {index_controls_top}
 {index_controls_bottom}
-<div class="panel">{fig1_html}</div>
+<div class="panel">{pio.to_html(fig1, include_plotlyjs=False, full_html=False, config={{"displaylogo": False}}, div_id="plfig")}</div>
 {bottom_script}
-<script>document.addEventListener('DOMContentLoaded',function(){{
-  bindPowerlawInteractions(PL_STORE);
-}});</script>
+<script>document.addEventListener('DOMContentLoaded',function(){{ bindPowerlawInteractions(PL_STORE); }});</script>
 """
     (DIST/"index.html").write_text(
         wrap_html("BTC Purchase Indicator", index_body, data_js),
         encoding="utf-8"
     )
 
-    # ── dma.html (unchanged UI except legend toggle & denom dropdown wired like before)
+    # ── dma.html
     dma_controls = """
 <div class="controls">
   <a class="btn" href="javascript:void(0)" onclick="back()">← Back</a>
@@ -417,21 +425,23 @@ def build():
   <a class="btn" href="javascript:void(0)" onclick="toggleLegend('dmafig')">Legend</a>
 </div>
 <script>
-document.addEventListener('DOMContentLoaded',function(){{
+document.addEventListener('DOMContentLoaded',function(){
   const sel=document.getElementById('denom2');
   function set(){
     const usdIdx=[0,1,2], goldIdx=[3,4,5];
-    Plotly.restyle('dmafig', {{'visible': sel.value==='USD'? true:'legendonly'}}, usdIdx);
-    Plotly.restyle('dmafig', {{'visible': sel.value==='Gold'? true:'legendonly'}}, goldIdx);
-    if(sel.value==='USD') Plotly.relayout('dmafig', {{'yaxis.title.text':'BTC Price (USD)','yaxis.tickformat':'$,d'}});
-    else Plotly.relayout('dmafig', {{'yaxis.title.text':'BTC per oz (Gold)','yaxis.tickformat':',d'}});
+    Plotly.restyle('dmafig', {'visible': sel.value==='USD'? true:'legendonly'}, usdIdx);
+    Plotly.restyle('dmafig', {'visible': sel.value==='Gold'? true:'legendonly'}, goldIdx);
+    if(sel.value==='USD')
+      Plotly.relayout('dmafig', {'yaxis.title.text':'USD / BTC','yaxis.tickformat':'$,d'});
+    else
+      Plotly.relayout('dmafig', {'yaxis.title.text':'Gold oz / BTC','yaxis.tickformat':',d'});
   }
   sel.addEventListener('change', set); set();
-}});
+});
 </script>
 """
     dma_body = f"""
-<h1>BTC — 50/200 DMA (USD &amp; BTC per oz)</h1>
+<h1>BTC — 50/200 DMA</h1>
 {dma_controls}
 <div class="panel">{fig2_html}</div>
 """
