@@ -1,14 +1,13 @@
 # build_static.py
 # Static builder for BTC Purchase Indicator (GitHub Pages)
-# - Power-law (log-time X, out to 2040)
+# - Power-law (log-time X to 2040), no anchoring (fit = historical only)
 # - DMA (USD or Gold oz/BTC)
-# - Legend toggle, denomination dropdown, back buttons
+# - Legend toggle, compact denomination dropdown, cross-page buttons
 # Python 3.11+
 
 from __future__ import annotations
 
-import json
-import math
+import io
 from pathlib import Path
 from typing import Iterable, Tuple
 
@@ -16,14 +15,13 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-# ────────────────────────────── constants
+# ─────────────────────────────────────────────────────────────
+# constants
 OUTDIR    = Path("dist")
 GENESIS   = pd.Timestamp("2009-01-03")
 PROJ_END  = pd.Timestamp("2040-12-31")
-ANCHOR_DT = pd.Timestamp("2030-01-01")
-ANCHOR_P  = 491_776.0  # USD (target mid-line at 2030-01-01)
 
-# fixed sigma bands (in stdev units)
+# fixed sigma bands (z-values) and colors
 LEVELS = {
     "Top": 1.75,
     "Frothy": 1.00,
@@ -32,304 +30,307 @@ LEVELS = {
     "Support": -1.50,
 }
 COLORS = {
-    "Top": "rgba(0,191,99,1)",
-    "Frothy": "rgba(144,238,144,1)",
+    "Top":       "#16a34a",   # green-600
+    "Frothy":    "#86efac",   # green-300
     "PL Best Fit": "white",
-    "Bear": "rgba(255,140,140,1)",
-    "Support": "rgba(255,59,59,1)",
-    "BTC": "gold",
+    "Bear":      "#fca5a5",   # red-300
+    "Support":   "#ef4444",   # red-500
+    "BTC":       "gold",
     # DMA palette
-    "DMA_50_USD": "mediumseagreen",
-    "DMA_200_USD": "forestgreen",
-    "DMA_50_GOLD": "khaki",
-    "DMA_200_GOLD": "goldenrod",
+    "DMA_50_USD":  "#60a5fa",   # blue-400
+    "DMA_200_USD": "#7c3aed",   # violet-600
+    "DMA_50_GOLD": "#fde047",   # yellow-300
+    "DMA_200_GOLD":"#f59e0b",   # amber-500
 }
 
-# ────────────────────────────── helpers
+# Zone → dot color (opposite of band tone as requested)
+ZONE_DOT = {
+    "SELL THE HOUSE!!": "#22c55e",  # green
+    "Buy":              "#86efac",  # light-green
+    "DCA":              "#ffffff",  # white
+    "Relax":            "#fdba74",  # light orange
+    "TO THE MOON":      "#ef4444",  # red
+}
 
-def days_since_genesis(dates: Iterable[pd.Timestamp]) -> np.ndarray:
-    """Return float days since GENESIS for pandas Series/Index/list."""
-    td = pd.to_datetime(dates) - GENESIS
-    return (td / pd.Timedelta(days=1)).to_numpy()
+# ─────────────────────────────────────────────────────────────
+# data loaders
 
-def log_days(dates: Iterable[pd.Timestamp]) -> np.ndarray:
-    d = days_since_genesis(dates)
-    # avoid log10(0)
-    d = np.clip(d, 1e-6, None)
-    return np.log10(d)
-
-def year_ticks(start: int, stop: int) -> Tuple[list[float], list[str]]:
-    """Ticks on log-time axis at Jan-01 for each year. Returns (vals, labels)."""
-    years = list(range(start, stop + 1))
-    dts = [pd.Timestamp(f"{y}-01-01") for y in years]
-    vals = log_days(dts).tolist()
-    txt  = [str(y) for y in years]
-    return vals, txt
+def _read_csv(url: str) -> pd.DataFrame:
+    return pd.read_csv(url)
 
 def fetch_btc() -> pd.DataFrame:
     # 1) Stooq
     try:
-        df = pd.read_csv("https://stooq.com/q/d/l/?s=btcusd&i=d")
-        cols = [c.lower() for c in df.columns]
-        df.columns = cols
-        date_col = [c for c in cols if "date" in c][0]
-        price_col = [c for c in cols if ("close" in c) or ("price" in c)][0]
+        df = _read_csv("https://stooq.com/q/d/l/?s=btcusd&i=d")
+        df.columns = [c.lower() for c in df.columns]
+        date_col  = [c for c in df.columns if "date"  in c][0]
+        price_col = [c for c in df.columns if ("close" in c) or ("price" in c)][0]
         df = df.rename(columns={date_col: "Date", price_col: "BTC"})
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        df["BTC"]  = pd.to_numeric(df["BTC"].astype(str).str.replace(",", ""), errors="coerce")
-        df = df.dropna().query("BTC>0").sort_values("Date")
-        if len(df) > 1000:
-            print(f"[build] BTC from Stooq: {len(df)} rows")
-            return df[["Date","BTC"]]
+        df["BTC"]  = pd.to_numeric(df["BTC"], errors="coerce")
+        out = df.dropna().query("BTC>0").sort_values("Date")
+        if len(out) > 1000:
+            print(f"[build] BTC from Stooq: {len(out)} rows")
+            return out[["Date","BTC"]]
     except Exception as e:
         print("[build] Stooq BTC failed:", e)
-
-    # 2) GitHub dataset fallback
-    raw = "https://raw.githubusercontent.com/datasets/bitcoin-price/master/data/bitcoin_price.csv"
-    rdf = pd.read_csv(raw).rename(columns={"Closing Price (USD)": "BTC"})
-    rdf["Date"] = pd.to_datetime(rdf["Date"])
-    rdf = rdf[["Date", "BTC"]].sort_values("Date")
-    print(f"[build] BTC from GitHub dataset: {len(rdf)} rows")
-    return rdf
+    # 2) GitHub dataset
+    try:
+        raw = _read_csv("https://raw.githubusercontent.com/datasets/bitcoin-price/master/data/bitcoin_price.csv")
+        raw = raw.rename(columns={"Closing Price (USD)": "BTC"})
+        raw["Date"] = pd.to_datetime(raw["Date"], errors="coerce")
+        raw["BTC"]  = pd.to_numeric(raw["BTC"], errors="coerce")
+        out = raw.dropna().sort_values("Date")[["Date","BTC"]]
+        print(f"[build] BTC from GitHub dataset: {len(out)} rows")
+        return out
+    except Exception as e:
+        raise RuntimeError(f"Failed to load BTC: {e}")
 
 def fetch_gold() -> pd.DataFrame:
     # 1) Stooq XAUUSD
     try:
-        df = pd.read_csv("https://stooq.com/q/d/l/?s=xauusd&i=d")
-        cols = [c.lower() for c in df.columns]
-        df.columns = cols
-        date_col = [c for c in cols if "date" in c][0]
-        price_col = [c for c in cols if ("close" in c) or ("price" in c)][0]
+        df = _read_csv("https://stooq.com/q/d/l/?s=xauusd&i=d")
+        df.columns = [c.lower() for c in df.columns]
+        date_col  = [c for c in df.columns if "date"  in c][0]
+        price_col = [c for c in df.columns if ("close" in c) or ("price" in c)][0]
         df = df.rename(columns={date_col: "Date", price_col: "Gold"})
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        df["Gold"] = pd.to_numeric(df["Gold"].astype(str).str.replace(",", ""), errors="coerce")
-        df = df.dropna().sort_values("Date")
-        if len(df) > 1000:
-            print(f"[build] Gold from Stooq: {len(df)} rows")
-            return df[["Date","Gold"]]
+        df["Gold"] = pd.to_numeric(df["Gold"], errors="coerce")
+        out = df.dropna().sort_values("Date")[["Date","Gold"]]
+        if len(out) > 1000:
+            print(f"[build] Gold from Stooq: {len(out)} rows")
+            return out
     except Exception as e:
         print("[build] Stooq Gold failed:", e)
+    # 2) LBMA mirror
+    try:
+        alt = _read_csv("https://raw.githubusercontent.com/koindata/gold-prices/master/data/gold.csv")
+        alt["Date"] = pd.to_datetime(alt["Date"], errors="coerce")
+        alt = alt.rename(columns={"USD (PM)": "Gold"})
+        out = alt[["Date","Gold"]].dropna().sort_values("Date")
+        print(f"[build] Gold from LBMA mirror: {len(out)} rows")
+        return out
+    except Exception as e:
+        raise RuntimeError(f"Failed to load Gold: {e}")
 
-    # 2) LBMA CSV fallback
-    raw = "https://raw.githubusercontent.com/koindata/gold-prices/master/data/gold.csv"
-    rdf = pd.read_csv(raw)
-    rdf["Date"] = pd.to_datetime(rdf["Date"])
-    rdf = rdf.rename(columns={"USD (PM)": "Gold"})
-    rdf = rdf[["Date","Gold"]].dropna().sort_values("Date")
-    print(f"[build] Gold from LBMA mirror: {len(rdf)} rows")
-    return rdf
+def load_merged() -> pd.DataFrame:
+    btc  = fetch_btc()
+    gold = fetch_gold()
+    df = pd.merge(btc, gold, on="Date", how="inner").sort_values("Date").reset_index(drop=True)
+    return df
 
-def fit_power(btc_df: pd.DataFrame) -> tuple[float, float, float]:
-    """Return slope, intercept, sigma for log10(price) vs log10(days since genesis)."""
-    X = log_days(btc_df["Date"])
-    y = np.log10(btc_df["BTC"].to_numpy())
+# ─────────────────────────────────────────────────────────────
+# transforms & model
+
+def days_since_genesis(dates: Iterable[pd.Timestamp]) -> np.ndarray:
+    td = pd.to_datetime(dates) - GENESIS
+    return (td / pd.Timedelta(days=1)).to_numpy()
+
+def log_days(dates: Iterable[pd.Timestamp]) -> np.ndarray:
+    d = np.clip(days_since_genesis(dates), 1.0, None)
+    return np.log10(d)
+
+def year_ticks_split(start=2012, split=2020, end=2040):
+    yrs = list(range(start, split + 1)) + list(range(split + 2, end + 1, 2))
+    vals = log_days([pd.Timestamp(f"{y}-01-01") for y in yrs]).tolist()
+    return vals, [str(y) for y in yrs]
+
+def extend_monthly_to_2040(df: pd.DataFrame) -> pd.DataFrame:
+    if df["Date"].max() >= PROJ_END:
+        return df.copy()
+    future = pd.date_range(df["Date"].max() + pd.offsets.MonthBegin(1), PROJ_END, freq="MS")
+    tail = pd.DataFrame({"Date": future})
+    out = pd.concat([df, tail], ignore_index=True)
+    # For Gold we need values to divide into bands; ffill Gold only
+    if "Gold" in out:
+        out["Gold"] = out["Gold"].ffill()
+    return out
+
+def fit_power(df_btc: pd.DataFrame) -> tuple[float,float,float]:
+    """Fit log10(price) ~ log10(days) from historical BTC (no anchoring)."""
+    X = log_days(df_btc["Date"])
+    y = np.log10(df_btc["BTC"].to_numpy())
     m, b = np.polyfit(X, y, 1)
-    mid = m * X + b
-    sigma = float(np.std(y - mid))
-    # Anchor at 2030-01-01 = ANCHOR_P
-    x_a = log_days([ANCHOR_DT])[0]
-    b = np.log10(ANCHOR_P) - m * x_a
+    sigma = float(np.std(y - (m * X + b)))
     return float(m), float(b), sigma
 
-def add_sigma_bands(df: pd.DataFrame, m: float, b: float, sigma: float) -> pd.DataFrame:
-    x = log_days(df["Date"])
+def add_sigma_bands_over(dates: pd.Series, m: float, b: float, sigma: float) -> pd.DataFrame:
+    """Compute PL mid & bands over an arbitrary date index."""
+    x = log_days(dates)
     mid_log = m * x + b
-    out = df.copy()
+    out = pd.DataFrame({"Date": pd.to_datetime(dates).to_pydatetime()})
     out["PL Best Fit"] = 10 ** mid_log
+    sig = max(0.25, sigma)
     for name, k in LEVELS.items():
         if name == "PL Best Fit":
             continue
-        out[name] = 10 ** (mid_log + sigma * k)
+        out[name] = 10 ** (mid_log + sig * k)
     return out
 
-def make_badge(zone: str) -> str:
-    return f"""
-    <div class="badge"><span class="dot"></span><span>Current zone:&nbsp;</span><strong>{zone}</strong></div>
-    """
+def zone_for(price: float, bands: dict[str,float]) -> str:
+    if price < bands["Support"]: return "SELL THE HOUSE!!"
+    if price < bands["Bear"]:    return "Buy"
+    if price < bands["Frothy"]:  return "DCA"
+    if price < bands["Top"]:     return "Relax"
+    return "TO THE MOON"
 
-def zone_for(p: float, bands: dict[str,float]) -> str:
-    if p < bands["Support"]:
-        return "SELL THE HOUSE!!"
-    if p < bands["Bear"]:
-        return "Buy"
-    if p < bands["Frothy"]:
-        return "DCA"
-    if p < bands["Top"]:
-        return "Relax"
-    return "Frothy"
+# ─────────────────────────────────────────────────────────────
+# figures
 
-def ensure_dir():
-    OUTDIR.mkdir(parents=True, exist_ok=True)
+def fig_powerlaw(df_hist: pd.DataFrame) -> go.Figure:
+    # Fit only on history
+    m, b, sigma = fit_power(df_hist)
 
-# ────────────────────────────── figures
+    # Build a timeline to 2040 for bands (price line remains historical)
+    base = df_hist[["Date","BTC","Gold"]].copy()
+    full = extend_monthly_to_2040(base)
 
-def fig_powerlaw(df_all: pd.DataFrame, denom_default="USD") -> go.Figure:
-    """
-    Build a dual-denomination power-law fig. We plot in log-time (x is log10 days),
-    but display year labels as ticktext.
-    """
-    # Compute bands (USD)
-    m, b, sigma = fit_power(df_all)
-    bands_usd = add_sigma_bands(df_all, m, b, max(sigma, 0.25))
+    # Bands in USD on the full timeline
+    bands_usd = add_sigma_bands_over(full["Date"], m, b, sigma)
+    bands_usd = bands_usd.merge(full[["Date","Gold"]], on="Date", how="left")
 
-    # Gold oz/BTC
-    df_gold = bands_usd.copy()
-    df_gold["BTC_gold"] = df_gold["BTC"] / df_gold["Gold"]
-    for nm in LEVELS:
-        df_gold[f"{nm} (Gold)"] = df_gold[nm] / df_gold["Gold"]
-
-    # Build traces (two legendgroups, toggle via JS)
+    # USD traces
+    order = ["Top","Frothy","PL Best Fit","Bear","Support"]
     traces = []
-
-    # Order: Top, Frothy, PL, Bear, Support, BTC
-    order = ["Top", "Frothy", "PL Best Fit", "Bear", "Support"]
-
-    # USD group (visible depending on default)
-    vis_usd = True if denom_default == "USD" else False
     for nm in order:
         traces.append(go.Scatter(
             x=log_days(bands_usd["Date"]),
             y=bands_usd[nm],
+            name=f"{nm} (USD)",
             mode="lines",
-            name=f"{nm} (USD)" if nm != "PL Best Fit" else "PL Best Fit (USD)",
-            line=dict(color=COLORS[nm], width=2, dash="dash" if nm != "PL Best Fit" else "dash"),
+            line=dict(color=COLORS[nm], dash="dash", width=2 if nm!="PL Best Fit" else 2),
             legendgroup="USD",
-            visible=vis_usd
+            visible=True
         ))
+    # Historical BTC price (USD) — no forward-fill into future
     traces.append(go.Scatter(
-        x=log_days(bands_usd["Date"]), y=bands_usd["BTC"],
-        mode="lines", name="BTC (USD)", line=dict(color=COLORS["BTC"], width=2.5),
-        legendgroup="USD", visible=vis_usd
+        x=log_days(df_hist["Date"]), y=df_hist["BTC"],
+        name="BTC (USD)", mode="lines",
+        line=dict(color=COLORS["BTC"], width=2.6),
+        legendgroup="USD", visible=True
     ))
 
-    # GOLD group (visible if denom_default == "Gold")
-    vis_gold = not vis_usd
+    # GOLD denomination (oz/BTC = BTC(USD)/Gold(USD/oz))
+    bands_gold = bands_usd.copy()
+    for nm in order:
+        bands_gold[f"{nm} (Gold)"] = bands_gold[nm] / bands_gold["Gold"]
+    hist_gold = df_hist.copy()
+    hist_gold["BTC_gold"] = hist_gold["BTC"] / hist_gold["Gold"]
+
     for nm in order:
         traces.append(go.Scatter(
-            x=log_days(df_gold["Date"]),
-            y=df_gold[f"{nm} (Gold)"],
-            mode="lines",
+            x=log_days(bands_gold["Date"]),
+            y=bands_gold[f"{nm} (Gold)"],
             name=f"{nm} (Gold)",
-            line=dict(color=COLORS[nm], width=2, dash="dash" if nm != "PL Best Fit" else "dash"),
-            legendgroup="Gold",
-            visible=vis_gold
+            mode="lines",
+            line=dict(color=COLORS[nm], dash="dash", width=2 if nm!="PL Best Fit" else 2),
+            legendgroup="Gold", visible=False
         ))
     traces.append(go.Scatter(
-        x=log_days(df_gold["Date"]), y=df_gold["BTC_gold"],
-        mode="lines", name="BTC (Gold)", line=dict(color=COLORS["BTC"], width=2.5, dash="solid"),
-        legendgroup="Gold", visible=vis_gold
+        x=log_days(hist_gold["Date"]), y=hist_gold["BTC_gold"],
+        name="BTC (Gold)", mode="lines",
+        line=dict(color=COLORS["BTC"], width=2.6, dash="solid"),
+        legendgroup="Gold", visible=False
     ))
 
-    # Axis ticks for years 2012..2040 (dense to sparse)
-    tickvals, ticktext = year_ticks(2012, 2040)
-
-    fig = go.Figure(data=traces)
-    fig.update_layout(
-        template="plotly_dark",
-        showlegend=False,  # hidden initially; button will toggle
-        margin=dict(l=70, r=20, t=10, b=60),
-        xaxis=dict(
-            title="Year (log-time)",
-            tickmode="array", tickvals=tickvals, ticktext=ticktext,
-            showgrid=True, gridwidth=0.5
-        ),
-        yaxis=dict(
-            type="log",
-            title="USD / BTC" if denom_default == "USD" else "Gold oz / BTC",
-            tickformat="$,d" if denom_default == "USD" else ",d",
-            showgrid=True, gridwidth=0.5
-        ),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
-    )
-
-    # we’ll pass data arrays for JS (zone slider etc.)
-    return fig
-
-def fig_dma(df_all: pd.DataFrame, denom_default="USD") -> go.Figure:
-    ser = df_all.copy()
-    # USD DMA
-    ser["DMA50_USD"] = ser["BTC"].rolling(50).mean()
-    ser["DMA200_USD"] = ser["BTC"].rolling(200).mean()
-
-    # Gold oz/BTC DMA
-    ser["BTC_gold"] = ser["BTC"] / ser["Gold"]
-    ser["DMA50_GOLD"] = ser["BTC_gold"].rolling(50).mean()
-    ser["DMA200_GOLD"] = ser["BTC_gold"].rolling(200).mean()
-
-    # x on log-time
-    X = log_days(ser["Date"])
-
-    traces = []
-    vis_usd = True if denom_default == "USD" else False
-    vis_gold = not vis_usd
-
-    # USD
-    traces += [
-        go.Scatter(x=X, y=ser["DMA200_USD"], name="200-DMA (USD)",
-                   line=dict(color=COLORS["DMA_200_USD"], width=2), legendgroup="USD", visible=vis_usd),
-        go.Scatter(x=X, y=ser["DMA50_USD"], name="50-DMA (USD)",
-                   line=dict(color=COLORS["DMA_50_USD"], width=2), legendgroup="USD", visible=vis_usd),
-        go.Scatter(x=X, y=ser["BTC"], name="BTC (USD)",
-                   line=dict(color=COLORS["BTC"], width=2.5), legendgroup="USD", visible=vis_usd),
-    ]
-
-    # GOLD
-    traces += [
-        go.Scatter(x=X, y=ser["DMA200_GOLD"], name="200-DMA (Gold)",
-                   line=dict(color=COLORS["DMA_200_GOLD"], width=2), legendgroup="Gold", visible=vis_gold),
-        go.Scatter(x=X, y=ser["DMA50_GOLD"], name="50-DMA (Gold)",
-                   line=dict(color=COLORS["DMA_50_GOLD"], width=2), legendgroup="Gold", visible=vis_gold),
-        go.Scatter(x=X, y=ser["BTC_gold"], name="BTC (Gold)",
-                   line=dict(color=COLORS["BTC"], width=2.5, dash="solid"), legendgroup="Gold", visible=vis_gold),
-    ]
-
-    tickvals, ticktext = year_ticks(2012, 2040)
+    tickvals, ticktext = year_ticks_split(2012, 2020, 2040)
 
     fig = go.Figure(data=traces)
     fig.update_layout(
         template="plotly_dark",
         showlegend=False,
-        margin=dict(l=70, r=20, t=10, b=60),
+        margin=dict(l=70, r=24, t=10, b=60),
         xaxis=dict(
             title="Year (log-time)",
             tickmode="array", tickvals=tickvals, ticktext=ticktext,
             showgrid=True, gridwidth=0.5
         ),
         yaxis=dict(
-            type="log",
-            title="USD / BTC" if denom_default == "USD" else "Gold oz / BTC",
-            tickformat="$,d" if denom_default == "USD" else ",d",
+            type="log", title="USD / BTC", tickformat="$,d",
             showgrid=True, gridwidth=0.5
         ),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
     )
     return fig
 
-# ────────────────────────────── HTML wrappers
+def fig_dma(df_hist: pd.DataFrame) -> go.Figure:
+    ser = df_hist.copy()
+    ser = ser[ser["Date"] >= pd.Timestamp("2012-04-01")].reset_index(drop=True)
+
+    # USD DMA
+    ser["DMA50_USD"]  = ser["BTC"].rolling(50).mean()
+    ser["DMA200_USD"] = ser["BTC"].rolling(200).mean()
+
+    # Gold oz/BTC DMA
+    ser["BTC_gold"] = ser["BTC"] / ser["Gold"]
+    ser["DMA50_GOLD"]  = ser["BTC_gold"].rolling(50).mean()
+    ser["DMA200_GOLD"] = ser["BTC_gold"].rolling(200).mean()
+
+    X = log_days(ser["Date"])
+    tickvals, ticktext = year_ticks_split(2012, 2020, 2040)
+
+    traces = [
+        # USD group (visible by default)
+        go.Scatter(x=X, y=ser["DMA200_USD"], name="200-DMA (USD)",
+                   line=dict(color=COLORS["DMA_200_USD"], width=2), legendgroup="USD", visible=True),
+        go.Scatter(x=X, y=ser["DMA50_USD"],  name="50-DMA (USD)",
+                   line=dict(color=COLORS["DMA_50_USD"], width=2), legendgroup="USD", visible=True),
+        go.Scatter(x=X, y=ser["BTC"],        name="BTC (USD)",
+                   line=dict(color=COLORS["BTC"], width=2.6), legendgroup="USD", visible=True),
+
+        # Gold group (start hidden)
+        go.Scatter(x=X, y=ser["DMA200_GOLD"], name="200-DMA (Gold)",
+                   line=dict(color=COLORS["DMA_200_GOLD"], width=2), legendgroup="Gold", visible=False),
+        go.Scatter(x=X, y=ser["DMA50_GOLD"],  name="50-DMA (Gold)",
+                   line=dict(color=COLORS["DMA_50_GOLD"], width=2), legendgroup="Gold", visible=False),
+        go.Scatter(x=X, y=ser["BTC_gold"],    name="BTC (Gold)",
+                   line=dict(color=COLORS["BTC"], width=2.6, dash="solid"), legendgroup="Gold", visible=False),
+    ]
+
+    fig = go.Figure(data=traces)
+    fig.update_layout(
+        template="plotly_dark",
+        showlegend=False,
+        margin=dict(l=70, r=24, t=10, b=60),
+        xaxis=dict(
+            title="Year (log-time)",
+            tickmode="array", tickvals=tickvals, ticktext=ticktext,
+            showgrid=True, gridwidth=0.5
+        ),
+        yaxis=dict(
+            type="log", title="USD / BTC", tickformat="$,d",
+            showgrid=True, gridwidth=0.5
+        ),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
+    )
+    return fig
+
+# ─────────────────────────────────────────────────────────────
+# HTML wrappers
 
 CSS = """
 <style>
-body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Inter, Helvetica, Arial, sans-serif;
-       margin:0; background:#0f1116; color:#e9e9ea; }
-.container { max-width: 980px; margin: 22px auto 60px; padding: 0 14px; }
-h1 { font-size: 40px; line-height: 1.05; margin: 0 0 10px; }
-.controls { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:16px 0; }
-.btn { background:#1b1e27; border:1px solid #2b2f3a; color:#cfd3dc; border-radius:12px; padding:10px 14px; cursor:pointer; }
-.btn:hover { background:#262a36; }
-.badge { display:inline-flex; align-items:center; gap:8px; background:#1b1e27; border:1px solid #2b2f3a;
-         padding:10px 14px; border-radius:18px; }
-.badge .dot { width:10px; height:10px; background:#cfd3dc; border-radius:50%; display:inline-block; }
-.subtle { color:#a9b0bd; }
-.footer { color:#768199; font-size:12px; margin-top:10px; }
-select { background:#1b1e27; color:#e9e9ea; border:1px solid #2b2f3a; border-radius:12px; padding:8px 10px; }
-.sliderrow { margin:10px 0 6px; color:#cfd3dc; }
-.card { background:#0f1116; border:1px solid #2b2f3a; border-radius:18px; padding:12px; }
+:root { color-scheme: dark; }
+body { margin:0; background:#0f1116; color:#eceff4;
+       font-family: Inter, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
+.container { max-width: 1024px; margin: 22px auto 64px; padding: 0 14px; }
+h1 { font-size: clamp(28px,4.2vw,44px); line-height:1.05; margin: 0 0 8px; }
+.controls { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:12px 0 10px; }
+.btn { background:#161a22; border:1px solid #2a2f3a; color:#dbe2ec; border-radius:12px; padding:.45rem .65rem; }
+.btn:hover { background:#1b2030; cursor:pointer; }
+.compact-label { color:#a8b3c7; font-weight:600; }
+.select-compact { background:#161a22; color:#dbe2ec; border:1px solid #2a2f3a;
+                  border-radius:10px; padding:.15rem .35rem; font-size:14px; height:auto; }
+.badge { display:inline-flex; align-items:center; gap:8px; background:#161a22; border:1px solid #2a2f3a;
+         padding:.45rem .65rem; border-radius:18px; }
+.badge .dot { width:10px; height:10px; border-radius:50%; background:#cfd3dc; display:inline-block; }
+.card { background:#0f1116; border:1px solid #262b36; border-radius:16px; padding:10px; }
 a { color:#7fb0ff; text-decoration:none; }
 a:hover { text-decoration:underline; }
 </style>
 """
 
-# small JS helpers — remember to escape braces in f-strings (use doubled braces)
+# JS helpers (double braces so f-strings don’t break)
 JS = """
 <script>
 function toggleLegend(figid) {{
@@ -338,17 +339,16 @@ function toggleLegend(figid) {{
   Plotly.relayout(gd, {{showlegend: !showing}});
 }}
 function setDenom(figid, denom) {{
-  // Toggle visibility by legendgroup: 'USD' vs 'Gold'
   const gd = document.getElementById(figid);
+  const groups = gd.data.map(tr => tr.legendgroup);
   const visUSD  = (denom === 'USD');
   const visGold = !visUSD;
-  const upd = {{visible: []}};
-  const groups = gd.data.map(tr => tr.legendgroup);
-  for (let i=0; i<groups.length; i++) {{
+  const vis = [];
+  for (let i=0;i<groups.length;i++) {{
     const g = groups[i];
-    upd.visible.push( (g === 'USD') ? visUSD : (g === 'Gold' ? visGold : true) );
+    vis.push(g === 'USD' ? visUSD : (g === 'Gold' ? visGold : true));
   }}
-  Plotly.update(gd, upd, {{
+  Plotly.update(gd, {{visible: vis}}, {{
     yaxis: {{
       title: (denom === 'USD') ? 'USD / BTC' : 'Gold oz / BTC',
       tickformat: (denom === 'USD') ? '$,d' : ',d'
@@ -358,75 +358,107 @@ function setDenom(figid, denom) {{
 </script>
 """
 
-def write_html(filename: str, title: str, fig: go.Figure, extra_controls: str = "", badge_html: str = ""):
-    OUTDIR.mkdir(parents=True, exist_ok=True)
-    html = f"""<!DOCTYPE html>
+def write_powerlaw_page(fig: go.Figure, zone: str):
+    html = f"""<!doctype html>
 <html lang="en">
-<meta charset="utf-8">
+<meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>{title}</title>
+<title>BTC Purchase Indicator · Power-law</title>
+<link rel="preconnect" href="https://cdn.plot.ly" />
 {CSS}
-<script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
 {JS}
 <body>
 <div class="container">
   <h1>BTC Purchase Indicator</h1>
-  {badge_html}
+  <div class="badge">
+    <span class="dot" style="background:{ZONE_DOT.get(zone,'#cfd3dc')}"></span>
+    <span>Current zone:&nbsp;</span><strong>{zone}</strong>
+  </div>
   <div class="controls">
-    <button class="btn" onclick="history.back()">&larr; Back</button>
-    <span class="subtle">Denomination:&nbsp;</span>
-    <select id="denom" onchange="setDenom('plfig', this.value)">
-      <option value="USD">USD</option>
+    <a class="btn" href="./dma.html">Open DMA chart →</a>
+    <span class="compact-label">Denomination</span>
+    <select id="denom" class="select-compact" onchange="setDenom('pl-fig', this.value)">
+      <option value="USD" selected>USD</option>
       <option value="Gold">Gold</option>
     </select>
-    <button class="btn" onclick="toggleLegend('plfig')">Legend</button>
-    {extra_controls}
+    <button class="btn" onclick="toggleLegend('pl-fig')">Legend</button>
   </div>
-  <div id="plfig" class="card"></div>
-  <div class="footer">philsin.github.io</div>
+  <div id="pl-fig" class="card"></div>
 </div>
 <script>
-  const FIGDATA = {fig.to_json()};
-  Plotly.newPlot('plfig', FIGDATA.data, FIGDATA.layout, {{displayModeBar: true, responsive: true}});
-  // Hide legend by default (button toggles)
-  Plotly.relayout('plfig', {{showlegend:false}});
-  // Set default denomination
-  setDenom('plfig', 'USD');
+  const FIG = {fig.to_json()};
+  Plotly.newPlot('pl-fig', FIG.data, FIG.layout, {{displayModeBar:true,responsive:true}});
+  Plotly.relayout('pl-fig', {{showlegend:false}});
+  setDenom('pl-fig','USD');
 </script>
 </body>
 </html>
 """
-    (OUTDIR / filename).write_text(html, encoding="utf-8")
-    print(f"[build] wrote {OUTDIR/filename}")
+    OUTDIR.mkdir(parents=True, exist_ok=True)
+    (OUTDIR / "index.html").write_text(html, encoding="utf-8")
+    print("[build] wrote dist/index.html")
 
-# ────────────────────────────── main build
+def write_dma_page(fig: go.Figure):
+    html = f"""<!doctype html>
+<html lang="en">
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>BTC Purchase Indicator · DMA</title>
+<link rel="preconnect" href="https://cdn.plot.ly" />
+{CSS}
+<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+{JS}
+<body>
+<div class="container">
+  <h1>BTC USD & Gold DMA</h1>
+  <div class="controls">
+    <a class="btn" href="./index.html">← Open Power-law chart</a>
+    <span class="compact-label">Denomination</span>
+    <select id="denom" class="select-compact" onchange="setDenom('dma-fig', this.value)">
+      <option value="USD" selected>USD</option>
+      <option value="Gold">Gold</option>
+    </select>
+    <button class="btn" onclick="toggleLegend('dma-fig')">Legend</button>
+  </div>
+  <div id="dma-fig" class="card"></div>
+</div>
+<script>
+  const FIG = {fig.to_json()};
+  Plotly.newPlot('dma-fig', FIG.data, FIG.layout, {{displayModeBar:true,responsive:true}});
+  Plotly.relayout('dma-fig', {{showlegend:false}});
+  setDenom('dma-fig','USD');
+</script>
+</body>
+</html>
+"""
+    OUTDIR.mkdir(parents=True, exist_ok=True)
+    (OUTDIR / "dma.html").write_text(html, encoding="utf-8")
+    print("[build] wrote dist/dma.html")
+
+# ─────────────────────────────────────────────────────────────
+# main
 
 def main():
-    ensure_dir()
-    btc = fetch_btc()
-    gold = fetch_gold()
-    df = pd.merge(btc, gold, on="Date", how="inner").sort_values("Date")
-    df = df[df["Date"] >= pd.Timestamp("2012-01-01")].reset_index(drop=True)
-
-    # Power-law
-    pl_fig = fig_powerlaw(df, denom_default="USD")
-    # Zone badge uses most-recent USD bands
+    OUTDIR.mkdir(parents=True, exist_ok=True)
+    df = load_merged()
+    # Zone from latest real price vs today’s bands (USD) — compute at last row
     m, b, sigma = fit_power(df)
-    usd_bands = add_sigma_bands(df, m, b, max(sigma, 0.25))
-    last = usd_bands.dropna().iloc[-1]
-    zone = zone_for(float(last["BTC"]), {
-        "Support": float(last["Support"]),
-        "Bear": float(last["Bear"]),
-        "Frothy": float(last["Frothy"]),
-        "Top": float(last["Top"]),
+    last_date = df["Date"].iloc[-1]
+    bands_today = add_sigma_bands_over(pd.Index([last_date]), m, b, sigma).iloc[0]
+    last_price  = float(df["BTC"].iloc[-1])
+    zone = zone_for(last_price, {
+        "Support": float(bands_today["Support"]),
+        "Bear":    float(bands_today["Bear"]),
+        "Frothy":  float(bands_today["Frothy"]),
+        "Top":     float(bands_today["Top"]),
     })
-    badge = make_badge(zone)
-    write_html("index.html", "BTC Purchase Indicator · Power-law", pl_fig, badge_html=badge)
 
-    # DMA page
-    dma_fig = fig_dma(df, denom_default="USD")
-    write_html("dma.html", "BTC USD & Gold DMA", dma_fig,
-               extra_controls='<a class="btn" href="index.html">Power-law chart &rarr;</a>')
+    pl_fig  = fig_powerlaw(df)
+    dma_fig = fig_dma(df)
+
+    write_powerlaw_page(pl_fig, zone)
+    write_dma_page(dma_fig)
 
 if __name__ == "__main__":
     main()
