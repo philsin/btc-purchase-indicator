@@ -102,10 +102,17 @@ def merge_prices() -> pd.DataFrame:
     df["OZ_per_BTC"] = df["BTC"] / df["Gold"]  # oz/BTC
     return df
 
-def log_days(dates: pd.Series) -> np.ndarray:
-    """log10(days since genesis), safely ignoring nonpositive days."""
-    days = (pd.to_datetime(dates) - GENESIS).dt.days.to_numpy()
-    days = np.where(days < 1, 1, days)
+def log_days(dates) -> np.ndarray:
+    """
+    Return log10(days since GENESIS) for an array-like of dates.
+    Works for scalars, lists, Series, DatetimeIndex.
+    """
+    dt = pd.to_datetime(dates)
+    td = dt - GENESIS
+    # Convert timedeltas -> days (array-safe; no .dt)
+    days = (td / np.timedelta64(1, "D")).astype(float)
+    # guard against log10(0)
+    days = np.clip(days, 1.0, None)
     return np.log10(days)
 
 def power_fit(df: pd.DataFrame, price_col: str) -> tuple[float, float, float]:
@@ -126,12 +133,19 @@ def band_series(dates: pd.Series, slope: float, intercept: float, sigma: float, 
     mid = slope * x + intercept
     return 10 ** (mid + sigma * z)
 
-def year_ticks(start_year=2012, turn_year=2020, end_year=2040):
-    """Tick every year to turn_year, then every 2 years to end_year."""
-    years = list(range(start_year, turn_year + 1)) + list(range(turn_year + 2, end_year + 1, 2))
-    tickvals = log_days(pd.to_datetime([f"{y}-01-01" for y in years]))
-    ticktext = [str(y) for y in years]
-    return tickvals.tolist(), ticktext
+def year_ticks(start: int, mid: int, end: int):
+    """
+    Year labels: every year up to `mid`, then every 2 years to `end`.
+    Returns (tickvals, ticktext) where tickvals are log-day positions.
+    """
+    left  = np.arange(start,  mid + 1, 1, dtype=int)
+    right = np.arange(mid+2, end + 1, 2, dtype=int)
+    years = np.r_[left, right]
+
+    tickdates = pd.to_datetime([f"{y}-01-01" for y in years])
+    tickvals  = log_days(tickdates).tolist()
+    ticktext  = [str(y) for y in years]
+    return tickvals, ticktext
 
 def zone_label(price: float, sup: float, bear: float, frothy: float, top: float) -> str:
     if price < sup:
