@@ -18,7 +18,8 @@
   #fig{height:70vh;min-height:430px;background:var(--card);border-radius:14px;padding:8px;position:relative}
   .slider{width:100%}
   .stack{display:flex;flex-direction:column;gap:2px;font-size:0.95rem}
-  /* hide Plotly default hover; we show only our pinned panel */
+
+  /* hide Plotly default hover; we use our pinned panel */
   .hoverlayer{ display:none !important; }
 
   /* pinned hover panel – ultra compact (140 px) */
@@ -175,16 +176,16 @@
       return {Support:g.Support[idx], Bear:g.Bear[idx], Mid:g.Mid[idx], Frothy:g.Frothy[idx], Top:g.Top[idx]};
     }
 
-    // legend toggle (keeps label "Legend")
+    /* ───────── Legend toggle (simple) ───────── */
     function legendIsOn(){ return !!(figEl._fullLayout && figEl._fullLayout.showlegend); }
     async function toggleLegend(){
       const want = !legendIsOn();
       await Plotly.relayout(figEl, { showlegend: !!want });
-      // small defer helps Safari catch up
-      setTimeout(()=>{},0);
+      setTimeout(()=>{},0); // help Safari catch up
     }
     legendBtn.addEventListener('click', toggleLegend, { passive:true });
     legendBtn.addEventListener('touchend', (e)=>{ e.preventDefault(); toggleLegend(); }, { passive:false });
+    /* ────────────────────────────────────────── */
 
     // denomination toggle (per-trace visibility via legendgroup)
     function setGoldTicks(){
@@ -210,6 +211,8 @@
       else { Plotly.relayout(figEl, {"yaxis.title.text":"Gold oz / BTC"}); setGoldTicks(); }
       updateMarkerAndReadout();
       if (window._lastPinnedX != null) updatePinnedHoverFromX(window._lastPinnedX);
+      // preserve Today state
+      if (chkToday.checked){ setTimeout(()=> setToday(true), 0); }
     }
     denomSel.addEventListener('change', e => setDenom(e.target.value));
 
@@ -230,14 +233,6 @@
       const i = Math.max(0, Math.min(parseInt(slider.value,10), slider._weeklyIdx.length-1));
       return slider._weeklyIdx[i] ?? (histMS.length-1);
     }
-
-    // Today checkbox
-    function setTodayIfChecked(){
-      if (chkToday.checked){ slider.value = slider.max; clearMarkerGuides(); }
-      updateMarkerAndReadout();
-    }
-    chkToday.addEventListener('change', setTodayIfChecked);
-    chkToday.addEventListener('click', setTodayIfChecked);
 
     // pinned hover rendering (140px wide panel; colors match lines)
     const LINE_CLASS = {
@@ -297,7 +292,45 @@
         if (!chkToday.checked) setMarkerGuides(xval, priceGLD); else clearMarkerGuides();
       }
     }
-    slider.addEventListener('input', ()=>{ chkToday.checked=false; updateMarkerAndReadout(); });
+
+    // ───────── Today toggle: jump to latest, clear guides, sync panel ─────────
+    function latestHistIndex(){ return Math.max(0, histMS.length - 1); }
+    function latestLogX(){
+      const ms = histMS[latestHistIndex()];
+      const days = Math.max(1, Math.round((ms - genesisMS)/MS_DAY));
+      return Math.log10(days);
+    }
+    function setToday(on){
+      chkToday.checked = !!on;
+      if (on){
+        slider.value = slider.max;           // newest weekly slot
+        clearMarkerGuides();                 // no yellow guides on Today
+        updateMarkerAndReadout();            // dot + zone
+        setTimeout(()=> updatePinnedHoverFromX(latestLogX()), 0); // pinned panel
+      } // else: slider handlers restore guides
+    }
+    const onTodayClick = (e)=>{ e.preventDefault(); setToday(!chkToday.checked); };
+    chkToday.addEventListener('click',     onTodayClick, {passive:false});
+    chkToday.addEventListener('touchend',  onTodayClick, {passive:false});
+    chkToday.addEventListener('change',   ()=> setToday(chkToday.checked));
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // ───────── Slider: leave Today mode, update guides + pinned panel ───────
+    function updatePinnedAtSlider(){
+      const i = sliderToHistIndex();
+      const ms = histMS[i];
+      const days = Math.max(1, Math.round((ms - genesisMS)/MS_DAY));
+      updatePinnedHoverFromX(Math.log10(days));
+    }
+    function onSliderInteract(){
+      if (chkToday.checked) chkToday.checked = false;  // exit Today mode
+      updateMarkerAndReadout();    // moves yellow dot + sets guides
+      updatePinnedAtSlider();      // refresh pinned hover to slider date
+    }
+    slider.addEventListener('input',    onSliderInteract, {passive:true});
+    slider.addEventListener('change',   onSliderInteract, {passive:true});
+    slider.addEventListener('touchend', onSliderInteract, {passive:true});
+    // ─────────────────────────────────────────────────────────────────────────
 
     // pinned hover (hover & click) → month-year + colored rows
     function updatePinnedHoverFromX(logx){
@@ -333,7 +366,7 @@
       renderHoverBox(monthLabel, rows);
     }
 
-    // hide on outside tap
+    // hide hover/crosshair on outside tap
     function outsideFig(el, target){ return !el.contains(target); }
     function hideHover(){ try{ Plotly.Fx.unhover(figEl); }catch(e){} clearHoverCrosshair(); }
     document.addEventListener('click', (ev)=>{ if(outsideFig(figEl, ev.target)) hideHover(); }, {passive:true});
