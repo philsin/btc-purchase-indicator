@@ -4,6 +4,9 @@
 #  - Power-law on log-time (days since 2009-01-03)
 #  - Denomination switch: USD/BTC or Gold oz/BTC
 #  - Bands projected monthly to 2040-12
+#  - Gold hover text: "Line | Month Year, xx.xx oz/BTC"
+#  - Gold y-axis: custom log ticks (≤1 minimal decimals, ≥1 whole numbers)
+#  - Weekly (Mondays) date slider + "Today" checkbox
 #  - Safe HTML embed (no f-strings in HTML/JS)
 # ─────────────────────────────────────────────────────────────
 
@@ -146,7 +149,7 @@ def year_ticks(start=2012, dense_until=2020, end=2040):
 def make_powerlaw_fig(df: pd.DataFrame):
     # Series
     usd_series = df["BTC"].astype(float)                  # USD / BTC
-    gld_series = (df["BTC"] / df["Gold"]).astype(float)   # Gold oz / BTC  ← (desired)
+    gld_series = (df["BTC"] / df["Gold"]).astype(float)   # Gold oz / BTC
 
     # Fits
     m_usd, b_usd, s_usd = fit_power(df["Date"], usd_series)
@@ -183,7 +186,7 @@ def make_powerlaw_fig(df: pd.DataFrame):
             line=dict(color=COLORS[name], width=2, dash=DASHES[name]),
             name=label, legendgroup="USD",
             customdata=date_labels_full,
-            hovertemplate=label + " | (%{customdata}, %{y:$,.0f})<extra></extra>",
+            hovertemplate=label + " | %{customdata}, %{y:$,.0f}<extra></extra>",
             visible=True
         ))
     fig.add_trace(go.Scatter(
@@ -191,7 +194,7 @@ def make_powerlaw_fig(df: pd.DataFrame):
         line=dict(color=COLORS["BTC"], width=2.5),
         name="BTC (USD)", legendgroup="USD",
         customdata=date_labels_hist,
-        hovertemplate="BTC | (%{customdata}, %{y:$,.0f})<extra></extra>",
+        hovertemplate="BTC | %{customdata}, %{y:$,.0f}<extra></extra>",
         visible=True
     ))
 
@@ -204,7 +207,7 @@ def make_powerlaw_fig(df: pd.DataFrame):
             line=dict(color=COLORS[name], width=2, dash=DASHES[name]),
             name=label, legendgroup="GLD",
             customdata=date_labels_full,
-            hovertemplate=label + " | (%{customdata}, %{y:,.6f} oz/BTC)<extra></extra>",
+            hovertemplate=label + " | %{customdata}, %{y:,.2f} oz/BTC<extra></extra>",
             visible=False
         ))
     fig.add_trace(go.Scatter(
@@ -212,11 +215,11 @@ def make_powerlaw_fig(df: pd.DataFrame):
         line=dict(color=COLORS["BTC"], width=2.5),
         name="BTC (oz/BTC)", legendgroup="GLD",
         customdata=date_labels_hist,
-        hovertemplate="BTC | (%{customdata}, %{y:,.6f} oz/BTC)<extra></extra>",
+        hovertemplate="BTC | %{customdata}, %{y:,.2f} oz/BTC<extra></extra>",
         visible=False
     ))
 
-    # Axes
+    # Axes (x is log-time)
     tickvals, ticktext = year_ticks(2012, 2020, 2040)
     fig.update_layout(
         template="plotly_dark",
@@ -253,7 +256,6 @@ def write_index_html(fig: go.Figure,
 
     # Robust date formatting for Series/Index
     dates_iso = pd.Series(pd.to_datetime(full_dates)).dt.strftime("%Y-%m-%d").tolist()
-    # historical dates are the first N items of full_dates, where N=len(usd_hist)
     hist_iso  = pd.Series(pd.to_datetime(full_dates[:len(usd_hist)])).dt.strftime("%Y-%m-%d").tolist()
 
     payload = {
@@ -305,6 +307,7 @@ def write_index_html(fig: go.Figure,
   .chip { background:var(--card); border:1px solid #263041; border-radius:999px; padding:8px 12px; display:inline-flex; align-items:center; gap:10px; }
   .dot { width:12px; height:12px; border-radius:50%; background:#fff; }
   .slider { width:100%; }
+  .check { display:flex; align-items:center; gap:8px; }
 </style>
 </head>
 <body>
@@ -315,9 +318,9 @@ def write_index_html(fig: go.Figure,
       <div class="chip"><span id="zoneDot" class="dot"></span> <b>Price Zone:</b> <span id="zoneTxt" style="margin-left:6px">—</span></div>
       <div class="row" style="gap:8px;">
         <label for="denom">Denomination</label>
-        <select id="denom" style="min-width:9.2rem;">
+        <select id="denom" style="min-width:6.0rem;">
           <option value="USD" selected>USD</option>
-          <option value="Gold">Gold oz / BTC</option>
+          <option value="Gold">Gold</option>
         </select>
       </div>
       <button class="btn" id="legendBtn">Legend</button>
@@ -325,6 +328,7 @@ def write_index_html(fig: go.Figure,
 
     <div class="row" style="margin:6px 0 2px;">
       <label for="dateSlider">View at date:</label>
+      <label class="check"><input type="checkbox" id="chkToday"/> Today</label>
     </div>
     <input id="dateSlider" class="slider" type="range" min="0" value="0" step="1"/>
     <div id="dateRead" class="row" style="opacity:.85; margin:6px 0 12px 2px;"></div>
@@ -355,37 +359,43 @@ def write_index_html(fig: go.Figure,
     const denomSel = document.getElementById('denom');
     const legendBtn = document.getElementById('legendBtn');
     const slider = document.getElementById('dateSlider');
+    const chkToday = document.getElementById('chkToday');
     const zoneTxt = document.getElementById('zoneTxt');
     const zoneDot = document.getElementById('zoneDot');
     const dateRead = document.getElementById('dateRead');
 
-    // Slider covers historical price dates
-    const histDates = ARR.hist.dates;
-    slider.max = Math.max(0, histDates.length - 1);
+    // Build weekly (Mondays) slider index
+    const histDates = ARR.hist.dates; // ISO strings
+    const weeklyIdx = [];
+    const weeklyDates = [];
+    for (let i=0;i<histDates.length;i++){
+      const d = new Date(histDates[i] + "T00:00:00Z");
+      // Monday = 1 in UTC
+      if (d.getUTCDay() === 1) { weeklyIdx.push(i); weeklyDates.push(histDates[i]); }
+    }
+    // Fallback: every 7th point if no Mondays detected
+    if (weeklyDates.length === 0){
+      for (let i=0;i<histDates.length;i+=7){ weeklyIdx.push(i); weeklyDates.push(histDates[i]); }
+    }
+    slider.max = Math.max(0, weeklyDates.length - 1);
     slider.value = slider.max;
 
     function setLegend(on){ Plotly.relayout(figEl, {"showlegend": !!on}); }
     let legendOn = true;
     legendBtn.addEventListener('click', ()=>{ legendOn = !legendOn; setLegend(legendOn); });
 
-    function setDenom(which){
-      const usdOn = (which === "USD");
-      const vis = new Array(FIG.data.length).fill(false);
-      USD_IDX.forEach(i => vis[i] = usdOn);
-      GLD_IDX.forEach(i => vis[i] = !usdOn);
-      Plotly.restyle(figEl, {"visible": vis});
-      Plotly.relayout(figEl, {
-        "yaxis.title.text": (usdOn ? "USD / BTC" : "Gold oz / BTC"),
-        "yaxis.tickformat": (usdOn ? "$,d" : ",.6f")
-      });
-      updateReadout();
-    }
-
     function fmtUSD(v){ return (v==null||!isFinite(v)) ? "—" : "$"+Math.round(v).toLocaleString(); }
     function fmtOzBTC(v){
       if (v==null || !isFinite(v)) return "—";
-      const n = Math.round(v * 1e6) / 1e6;
-      return n.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:6}) + " oz/BTC";
+      const n = Math.round(v * 1e2) / 1e2;  // 2 decimals for readout
+      return n.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2}) + " oz/BTC";
+    }
+    function fmtTickGold(v){
+      if (!isFinite(v) || v<=0) return "";
+      if (v >= 1) return Math.round(v).toLocaleString();
+      // below 1: show minimal decimals (trim trailing zeros)
+      let s = v.toFixed(3).replace(/\.?0+$/,"");
+      return s;
     }
 
     function zoneFor(val, bands){
@@ -420,14 +430,63 @@ def write_index_html(fig: go.Figure,
       };
     }
 
-    function updateReadout(){
+    // Custom ticks for Gold (oz/BTC) on log axis: make gridlines align
+    function setGoldTicks(){
+      // gather min/max across bands and hist
+      const G = ARR.gld;
+      const all = []
+        .concat(G.Support, G.Bear, G.Mid, G.Frothy, G.Top, ARR.hist.gld)
+        .filter(v => v>0 && isFinite(v));
+      if (all.length === 0){ return; }
+      const minV = Math.min.apply(null, all);
+      const maxV = Math.max.apply(null, all);
+
+      // candidate ticks spanning typical decades
+      const candidates = [0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10,20,50,100,200,500,1000];
+      const ticks = candidates.filter(v => v>=minV*0.9 && v<=maxV*1.1);
+      const ticktext = ticks.map(fmtTickGold);
+
+      Plotly.relayout(figEl, {
+        "yaxis.tickvals": ticks,
+        "yaxis.ticktext": ticktext,
+        "yaxis.tickformat": ""  // use custom ticktext
+      });
+    }
+    function clearCustomTicks(){
+      Plotly.relayout(figEl, {
+        "yaxis.tickvals": null,
+        "yaxis.ticktext": null,
+        "yaxis.tickformat": "$,d"
+      });
+    }
+
+    function setDenom(which){
+      const usdOn = (which === "USD");
+      const vis = new Array(FIG.data.length).fill(false);
+      USD_IDX.forEach(i => vis[i] = usdOn);
+      GLD_IDX.forEach(i => vis[i] = !usdOn);
+      Plotly.restyle(figEl, {"visible": vis});
+      Plotly.relayout(figEl, {
+        "yaxis.title.text": (usdOn ? "USD / BTC" : "Gold oz / BTC"),
+      });
+      if (usdOn) clearCustomTicks(); else setGoldTicks();
+      updateReadout();
+    }
+
+    function sliderToHistIndex(){
       const i = parseInt(slider.value, 10);
+      const j = Math.max(0, Math.min(i, weeklyIdx.length-1));
+      return weeklyIdx[j] ?? (ARR.hist.dates.length-1);
+    }
+
+    function updateReadout(){
+      const j = sliderToHistIndex();
       const denom = denomSel.value;
-      const dISO = histDates[i] || ARR.dates[ARR.dates.length-1];
+      const dISO = ARR.hist.dates[j];
       const bands = readBandsAt(dISO, denom);
       if (!bands){ zoneTxt.textContent = "—"; dateRead.textContent = ""; return; }
 
-      const price = (denom==="USD") ? ARR.hist.usd[i] : ARR.hist.gld[i];
+      const price = (denom==="USD") ? ARR.hist.usd[j] : ARR.hist.gld[j];
       const zone = zoneFor(price, bands);
       zoneTxt.textContent = zone;
       zoneDot.style.background = zoneDotColor(zone);
@@ -438,7 +497,13 @@ def write_index_html(fig: go.Figure,
     }
 
     denomSel.addEventListener('change', (e)=> setDenom(e.target.value));
-    slider.addEventListener('input', updateReadout);
+    slider.addEventListener('input', ()=>{ chkToday.checked = false; updateReadout(); });
+    chkToday.addEventListener('change', (e)=>{
+      if (e.target.checked){
+        slider.value = slider.max;
+        updateReadout();
+      }
+    });
 
     // Init
     setDenom("USD");
