@@ -129,11 +129,11 @@ def year_ticks(start=2012, dense_until=2020, end=2040):
 
 # --------------------- figure
 def make_powerlaw_fig(df: pd.DataFrame):
-    # Series we plot
-    usd = df["BTC"].astype(float)                 # USD / BTC
-    gld = (df["BTC"] / df["Gold"]).astype(float)  # Gold oz / BTC
+    # Core series
+    usd = df["BTC"].astype(float)                         # USD / BTC
+    gld = (df["BTC"] / df["Gold"]).astype(float)          # Gold oz / BTC
 
-    # Power-law fits on log-time
+    # Fit on log-time
     m_u, b_u, s_u = fit_power(df["Date"], usd)
     m_g, b_g, s_g = fit_power(df["Date"], gld)
 
@@ -142,108 +142,146 @@ def make_powerlaw_fig(df: pd.DataFrame):
     future = pd.date_range(last + pd.offsets.MonthBegin(1), PROJ_END, freq="MS")
     full_dates = pd.Index(df["Date"]).append(future)
 
-    # Bands (on full date range)
-    bands_usd = build_bands(full_dates, m_u, b_u, s_u)
+    # Build bands over full span
+    bands_usd = build_bands(full_dates, m_u, b_u, s_u)    # keys: mid, Top, Frothy, Bear, Support
     bands_gld = build_bands(full_dates, m_g, b_g, s_g)
 
-    # X arrays = log10(days since genesis)
+    # X arrays (log days since genesis)
     x_hist = log_days(df["Date"])
     x_full = log_days(full_dates)
 
-    # Month-Year strings aligned to x_full for our custom hover header
-    monyr_full = [pd.Timestamp(d).strftime("%b %Y") for d in full_dates]
+    # Month-Year strings used as the "header" in our custom hover
+    monyr_full = np.array([pd.Timestamp(d).strftime("%b %Y") for d in full_dates])
+
+    # Align historical BTC series to full_dates (so BTC shows at same indices as bands)
+    usd_full = (
+        pd.Series(usd.values, index=df["Date"])
+          .reindex(full_dates)
+          .ffill()
+          .to_numpy()
+    )
+    gld_full = (
+        pd.Series(gld.values, index=df["Date"])
+          .reindex(full_dates)
+          .ffill()
+          .to_numpy()
+    )
 
     fig = go.Figure()
-    order = ["Top","Frothy","PL Best Fit","Bear","Support"]
+    order = ["Top", "Frothy", "PL Best Fit", "Bear", "Support"]
 
-    # ---------------- USD group ----------------
-    # Invisible “header” trace that prints Month Year as first line of unified hover
-    fig.add_trace(go.Scatter(
-        x=x_full, y=bands_usd["mid"]*0 + 1,  # any y, we hide marker
-        mode="markers",
-        marker=dict(size=1, opacity=0),
-        name="", showlegend=False, legendgroup="USD",
-        hovertemplate="<b>%{customdata}</b><extra></extra>",
-        customdata=monyr_full,
-        visible=True
-    ))
-    USD_HDR_IDX = len(fig.data)-1
-
-    # Bands
+    # ------------- USD group (visible by default) -------------
+    # Bands (hover suppressed; we’ll show one composite label instead)
     for name in order:
-        y = bands_usd["mid"] if name=="PL Best Fit" else bands_usd[name]
+        y = bands_usd["mid"] if name == "PL Best Fit" else bands_usd[name]
         fig.add_trace(go.Scatter(
             x=x_full, y=y, mode="lines",
             line=dict(color=COLORS[name], width=2, dash=DASHES[name]),
             name=name, legendgroup="USD",
-            hovertemplate=f"{name} | "+"%{y:$,.0f}<extra></extra>",
+            hoverinfo="skip",  # <- suppress individual labels
             visible=True
         ))
-    # BTC price
+    # BTC line
     fig.add_trace(go.Scatter(
         x=x_hist, y=usd, mode="lines",
         line=dict(color=COLORS["BTC"], width=2.5),
         name="BTC", legendgroup="USD",
-        hovertemplate="BTC | %{y:$,.0f}<extra></extra>",
+        hoverinfo="skip",
         visible=True
     ))
-    USD_BTC_IDX = len(fig.data)-1
-    # Marker that follows the slider
+    # Slider-following marker on BTC
     fig.add_trace(go.Scatter(
         x=[None], y=[None], mode="markers",
         marker=dict(color=COLORS["BTC_MARK"], size=8, line=dict(color="#000", width=.5)),
         name=" ", legendgroup="USD", showlegend=False, hoverinfo="skip", visible=True
     ))
-    USD_MARK_IDX = len(fig.data)-1
+    USD_MARK_IDX = len(fig.data) - 1
 
-    # ---------------- GOLD group ----------------
-    # Invisible header trace (Month Year)
+    # Composite hover trace (fully transparent marker) — prints Month Year + all lines
+    # customdata columns: 0 MonYr | 1 Top | 2 Frothy | 3 Mid | 4 Bear | 5 Support | 6 BTC
+    cd_usd = np.column_stack([
+        monyr_full,
+        bands_usd["Top"], bands_usd["Frothy"], bands_usd["mid"],
+        bands_usd["Bear"], bands_usd["Support"],
+        usd_full
+    ])
     fig.add_trace(go.Scatter(
-        x=x_full, y=bands_gld["mid"]*0 + 1,
+        x=x_full, y=bands_usd["mid"],  # any y aligned to x_full
         mode="markers",
         marker=dict(size=1, opacity=0),
-        name="", showlegend=False, legendgroup="GLD",
-        hovertemplate="<b>%{customdata}</b><extra></extra>",
-        customdata=monyr_full,
-        visible=False
+        name="", showlegend=False, legendgroup="USD",
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>"       # Mon YYYY
+            "Top | %{customdata[1]:$,.0f}<br>"
+            "Frothy | %{customdata[2]:$,.0f}<br>"
+            "PL Best Fit | %{customdata[3]:$,.0f}<br>"
+            "Bear | %{customdata[4]:$,.0f}<br>"
+            "Support | %{customdata[5]:$,.0f}<br>"
+            "BTC | %{customdata[6]:$,.0f}"
+            "<extra></extra>"
+        ),
+        customdata=cd_usd,
+        visible=True
     ))
-    GLD_HDR_IDX = len(fig.data)-1
 
+    # ------------- GOLD group (hidden initially) -------------
     for name in order:
-        y = bands_gld["mid"] if name=="PL Best Fit" else bands_gld[name]
+        y = bands_gld["mid"] if name == "PL Best Fit" else bands_gld[name]
         fig.add_trace(go.Scatter(
             x=x_full, y=y, mode="lines",
             line=dict(color=COLORS[name], width=2, dash=DASHES[name]),
             name=name, legendgroup="GLD",
-            hovertemplate=f"{name} | "+"%{y:,.2f} oz/BTC<extra></extra>",
+            hoverinfo="skip",
             visible=False
         ))
     fig.add_trace(go.Scatter(
         x=x_hist, y=gld, mode="lines",
         line=dict(color=COLORS["BTC"], width=2.5),
         name="BTC", legendgroup="GLD",
-        hovertemplate="BTC | %{y:,.2f} oz/BTC<extra></extra>",
+        hoverinfo="skip",
         visible=False
     ))
-    GLD_BTC_IDX = len(fig.data)-1
     fig.add_trace(go.Scatter(
         x=[None], y=[None], mode="markers",
         marker=dict(color=COLORS["BTC_MARK"], size=8, line=dict(color="#000", width=.5)),
         name=" ", legendgroup="GLD", showlegend=False, hoverinfo="skip", visible=False
     ))
-    GLD_MARK_IDX = len(fig.data)-1
+    GLD_MARK_IDX = len(fig.data) - 1
 
-    # Axis ticks (years) on log-time
+    cd_gld = np.column_stack([
+        monyr_full,
+        bands_gld["Top"], bands_gld["Frothy"], bands_gld["mid"],
+        bands_gld["Bear"], bands_gld["Support"],
+        gld_full
+    ])
+    fig.add_trace(go.Scatter(
+        x=x_full, y=bands_gld["mid"],
+        mode="markers",
+        marker=dict(size=1, opacity=0),
+        name="", showlegend=False, legendgroup="GLD",
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>"
+            "Top | %{customdata[1]:,.2f} oz/BTC<br>"
+            "Frothy | %{customdata[2]:,.2f} oz/BTC<br>"
+            "PL Best Fit | %{customdata[3]:,.2f} oz/BTC<br>"
+            "Bear | %{customdata[4]:,.2f} oz/BTC<br>"
+            "Support | %{customdata[5]:,.2f} oz/BTC<br>"
+            "BTC | %{customdata[6]:,.2f} oz/BTC"
+            "<extra></extra>"
+        ),
+        customdata=cd_gld,
+        visible=False
+    ))
+
+    # Ticks (years) on log-time
     tickvals, ticktext = year_ticks(2012, 2020, 2040)
 
     fig.update_layout(
         template="plotly_dark",
-        hovermode="x unified",
+        hovermode="x",                      # <- not unified; only our composite label shows
         xaxis=dict(
             title="Year (log-time)",
             tickmode="array", tickvals=tickvals, ticktext=ticktext,
-            # CRUCIAL: blank unified header; our invisible header trace prints Month-Year
-            hoverformat=" ",
             showgrid=True, gridcolor="#263041", zeroline=False
         ),
         yaxis=dict(
@@ -251,13 +289,10 @@ def make_powerlaw_fig(df: pd.DataFrame):
             showgrid=True, gridcolor="#263041", zeroline=False
         ),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        hoverlabel=dict(align="left"),
         margin=dict(l=60, r=24, t=18, b=64),
         paper_bgcolor="#0f1116", plot_bgcolor="#151821",
-        # expose indices so the page JS can toggle denom & move markers
-        meta=dict(
-            USD_BTC_IDX=USD_BTC_IDX, USD_MARK_IDX=USD_MARK_IDX, USD_HDR_IDX=USD_HDR_IDX,
-            GLD_BTC_IDX=GLD_BTC_IDX, GLD_MARK_IDX=GLD_MARK_IDX, GLD_HDR_IDX=GLD_HDR_IDX
-        )
+        meta=dict(USD_MARK_IDX=USD_MARK_IDX, GLD_MARK_IDX=GLD_MARK_IDX)
     )
     return fig, full_dates, bands_usd, bands_gld, usd, gld
 
