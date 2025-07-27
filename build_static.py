@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 
 # ─────────────────────────────────────────────────────────────
 # build_static.py  ·  BTC Purchase Indicator (static Plotly)
 #  - Power-law bands on log-time (days since 2009-01-03)
