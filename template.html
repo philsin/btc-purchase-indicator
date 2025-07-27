@@ -18,12 +18,16 @@
   #fig{height:70vh;min-height:430px;background:var(--card);border-radius:14px;padding:8px;position:relative}
   .slider{width:100%}
   .stack{display:flex;flex-direction:column;gap:2px;font-size:0.95rem}
-  /* pinned hover box (bottom-right) */
+  /* hide Plotly’s built-in hover layer (we use a pinned panel instead) */
+  .hoverlayer{ display:none !important; }
+
+  /* pinned hover box (bottom-right) — sized similar to Plotly’s unified hover */
   #hoverBox{
     position:fixed; right:20px; bottom:20px; z-index:10;
     background:rgba(20,24,32,0.88); border:1px solid #3b4455;
-    border-radius:10px; padding:10px 12px; min-width:220px; max-width:320px;
+    border-radius:10px; padding:10px 12px; min-width:260px; max-width:360px;
     font-size:0.92rem; line-height:1.25rem; display:none; user-select:none;
+    box-shadow:0 8px 24px rgba(0,0,0,.35);
   }
   #hoverBox .hdr{font-weight:700; margin-bottom:6px; color:#e7e9ee}
   #hoverBox .rowline{display:flex; justify-content:space-between; gap:8px}
@@ -74,6 +78,9 @@
     const ARR = JSON.parse(document.getElementById('arrays').textContent);
     const figEl = document.getElementById('fig');
 
+    // Disable default hover popups but keep hover events
+    (FIG.data||[]).forEach(tr => tr.hoverinfo = 'skip');
+
     Plotly.newPlot(figEl, FIG.data, FIG.layout, {displaylogo:false, responsive:true});
 
     // indices exposed by layout.meta
@@ -104,9 +111,9 @@
     const fullDatesISO = ARR.dates;
     const fullMs = fullDatesISO.map(d=>Date.parse(d+"T00:00:00Z"));
 
-    // ── crosshair (white) and marker guides (yellow) shapes (slightly transparent)
-    let hoverShapes = { v: null, h: null };  // white, shown only while hovering
-    let guideShapes = { v: null, h: null };  // yellow, persist at slider position
+    // ── crosshair (white) and marker guides (yellow), semi-transparent
+    let hoverShapes = { v: null, h: null };
+    let guideShapes = { v: null, h: null };
 
     function refreshShapes(){
       const arr = [];
@@ -122,29 +129,29 @@
       hoverShapes.v = { type:"line", xref:"x", x0:x, x1:x, yref:"paper", y0:0, y1:1, line:{color:w,width:1} };
       hoverShapes.h = { type:"line", xref:"paper", x0:0, x1:1, yref:"y",     y0:y, y1:y, line:{color:w,width:1} };
       refreshShapes();
-      hb.style.display = "block"; // show pinned panel on hover
+      hb.style.display = "block";
     }
     function clearHoverCrosshair(){
       hoverShapes.v = null; hoverShapes.h = null;
       refreshShapes();
-      // keep hoverBox visible; it’s pinned
     }
 
     function setMarkerGuides(x, y){
-      const yel = "rgba(250,204,21,0.6)"; // yellow with transparency
+      const yel = "rgba(250,204,21,0.6)";
       guideShapes.v = { type:"line", xref:"x", x0:x, x1:x, yref:"paper", y0:0, y1:1, line:{color:yel,width:1} };
       guideShapes.h = { type:"line", xref:"paper", x0:0, x1:1, yref:"y",     y0:y, y1:y, line:{color:yel,width:1} };
       refreshShapes();
     }
     function clearMarkerGuides(){
-      guideShapes.v = null; guideShapes.h = null;
-      refreshShapes();
+      guideShapes.v = null; guideShapes.h = null; refreshShapes();
     }
 
-    // legend toggle (robust)
-    function getLegend(){ return !!(figEl._fullLayout && figEl._fullLayout.showlegend); }
-    function setLegend(on){ Plotly.relayout(figEl, {"showlegend": !!on}); }
-    document.getElementById('legendBtn').addEventListener('click', ()=> setLegend(!getLegend()));
+    // Legend toggle (reads current state from live layout)
+    function legendShowing(){ return !!(figEl._fullLayout && figEl._fullLayout.showlegend); }
+    async function toggleLegend(){
+      await Plotly.relayout(figEl, {"showlegend": !legendShowing()});
+    }
+    legendBtn.addEventListener('click', toggleLegend);
 
     // formatters
     function fmtUSD(v){ return (v==null||!isFinite(v))?"—":"$"+Math.round(v).toLocaleString(); }
@@ -159,7 +166,7 @@
       return Number(v).toFixed(3).replace(/\.?0+$/,"");
     }
 
-    // near index in full dates by milliseconds
+    // nearest in full timeline
     function nearestFullIndex(ms){
       let lo=0, hi=fullMs.length-1, pos=hi;
       while (lo<=hi){ const mid=(lo+hi)>>1; if (fullMs[mid]>=ms){pos=mid; hi=mid-1;} else lo=mid+1; }
@@ -167,7 +174,7 @@
       return pos;
     }
 
-    // zone helpers
+    // zone colors
     function zoneDotColor(z){
       switch(z){
         case "SELL THE HOUSE!!": return "#ffffff";
@@ -199,10 +206,11 @@
       Plotly.relayout(figEl, {"yaxis.tickvals":null, "yaxis.ticktext":null, "yaxis.tickformat":"$,d"});
     }
 
-    // denomination toggle (show only traces in that legendgroup)
+    // denomination toggle (compute against live traces)
     function setDenom(which){
+      const traces = figEl.data || [];
       const want = which==="USD" ? "USD" : "GLD";
-      const vis = (FIG.data||[]).map(tr => {
+      const vis = traces.map(tr => {
         const grp = tr.legendgroup || "";
         if (grp) return grp === want;
         const nm = (tr.name || "").toLowerCase();
@@ -212,14 +220,13 @@
       Plotly.restyle(figEl, {"visible": vis});
       if (which==="USD"){ Plotly.relayout(figEl, {"yaxis.title.text":"USD / BTC"}); clearGoldTicks(); }
       else { Plotly.relayout(figEl, {"yaxis.title.text":"Gold oz / BTC"}); setGoldTicks(); }
-      updateMarkerAndReadout(); // also redraw yellow guides in correct units
+      updateMarkerAndReadout();
     }
 
-    // ----- Weekly (Monday) slider independent of data gaps
+    // ----- Weekly (Monday) slider
     const histDatesISO = ARR.hist.dates;
     const histMs = histDatesISO.map(d=>Date.parse(d+"T00:00:00Z"));
     const MS_DAY = 86400000;
-    // first Monday on/after first data date
     const firstDate = new Date(histMs[0]);
     const firstMon = histMs[0] + ((8 - firstDate.getUTCDay()) % 7) * MS_DAY;
     const weeklyIdx = [], weeklyDates = [];
@@ -268,7 +275,7 @@
       const line = (denom==="USD") ? fmtUSD(priceUSD) : fmtOzBTC(priceGLD);
       dateRead.innerHTML = `<div style="font-weight:600">${dISO}</div><div>BTC: ${line}</div>`;
 
-      // Move marker + set/clear yellow guides at the same x/y
+      // Marker + yellow guides
       const genesis = Date.parse("2009-01-03T00:00:00Z");
       const dms = Date.parse(dISO+"T00:00:00Z");
       const days = Math.max(1, Math.round((dms - genesis)/86400000));
@@ -283,7 +290,7 @@
       }
     }
 
-    // pinned hover panel content from current mouse x (log-days)
+    // pinned hover content from current mouse x (log-days)
     function updatePinnedHoverFromX(logx){
       const days = Math.max(1, Math.round(Math.pow(10, logx)));
       const ms = Date.parse("2009-01-03T00:00:00Z") + days*86400000;
@@ -292,7 +299,7 @@
       const denom = denomSel.value;
       const b = readBandsAtIdx(idx, denom);
 
-      // BTC at same date (nearest in hist)
+      // BTC nearest in hist
       let lo=0, hi=histMs.length-1, pos=hi;
       while (lo<=hi){ const mid=(lo+hi)>>1; if (histMs[mid]>=ms){ pos=mid; hi=mid-1; } else lo=mid+1; }
       if (pos>0 && Math.abs(histMs[pos-1]-ms)<=Math.abs(histMs[pos]-ms)) pos=pos-1;
@@ -318,32 +325,30 @@
       hb.style.display = "block";
     }
 
+    // events
     denomSel.addEventListener('change', (e)=> setDenom(e.target.value));
     slider.addEventListener('input', ()=>{ chkToday.checked=false; updateMarkerAndReadout(); });
-    chkToday.addEventListener('change', (e)=>{ if(e.target.checked){ slider.value = slider.max; } updateMarkerAndReadout(); });
+    chkToday.addEventListener('change', ()=>{ slider.value = slider.max; updateMarkerAndReadout(); });
 
-    // Tap/click outside → hide hover crosshair (pinned box stays)
+    // hide crosshair when tapping outside
     function outsideFig(el, target){ return !el.contains(target); }
-    function hideHover(){ try{ Plotly.Fx.unhover(figEl); }catch(e){} 
-      hoverShapes.v = null; hoverShapes.h = null; refreshShapes();
-    }
+    function hideHover(){ try{ Plotly.Fx.unhover(figEl); }catch(e){} clearHoverCrosshair(); }
     document.addEventListener('click', (ev)=>{ if(outsideFig(figEl, ev.target)) hideHover(); }, {passive:true});
     document.addEventListener('touchstart', (ev)=>{ if(outsideFig(figEl, ev.target)) hideHover(); }, {passive:true});
 
-    // hover crosshair + pinned hover update
+    // hover → crosshair + pinned panel
     figEl.on('plotly_hover', (ev) => {
       if (!ev || !ev.points || !ev.points.length) return;
       const p = ev.points[0];
       setHoverCrosshair(p.x, p.y);
       updatePinnedHoverFromX(p.x);
     });
-    figEl.on('plotly_unhover', () => { 
-      hoverShapes.v = null; hoverShapes.h = null; refreshShapes();
-    });
+    figEl.on('plotly_unhover', () => { clearHoverCrosshair(); });
 
     // Init
     setDenom("USD");
-    setLegend(true);  // JS 'true' (not Python True)
+    Plotly.restyle(figEl, {hoverinfo:'skip'}); // belt & suspenders
+    legendBtn.addEventListener('click', toggleLegend);
     updateMarkerAndReadout();
     // show pinned panel initially at latest date
     (function initPinned(){
