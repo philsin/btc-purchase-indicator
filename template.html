@@ -18,19 +18,24 @@
   #fig{height:70vh;min-height:430px;background:var(--card);border-radius:14px;padding:8px;position:relative}
   .slider{width:100%}
   .stack{display:flex;flex-direction:column;gap:2px;font-size:0.95rem}
-  /* hide Plotly default hover; we use pinned panel */
+  /* hide Plotly default hover; we show only our pinned panel */
   .hoverlayer{ display:none !important; }
 
-  /* pinned hover panel (compact) */
+  /* pinned hover panel – compact */
   #hoverBox{
     position:fixed; right:16px; bottom:16px; z-index:10;
     background:rgba(18,22,30,0.88); border:1px solid #3b4455;
-    border-radius:10px; padding:8px 10px; min-width:240px; max-width:340px;
-    font-size:0.9rem; line-height:1.2rem; display:none; user-select:none;
+    border-radius:10px; padding:8px 10px; min-width:230px; max-width:330px;
+    font-size:0.88rem; line-height:1.15rem; display:none; user-select:none;
     box-shadow:0 8px 24px rgba(0,0,0,.35);
   }
   #hoverBox .hdr{font-weight:700; margin-bottom:4px; color:#e7e9ee}
-  #hoverBox .rowline{display:flex; justify-content:space-between; gap:6px}
+  #hoverBox .rowline{
+    display:grid; grid-template-columns: 1fr auto; align-items:center;
+    column-gap:6px; margin:0; padding:0;
+  }
+  #hoverBox .rowline span:first-child{white-space:nowrap}
+  #hoverBox .rowline span:last-child{text-align:right; white-space:nowrap}
 </style>
 </head>
 <body>
@@ -62,12 +67,12 @@
   <!-- pinned hover box -->
   <div id="hoverBox">
     <div class="hdr" id="hb_hdr">—</div>
-    <div class="rowline"><span style="color:#22c55e">Top</span> <span id="hb_top">—</span></div>
-    <div class="rowline"><span style="color:#86efac">Frothy</span> <span id="hb_fro">—</span></div>
+    <div class="rowline"><span style="color:#22c55e">Top</span>      <span id="hb_top">—</span></div>
+    <div class="rowline"><span style="color:#86efac">Frothy</span>   <span id="hb_fro">—</span></div>
     <div class="rowline"><span style="color:#e5e7eb">PL Best Fit</span> <span id="hb_mid">—</span></div>
-    <div class="rowline"><span style="color:#fca5a5">Bear</span> <span id="hb_bear">—</span></div>
-    <div class="rowline"><span style="color:#ef4444">Support</span> <span id="hb_sup">—</span></div>
-    <div class="rowline"><span style="color:#facc15">BTC</span> <span id="hb_btc">—</span></div>
+    <div class="rowline"><span style="color:#fca5a5">Bear</span>      <span id="hb_bear">—</span></div>
+    <div class="rowline"><span style="color:#ef4444">Support</span>   <span id="hb_sup">—</span></div>
+    <div class="rowline"><span style="color:#facc15">BTC</span>       <span id="hb_btc">—</span></div>
   </div>
 
   <script type="application/json" id="figjson">__FIGJSON__</script>
@@ -78,7 +83,7 @@
     const ARR = JSON.parse(document.getElementById('arrays').textContent);
     const figEl = document.getElementById('fig');
 
-    // Hide Plotly's default hover
+    // hide default hover because we use a pinned panel
     (FIG.data||[]).forEach(tr => tr.hoverinfo = 'skip');
 
     Plotly.newPlot(figEl, FIG.data, FIG.layout, {displaylogo:false, responsive:true});
@@ -107,7 +112,7 @@
     const hb_sup = document.getElementById('hb_sup');
     const hb_btc = document.getElementById('hb_btc');
 
-    // Precompute epoch ms for full & hist dates
+    // dates & constants
     const fullISO = ARR.dates;
     const fullMS  = fullISO.map(d => Date.parse(d+"T00:00:00Z"));
     const histISO = ARR.hist.dates;
@@ -115,7 +120,7 @@
     const genesisMS = Date.parse("2009-01-03T00:00:00Z");
     const MS_DAY = 86400000;
 
-    // semi-transparent guide/crosshair
+    // guide/crosshair shapes
     let hoverShapes = { v: null, h: null };
     let guideShapes = { v: null, h: null };
     function refreshShapes(){
@@ -134,46 +139,35 @@
     }
     function clearHoverCrosshair(){ hoverShapes.v=null; hoverShapes.h=null; refreshShapes(); }
     function setMarkerGuides(x,y){
-      const yel="rgba(250,204,21,0.6)";
+      const yel="rgba(250,204,21,0.55)";
       guideShapes.v={type:"line",xref:"x",x0:x,x1:x,yref:"paper",y0:0,y1:1,line:{color:yel,width:1}};
       guideShapes.h={type:"line",xref:"paper",x0:0,x1:1,yref:"y",y0:y,y1:y,line:{color:yel,width:1}};
       refreshShapes();
     }
     function clearMarkerGuides(){ guideShapes.v=null; guideShapes.h=null; refreshShapes(); }
 
-    // Legend toggle (read live layout state)
-    function legendShowing(){ return !!(figEl._fullLayout && figEl._fullLayout.showlegend); }
-    function toggleLegend(){ Plotly.relayout(figEl, {"showlegend": !legendShowing()}); }
-    legendBtn.addEventListener('click', toggleLegend);
-
-    // Formatters
+    // Utilities
     function fmtUSD(v){ return (v==null||!isFinite(v))?"—":"$"+Math.round(v).toLocaleString(); }
     function fmtOzBTC(v){
       if (v==null||!isFinite(v)) return "—";
       const n = Math.round(v*100)/100;
       return n.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})+" oz/BTC";
     }
+    function fmtMonthYear(iso){
+      const d = new Date(iso+"T00:00:00Z");
+      return d.toLocaleString('en-US', {month:'short', year:'numeric'});
+    }
     function fmtTickGold(v){
       if (!isFinite(v)||v<=0) return "";
       if (v>=1) return Math.round(v).toLocaleString();
       return Number(v).toFixed(3).replace(/\.?0+$/,"");
     }
-
-    // Nearest helpers
-    function nearestFullIndex(ms){
-      let lo=0, hi=fullMS.length-1, pos=hi;
-      while (lo<=hi){ const mid=(lo+hi)>>1; if (fullMS[mid]>=ms){pos=mid; hi=mid-1;} else lo=mid+1; }
-      if (pos>0 && Math.abs(fullMS[pos-1]-ms)<=Math.abs(fullMS[pos]-ms)) return pos-1;
+    function nearestIdx(ms, arrMS){
+      let lo=0, hi=arrMS.length-1, pos=hi;
+      while (lo<=hi){ const mid=(lo+hi)>>1; if (arrMS[mid]>=ms){pos=mid; hi=mid-1;} else lo=mid+1; }
+      if (pos>0 && Math.abs(arrMS[pos-1]-ms)<=Math.abs(arrMS[pos]-ms)) return pos-1;
       return pos;
     }
-    function nearestHistIndex(ms){
-      let lo=0, hi=histMS.length-1, pos=hi;
-      while (lo<=hi){ const mid=(lo+hi)>>1; if (histMS[mid]>=ms){pos=mid; hi=mid-1;} else lo=mid+1; }
-      if (pos>0 && Math.abs(histMS[pos-1]-ms)<=Math.abs(histMS[pos]-ms)) return pos-1;
-      return pos;
-    }
-
-    // Zone helpers
     function zoneDotColor(z){
       switch(z){
         case "SELL THE HOUSE!!": return "#ffffff";
@@ -189,6 +183,27 @@
       return {Support:g.Support[idx], Bear:g.Bear[idx], Mid:g.Mid[idx], Frothy:g.Frothy[idx], Top:g.Top[idx]};
     }
 
+    // Legend toggle (robust)
+    function legendShowing(){ return !!(figEl._fullLayout && figEl._fullLayout.showlegend); }
+    function toggleLegend(){ Plotly.relayout(figEl, {"showlegend": !legendShowing()}); }
+    legendBtn.addEventListener('click', toggleLegend);
+
+    // Denomination toggle (apply per-trace so it works everywhere)
+    function setDenom(which){
+      const want = which==="USD" ? "USD" : "GLD";
+      const traces = figEl.data || [];
+      traces.forEach((tr,i)=>{
+        const vis = (tr.legendgroup||"") === want;
+        Plotly.restyle(figEl, {"visible": vis}, [i]);
+      });
+      if (which==="USD"){ Plotly.relayout(figEl, {"yaxis.title.text":"USD / BTC"}); clearGoldTicks(); }
+      else { Plotly.relayout(figEl, {"yaxis.title.text":"Gold oz / BTC"}); setGoldTicks(); }
+      updateMarkerAndReadout();
+      // refresh pinned panel at the latest x used
+      if (window._lastPinnedX != null) updatePinnedHoverFromX(window._lastPinnedX);
+    }
+    denomSel.addEventListener('change', e => setDenom(e.target.value));
+
     // Gold tick labels
     function setGoldTicks(){
       const G = ARR.gld;
@@ -203,27 +218,14 @@
       Plotly.relayout(figEl, {"yaxis.tickvals":null, "yaxis.ticktext":null, "yaxis.tickformat":"$,d"});
     }
 
-    // Denomination toggle (use legendgroup)
-    function setDenom(which){
-      const want = which==="USD" ? "USD" : "GLD";
-      const vis = (figEl.data||[]).map(tr => (tr.legendgroup||"") === want);
-      Plotly.restyle(figEl, {"visible": vis});
-      if (which==="USD"){ Plotly.relayout(figEl, {"yaxis.title.text":"USD / BTC"}); clearGoldTicks(); }
-      else { Plotly.relayout(figEl, {"yaxis.title.text":"Gold oz / BTC"}); setGoldTicks(); }
-      updateMarkerAndReadout();
-    }
-    denomSel.addEventListener('change', e => setDenom(e.target.value));
-
     // Weekly slider (Mondays)
     (function initWeekly(){
       const firstDate = new Date(histMS[0]);
       const firstMon = histMS[0] + ((8 - firstDate.getUTCDay()) % 7) * MS_DAY;
-      const weeklyIdx = [], weeklyDates = [];
-      for (let t = firstMon; t <= histMS[histMS.length-1]; t += 7*MS_DAY){
-        weeklyIdx.push(nearestHistIndex(t));
-        weeklyDates.push(histISO[weeklyIdx[weeklyIdx.length-1]]);
-      }
-      if (weeklyIdx.length===0){ weeklyIdx.push(histISO.length-1); weeklyDates.push(histISO.at(-1)); }
+      const weeklyIdx = [];
+      for (let t = firstMon; t <= histMS[histMS.length-1]; t += 7*MS_DAY)
+        weeklyIdx.push(nearestIdx(t, histMS));
+      if (weeklyIdx.length===0) weeklyIdx.push(histMS.length-1);
       slider._weeklyIdx = weeklyIdx;
       slider.max = Math.max(0, weeklyIdx.length-1);
       slider.value = slider.max;
@@ -231,9 +233,18 @@
 
     function sliderToHistIndex(){
       const i = Math.max(0, Math.min(parseInt(slider.value,10), slider._weeklyIdx.length-1));
-      return slider._weeklyIdx[i] ?? (histISO.length-1);
+      return slider._weeklyIdx[i] ?? (histMS.length-1);
     }
 
+    // Today checkbox
+    function setTodayIfChecked(){
+      if (chkToday.checked){ slider.value = slider.max; clearMarkerGuides(); }
+      updateMarkerAndReadout();
+    }
+    chkToday.addEventListener('change', setTodayIfChecked);
+    chkToday.addEventListener('click', setTodayIfChecked);
+
+    // Marker & readout
     function updateMarkerAndReadout(){
       const j = sliderToHistIndex();
       const denom = denomSel.value;
@@ -243,7 +254,7 @@
 
       // zone from bands at nearest full date
       const ms = Date.parse(dISO+"T00:00:00Z");
-      const k = nearestFullIndex(ms);
+      const k = nearestIdx(ms, fullMS);
       const b = bandsAtIdx(k, denom);
       const price = denom==="USD" ? priceUSD : priceGLD;
       const zone = (price < b.Support) ? "SELL THE HOUSE!!"
@@ -254,7 +265,7 @@
       zoneTxt.textContent = zone;
       zoneDot.style.background = zoneDotColor(zone);
 
-      // readout
+      // readout: only date & BTC price
       const line = denom==="USD" ? fmtUSD(priceUSD) : fmtOzBTC(priceGLD);
       dateRead.innerHTML = `<div style="font-weight:600">${dISO}</div><div>BTC: ${line}</div>`;
 
@@ -269,27 +280,22 @@
         if (!chkToday.checked) setMarkerGuides(xval, priceGLD); else clearMarkerGuides();
       }
     }
-
-    // Today checkbox
-    chkToday.addEventListener('change', ()=>{
-      if (chkToday.checked){ slider.value = slider.max; clearMarkerGuides(); }
-      updateMarkerAndReadout();
-    });
     slider.addEventListener('input', ()=>{ chkToday.checked=false; updateMarkerAndReadout(); });
 
-    // pinned hover (updates on hover and on click)
+    // pinned hover panel (updates on hover & click)
     function updatePinnedHoverFromX(logx){
+      window._lastPinnedX = logx;  // remember for denom flips
       const days = Math.max(1, Math.round(Math.pow(10, logx)));
       const ms = genesisMS + days*MS_DAY;
-      const idxFull = nearestFullIndex(ms);
-      const idxHist = nearestHistIndex(ms);
+      const idxFull = nearestIdx(ms, fullMS);
+      const idxHist = nearestIdx(ms, histMS);
       const dateISO = fullISO[idxFull];
       const denom = denomSel.value;
       const b = bandsAtIdx(idxFull, denom);
       const usd = ARR.hist.usd[idxHist];
       const gld = ARR.hist.gld[idxHist];
 
-      hb_hdr.textContent = dateISO;
+      hb_hdr.textContent = fmtMonthYear(dateISO);
       if (denom==="USD"){
         hb_top.textContent = fmtUSD(b.Top);
         hb_fro.textContent = fmtUSD(b.Frothy);
@@ -308,7 +314,6 @@
       hb.style.display = "block";
     }
 
-    // show/clear crosshair and pinned box on interactions
     function outsideFig(el, target){ return !el.contains(target); }
     function hideHover(){ try{ Plotly.Fx.unhover(figEl); }catch(e){} clearHoverCrosshair(); }
     document.addEventListener('click', (ev)=>{ if(outsideFig(figEl, ev.target)) hideHover(); }, {passive:true});
@@ -316,21 +321,17 @@
 
     figEl.on('plotly_hover', (ev) => {
       if (!ev || !ev.points || !ev.points.length) return;
-      const p = ev.points[0];
-      setHoverCrosshair(p.x, p.y);
-      updatePinnedHoverFromX(p.x);
+      const p = ev.points[0]; setHoverCrosshair(p.x, p.y); updatePinnedHoverFromX(p.x);
     });
     figEl.on('plotly_click', (ev) => {
       if (!ev || !ev.points || !ev.points.length) return;
-      const p = ev.points[0];
-      setHoverCrosshair(p.x, p.y);
-      updatePinnedHoverFromX(p.x);
+      const p = ev.points[0]; setHoverCrosshair(p.x, p.y); updatePinnedHoverFromX(p.x);
     });
     figEl.on('plotly_unhover', () => { clearHoverCrosshair(); });
 
     // Init
-    setDenom("USD");
-    updateMarkerAndReadout();
+    setDenom("USD");          // sets visibility & axis, then calls updateMarkerAndReadout
+    updateMarkerAndReadout(); // ensure marker/zone are in sync
     // show pinned panel at latest point initially
     (function initPinned(){
       const lastISO = histISO.at(-1);
