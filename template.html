@@ -113,6 +113,14 @@
     const genesisMS = Date.parse("2009-01-03T00:00:00Z");
     const MS_DAY = 86400000;
 
+    // cutoff for BTC display in hover (6 months after last historical point)
+    const LAST_HIST_MS = histMS[histMS.length-1];
+    const CUTOFF_MS = (() => {
+      const d = new Date(LAST_HIST_MS);
+      d.setUTCMonth(d.getUTCMonth() + 6);
+      return d.getTime();
+    })();
+
     // crosshair & guides (semi-transparent)
     let hoverShapes = { v: null, h: null };
     let guideShapes = { v: null, h: null };
@@ -211,7 +219,6 @@
       else { Plotly.relayout(figEl, {"yaxis.title.text":"Gold oz / BTC"}); setGoldTicks(); }
       updateMarkerAndReadout();
       if (window._lastPinnedX != null) updatePinnedHoverFromX(window._lastPinnedX);
-      // preserve Today state
       if (chkToday.checked){ setTimeout(()=> setToday(true), 0); }
     }
     denomSel.addEventListener('change', e => setDenom(e.target.value));
@@ -345,6 +352,8 @@
       const usd = ARR.hist.usd[idxHist];
       const gld = ARR.hist.gld[idxHist];
 
+      const showBTC = (ms <= CUTOFF_MS);   // ← hide BTC beyond +6 months
+
       const monthLabel = fmtMonthYear(dateISO);
       const rows = (denom==="USD")
         ? [
@@ -353,7 +362,7 @@
             {name:"PL Best Fit",value: fmtUSD(b.Mid)},
             {name:"Bear",       value: fmtUSD(b.Bear)},
             {name:"Support",    value: fmtUSD(b.Support)},
-            {name:"BTC",        value: fmtUSD(usd)}
+            ...(showBTC ? [{name:"BTC", value: fmtUSD(usd)}] : [])
           ]
         : [
             {name:"Top",        value: fmtOzBTC(b.Top)},
@@ -361,7 +370,7 @@
             {name:"PL Best Fit",value: fmtOzBTC(b.Mid)},
             {name:"Bear",       value: fmtOzBTC(b.Bear)},
             {name:"Support",    value: fmtOzBTC(b.Support)},
-            {name:"BTC",        value: fmtOzBTC(gld)}
+            ...(showBTC ? [{name:"BTC", value: fmtOzBTC(gld)}] : [])
           ];
       renderHoverBox(monthLabel, rows);
     }
