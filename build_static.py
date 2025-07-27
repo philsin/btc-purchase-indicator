@@ -179,7 +179,7 @@ def make_powerlaw_fig(df: pd.DataFrame):
 
     # USD traces (visible by default)
     for name in order:
-        label = name + " (USD)"
+        label = name
         y = bands_usd["mid"] if name == "PL Best Fit" else bands_usd[name]
         fig.add_trace(go.Scatter(
             x=x_full, y=y, mode="lines",
@@ -192,7 +192,7 @@ def make_powerlaw_fig(df: pd.DataFrame):
     fig.add_trace(go.Scatter(
         x=x_hist, y=usd_series, mode="lines",
         line=dict(color=COLORS["BTC"], width=2.5),
-        name="BTC (USD)", legendgroup="USD",
+        name="BTC", legendgroup="USD",
         customdata=date_labels_hist,
         hovertemplate="BTC | %{customdata}, %{y:$,.0f}<extra></extra>",
         visible=True
@@ -200,7 +200,7 @@ def make_powerlaw_fig(df: pd.DataFrame):
 
     # Gold traces (hidden initially) — Gold oz per BTC
     for name in order:
-        label = name + " (oz/BTC)"
+        label = name
         y = bands_gld["mid"] if name == "PL Best Fit" else bands_gld[name]
         fig.add_trace(go.Scatter(
             x=x_full, y=y, mode="lines",
@@ -213,7 +213,7 @@ def make_powerlaw_fig(df: pd.DataFrame):
     fig.add_trace(go.Scatter(
         x=x_hist, y=gld_series, mode="lines",
         line=dict(color=COLORS["BTC"], width=2.5),
-        name="BTC (oz/BTC)", legendgroup="GLD",
+        name="BTC", legendgroup="GLD",
         customdata=date_labels_hist,
         hovertemplate="BTC | %{customdata}, %{y:,.2f} oz/BTC<extra></extra>",
         visible=False
