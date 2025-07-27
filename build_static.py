@@ -353,36 +353,37 @@ def make_powerlaw_fig(df: pd.DataFrame):
 def write_index_html(fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist,
                      out_path="dist/index.html", page_title="BTC Purchase Indicator"):
     from pathlib import Path
-    import plotly.io as pio, json, numpy as np, pandas as pd
+    import json, numpy as np, pandas as pd
+    import plotly.io as pio
 
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
 
     fig_json = pio.to_json(fig, pretty=False)
 
-    dates_iso = pd.Series(pd.to_datetime(full_dates)).dt.strftime("%Y-%m-%d").tolist()
-    hist_len = len(usd_hist)
-    hist_iso = pd.Series(pd.to_datetime(full_dates[:hist_len])).dt.strftime("%Y-%m-%d").tolist()
+    dates_iso = pd.to_datetime(full_dates).strftime("%Y-%m-%d").tolist()
+    hist_len  = len(usd_hist)
+    hist_iso  = pd.to_datetime(full_dates[:hist_len]).strftime("%Y-%m-%d").tolist()
 
     payload = {
         "dates": dates_iso,
         "hist": {
             "dates": hist_iso,
-            "usd": pd.Series(usd_hist).astype(float).round(6).tolist(),
-            "gld": pd.Series(gld_hist).astype(float).round(6).tolist(),
+            "usd": pd.Series(usd_hist, dtype="float64").round(6).tolist(),
+            "gld": pd.Series(gld_hist, dtype="float64").round(6).tolist(),
         },
-        "usd": {k: np.asarray(v).astype(float).round(6).tolist() for k, v in {
+        "usd": {k: np.asarray(v, dtype="float64").round(6).tolist() for k, v in {
             "Top": bands_usd["Top"], "Frothy": bands_usd["Frothy"],
             "Mid": bands_usd["mid"], "Bear": bands_usd["Bear"], "Support": bands_usd["Support"]
         }.items()},
-        "gld": {k: np.asarray(v).astype(float).round(6).tolist() for k, v in {
+        "gld": {k: np.asarray(v, dtype="float64").round(6).tolist() for k, v in {
             "Top": bands_gld["Top"], "Frothy": bands_gld["Frothy"],
             "Mid": bands_gld["mid"], "Bear": bands_gld["Bear"], "Support": bands_gld["Support"]
         }.items()}
     }
     arrays_json = json.dumps(payload, separators=(",", ":"))
 
-    # ───────────────────────── HTML TEMPLATE (raw string) ─────────────────────────
-    TEMPLATE = r"""<!doctype html>
+    # ------------------------- HTML TEMPLATE -------------------------
+    TEMPLATE = r'''<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
@@ -402,7 +403,6 @@ def write_index_html(fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist,
   #fig{height:70vh;min-height:430px;background:var(--card);border-radius:14px;padding:8px;position:relative}
   .slider{width:100%}
   .stack{display:flex;flex-direction:column;gap:2px;font-size:0.95rem}
-  /* pinned hover box (bottom-right) */
   #hoverBox{
     position:fixed; right:20px; bottom:20px; z-index:10;
     background:rgba(20,24,32,0.88); border:1px solid #3b4455;
@@ -439,7 +439,6 @@ def write_index_html(fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist,
     <div id="fig"></div>
   </div>
 
-  <!-- pinned hover box -->
   <div id="hoverBox">
     <div class="hdr" id="hb_hdr">—</div>
     <div class="rowline"><span style="color:#22c55e">Top</span> <span id="hb_top">—</span></div>
@@ -460,12 +459,10 @@ def write_index_html(fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist,
 
     Plotly.newPlot(figEl, FIG.data, FIG.layout, {displaylogo:false, responsive:true});
 
-    // indices exposed by layout.meta
     const META = FIG.layout.meta || {};
     const USD_MARK_IDX = META.USD_MARK_IDX;
     const GLD_MARK_IDX = META.GLD_MARK_IDX;
 
-    // controls
     const denomSel = document.getElementById('denom');
     const legendBtn = document.getElementById('legendBtn');
     const slider = document.getElementById('dateSlider');
@@ -474,7 +471,6 @@ def write_index_html(fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist,
     const zoneDot = document.getElementById('zoneDot');
     const dateRead = document.getElementById('dateRead');
 
-    // pinned hover elements
     const hb = document.getElementById('hoverBox');
     const hb_hdr = document.getElementById('hb_hdr');
     const hb_top = document.getElementById('hb_top');
@@ -484,13 +480,11 @@ def write_index_html(fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist,
     const hb_sup = document.getElementById('hb_sup');
     const hb_btc = document.getElementById('hb_btc');
 
-    // precompute full date ms for band lookup
     const fullDatesISO = ARR.dates;
     const fullMs = fullDatesISO.map(d=>Date.parse(d+"T00:00:00Z"));
 
-    // ── crosshair (white) and marker guides (yellow) shapes (slightly transparent)
-    let hoverShapes = { v: null, h: null };  // white, shown only while hovering
-    let guideShapes = { v: null, h: null };  // yellow, persist at slider position
+    let hoverShapes = { v: null, h: null };
+    let guideShapes = { v: null, h: null };
 
     function refreshShapes(){
       const arr = [];
@@ -506,16 +500,15 @@ def write_index_html(fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist,
       hoverShapes.v = { type:"line", xref:"x", x0:x, x1:x, yref:"paper", y0:0, y1:1, line:{color:w,width:1} };
       hoverShapes.h = { type:"line", xref:"paper", x0:0, x1:1, yref:"y",     y0:y, y1:y, line:{color:w,width:1} };
       refreshShapes();
-      hb.style.display = "block"; // show pinned panel on hover
+      hb.style.display = "block";
     }
     function clearHoverCrosshair(){
       hoverShapes.v = null; hoverShapes.h = null;
       refreshShapes();
-      // keep hoverBox visible; it’s pinned
     }
 
     function setMarkerGuides(x, y){
-      const yel = "rgba(250,204,21,0.6)"; // yellow with transparency
+      const yel = "rgba(250,204,21,0.6)";
       guideShapes.v = { type:"line", xref:"x", x0:x, x1:x, yref:"paper", y0:0, y1:1, line:{color:yel,width:1} };
       guideShapes.h = { type:"line", xref:"paper", x0:0, x1:1, yref:"y",     y0:y, y1:y, line:{color:yel,width:1} };
       refreshShapes();
@@ -525,12 +518,10 @@ def write_index_html(fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist,
       refreshShapes();
     }
 
-    // legend toggle (robust)
     function getLegend(){ return !!(figEl._fullLayout && figEl._fullLayout.showlegend); }
     function setLegend(on){ Plotly.relayout(figEl, {"showlegend": !!on}); }
     legendBtn.addEventListener('click', ()=> setLegend(!getLegend()));
 
-    // formatters
     function fmtUSD(v){ return (v==null||!isFinite(v))?"—":"$"+Math.round(v).toLocaleString(); }
     function fmtOzBTC(v){
       if (v==null||!isFinite(v)) return "—";
@@ -543,16 +534,13 @@ def write_index_html(fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist,
       return Number(v).toFixed(3).replace(/\.?0+$/,"");
     }
 
-    // near index in full dates by milliseconds
     function nearestFullIndex(ms){
-      // lower-bound binary search
       let lo=0, hi=fullMs.length-1, pos=hi;
       while (lo<=hi){ const mid=(lo+hi)>>1; if (fullMs[mid]>=ms){pos=mid; hi=mid-1;} else lo=mid+1; }
       if (pos>0 && Math.abs(fullMs[pos-1]-ms) <= Math.abs(fullMs[pos]-ms)) return pos-1;
       return pos;
     }
 
-    // zone helpers
     function zoneDotColor(z){
       switch(z){
         case "SELL THE HOUSE!!": return "#ffffff";
@@ -569,7 +557,6 @@ def write_index_html(fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist,
       return { Support:g.Support[idx], Bear:g.Bear[idx], Mid:g.Mid[idx], Frothy:g.Frothy[idx], Top:g.Top[idx] };
     }
 
-    // gold ticks for oz/BTC
     function setGoldTicks(){
       const G = ARR.gld;
       const all = [].concat(G.Support,G.Bear,G.Mid,G.Frothy,G.Top,ARR.hist.gld).filter(v=>v>0&&isFinite(v));
@@ -584,7 +571,6 @@ def write_index_html(fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist,
       Plotly.relayout(figEl, {"yaxis.tickvals":null, "yaxis.ticktext":null, "yaxis.tickformat":"$,d"});
     }
 
-    // denomination toggle (map by legendgroup; safe fallback by name substring)
     function setDenom(which){
       const want = which==="USD" ? "USD" : "GLD";
       const vis = (FIG.data||[]).map(tr => {
@@ -597,19 +583,16 @@ def write_index_html(fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist,
       Plotly.restyle(figEl, {"visible": vis});
       if (which==="USD"){ Plotly.relayout(figEl, {"yaxis.title.text":"USD / BTC"}); clearGoldTicks(); }
       else { Plotly.relayout(figEl, {"yaxis.title.text":"Gold oz / BTC"}); setGoldTicks(); }
-      updateMarkerAndReadout(); // redraw yellow guides in correct units
+      updateMarkerAndReadout();
     }
 
-    // ----- Weekly (Monday) slider independent of data gaps
     const histDatesISO = ARR.hist.dates;
     const histMs = histDatesISO.map(d=>Date.parse(d+"T00:00:00Z"));
     const MS_DAY = 86400000;
-    // first Monday on/after first data date
     const firstDate = new Date(histMs[0]);
     const firstMon = histMs[0] + ((8 - firstDate.getUTCDay()) % 7) * MS_DAY;
     const weeklyIdx = [], weeklyDates = [];
     for (let t = firstMon; t <= histMs[histMs.length-1]; t += 7*MS_DAY){
-      // nearest lower-bound index
       let lo = 0, hi = histMs.length-1, pos = hi;
       while (lo <= hi){ const mid=(lo+hi)>>1; if (histMs[mid] >= t){ pos=mid; hi=mid-1; } else { lo=mid+1; } }
       let cand = pos;
@@ -618,11 +601,12 @@ def write_index_html(fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist,
       weeklyDates.push(histDatesISO[cand]);
     }
     if (weeklyIdx.length===0){ weeklyIdx.push(histDatesISO.length-1); weeklyDates.push(histDatesISO.at(-1)); }
-    slider.max = Math.max(0, weeklyIdx.length-1);
-    slider.value = slider.max;
+    const sliderEl = slider;
+    sliderEl.max = Math.max(0, weeklyIdx.length-1);
+    sliderEl.value = sliderEl.max;
 
     function sliderToHistIndex(){
-      const i = Math.max(0, Math.min(parseInt(slider.value,10), weeklyIdx.length-1));
+      const i = Math.max(0, Math.min(parseInt(sliderEl.value,10), weeklyIdx.length-1));
       return weeklyIdx[i] ?? (histDatesISO.length-1);
     }
 
@@ -634,7 +618,6 @@ def write_index_html(fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist,
       const priceUSD = ARR.hist.usd[j];
       const priceGLD = ARR.hist.gld[j];
 
-      // zone badge from bands at this date (use fullDates to get the same month)
       const ms = Date.parse(dISO+"T00:00:00Z");
       const k = nearestFullIndex(ms);
       const bands = readBandsAtIdx(k, denom);
@@ -650,11 +633,9 @@ def write_index_html(fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist,
       zoneTxt.textContent = zone;
       zoneDot.style.background = zoneDotColor(zone);
 
-      // Readout: only date + BTC price
       const line = (denom==="USD") ? fmtUSD(priceUSD) : fmtOzBTC(priceGLD);
       dateRead.innerHTML = `<div style="font-weight:600">${dISO}</div><div>BTC: ${line}</div>`;
 
-      // Move marker + (optionally) set yellow guides at the same x/y
       const genesis = Date.parse("2009-01-03T00:00:00Z");
       const dms = Date.parse(dISO+"T00:00:00Z");
       const days = Math.max(1, Math.round((dms - genesis)/86400000));
@@ -669,7 +650,6 @@ def write_index_html(fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist,
       }
     }
 
-    // pinned hover panel content from current mouse x (log-days)
     function updatePinnedHoverFromX(logx){
       const days = Math.max(1, Math.round(Math.pow(10, logx)));
       const ms = Date.parse("2009-01-03T00:00:00Z") + days*86400000;
@@ -678,14 +658,13 @@ def write_index_html(fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist,
       const denom = denomSel.value;
       const b = readBandsAtIdx(idx, denom);
 
-      // BTC at same date (nearest in hist)
       let lo=0, hi=histMs.length-1, pos=hi;
       while (lo<=hi){ const mid=(lo+hi)>>1; if (histMs[mid]>=ms){ pos=mid; hi=mid-1; } else lo=mid+1; }
       if (pos>0 && Math.abs(histMs[pos-1]-ms)<=Math.abs(histMs[pos]-ms)) pos=pos-1;
       const usd = ARR.hist.usd[pos];
       const gld = ARR.hist.gld[pos];
 
-      hb_hdr.textContent = new Date(ms).toISOString().slice(0,7); // YYYY-MM
+      hb_hdr.textContent = dateISO;
       if (denom==="USD"){
         hb_top.textContent = fmtUSD(b.Top);
         hb_fro.textContent = fmtUSD(b.Frothy);
@@ -705,19 +684,14 @@ def write_index_html(fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist,
     }
 
     denomSel.addEventListener('change', (e)=> setDenom(e.target.value));
-    slider.addEventListener('input', ()=>{ chkToday.checked=false; updateMarkerAndReadout(); });
-    chkToday.addEventListener('change', (e)=>{ 
-      if(e.target.checked){ slider.value = slider.max; }
-      updateMarkerAndReadout();
-    });
+    sliderEl.addEventListener('input', ()=>{ chkToday.checked=false; updateMarkerAndReadout(); });
+    chkToday.addEventListener('change', (e)=>{ if(e.target.checked){ sliderEl.value = sliderEl.max; } updateMarkerAndReadout(); });
 
-    // Tap/click outside → hide crosshair; keep pinned hover visible
     function outsideFig(el, target){ return !el.contains(target); }
     function hideHover(){ try{ Plotly.Fx.unhover(figEl); }catch(e){} clearHoverCrosshair(); }
     document.addEventListener('click', (ev)=>{ if(outsideFig(figEl, ev.target)) hideHover(); }, {passive:true});
     document.addEventListener('touchstart', (ev)=>{ if(outsideFig(figEl, ev.target)) hideHover(); }, {passive:true});
 
-    // White crosshair follows the hover; pinned hover content updates from x
     figEl.on('plotly_hover', (ev) => {
       if (!ev || !ev.points || !ev.points.length) return;
       const p = ev.points[0];
@@ -726,11 +700,9 @@ def write_index_html(fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist,
     });
     figEl.on('plotly_unhover', () => { clearHoverCrosshair(); });
 
-    // Init
     setDenom("USD");
-    setLegend(true);
+    setLegend(True);   // legend visible at load
     updateMarkerAndReadout();
-    // show pinned panel initially at the latest x
     (function initPinned(){
       const lastISO = ARR.hist.dates.at(-1);
       const ms = Date.parse(lastISO+"T00:00:00Z");
@@ -743,7 +715,16 @@ def write_index_html(fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist,
     window.addEventListener('resize', ()=> Plotly.Plots.resize(figEl));
   </script>
 </body>
-</html>
+</html>'''
+    # ----------------------- END TEMPLATE -----------------------
+
+    html = (TEMPLATE
+            .replace("__TITLE__", page_title)
+            .replace("__FIGJSON__", fig_json)
+            .replace("__ARRAYS__", arrays_json))
+
+    Path(out_path).write_text(html, encoding="utf-8")
+    print("[build] wrote", out_path)
 
 # --------------------- main
 def main():
