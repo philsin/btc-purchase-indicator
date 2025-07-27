@@ -176,9 +176,34 @@
     }
 
     // legend toggle
-    function legendShowing(){ return !!(figEl._fullLayout && figEl._fullLayout.showlegend); }
-    function toggleLegend(){ Plotly.relayout(figEl, {"showlegend": !legendShowing()}); }
-    legendBtn.addEventListener('click', toggleLegend);
+    // ----- Legend toggle (robust on iOS/Safari) -----
+let legendOn = true;
+
+// read current state from the live layout
+function readLegendState(){
+  // default true if layout not ready yet
+  legendOn = !!(figEl._fullLayout ? figEl._fullLayout.showlegend : true);
+  // reflect state in button (optional)
+  legendBtn.setAttribute('aria-pressed', legendOn ? 'true' : 'false');
+}
+
+// apply a state and refresh our cached value after relayout
+function setLegend(on){
+  return Plotly.relayout(figEl, {showlegend: !!on}).then(readLegendState);
+}
+
+// keep our cache in sync if other relayouts happen
+figEl.on('plotly_relayout', readLegendState);
+
+// initial read after the first render
+readLegendState();
+
+// click handler
+legendBtn.addEventListener('click', () => {
+  // read fresh (in case something else changed it)
+  readLegendState();
+  setLegend(!legendOn);
+});
 
     // denom toggle (per-trace visibility via legendgroup)
     function setGoldTicks(){
