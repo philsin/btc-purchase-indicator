@@ -350,7 +350,39 @@ def make_powerlaw_fig(df: pd.DataFrame):
     return fig, full_dates, bands_usd, bands_gld, usd, gld
 
 # --------------------- HTML writer
-<!doctype html>
+def write_index_html(fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist,
+                     out_path="dist/index.html", page_title="BTC Purchase Indicator"):
+    from pathlib import Path
+    import plotly.io as pio, json, numpy as np, pandas as pd
+
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+
+    fig_json = pio.to_json(fig, pretty=False)
+
+    dates_iso = pd.Series(pd.to_datetime(full_dates)).dt.strftime("%Y-%m-%d").tolist()
+    hist_len = len(usd_hist)
+    hist_iso = pd.Series(pd.to_datetime(full_dates[:hist_len])).dt.strftime("%Y-%m-%d").tolist()
+
+    payload = {
+        "dates": dates_iso,
+        "hist": {
+            "dates": hist_iso,
+            "usd": pd.Series(usd_hist).astype(float).round(6).tolist(),
+            "gld": pd.Series(gld_hist).astype(float).round(6).tolist(),
+        },
+        "usd": {k: np.asarray(v).astype(float).round(6).tolist() for k, v in {
+            "Top": bands_usd["Top"], "Frothy": bands_usd["Frothy"],
+            "Mid": bands_usd["mid"], "Bear": bands_usd["Bear"], "Support": bands_usd["Support"]
+        }.items()},
+        "gld": {k: np.asarray(v).astype(float).round(6).tolist() for k, v in {
+            "Top": bands_gld["Top"], "Frothy": bands_gld["Frothy"],
+            "Mid": bands_gld["mid"], "Bear": bands_gld["Bear"], "Support": bands_gld["Support"]
+        }.items()}
+    }
+    arrays_json = json.dumps(payload, separators=(",", ":"))
+
+    # ───────────────────────── HTML TEMPLATE (raw string) ─────────────────────────
+    TEMPLATE = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
@@ -630,7 +662,14 @@ def make_powerlaw_fig(df: pd.DataFrame):
     window.addEventListener('resize', ()=> Plotly.Plots.resize(figEl));
   </script>
 </body>
-</html>
+</html>"""
+
+    html = (TEMPLATE
+            .replace("__TITLE__", page_title)
+            .replace("__FIGJSON__", fig_json)
+            .replace("__ARRAYS__", arrays_json))
+    Path(out_path).write_text(html, encoding="utf-8")
+    print("[build] wrote", out_path)
 
 # --------------------- main
 def main():
