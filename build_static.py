@@ -21,10 +21,10 @@ UA       = {"User-Agent": "btc-pl-pages/1.2"}
 
 LEVELS = {
     "Top":         +1.75,
-    "Frothy":      +1.00,
-    "PL Best Fit":  0.00,
-    "Bear":        -0.50,
-    "Support":     -1.50,
+    "Frothy":      +1,
+    "PL Best Fit":  0,
+    "Bear":        -0.5,
+    "Support":     -1.5,
 }
 COLORS = {
     "Top":         "#16a34a",
