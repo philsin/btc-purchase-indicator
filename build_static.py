@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # ─────────────────────────────────────────────────────────────
 # build_static.py  ·  BTC Purchase Indicator (static Plotly)
-#  - Power-law on log-time (days since 2009-01-03)
-#  - Denomination switch: USD/BTC or Gold oz/BTC
-#  - Bands projected monthly to 2040-12
-#  - Unified hover (shows all lines)
-#  - Legend names include σ
-#  - BTC marker follows weekly (Monday) slider selection
-#  - Safe HTML embed (no f-strings in HTML/JS)
+#  - Power-law bands on log-time (days since 2009-01-03)
+#  - Denomination: USD/BTC or Gold oz/BTC
+#  - Unified hover: shows all lines; top row = date
+#  - BTC marker follows weekly (Monday) slider
+#  - Readout shows only date + BTC price
+#  - Tap outside chart hides hover box
 # ─────────────────────────────────────────────────────────────
 
 from pathlib import Path
@@ -15,12 +14,10 @@ import io, json, requests, numpy as np, pandas as pd
 import plotly.graph_objects as go
 import plotly.io as pio
 
-# --------------- constants
-GENESIS   = pd.Timestamp("2009-01-03")
-PROJ_END  = pd.Timestamp("2040-12-31")
-UA        = {"User-Agent": "btc-pl-pages/1.0"}
+GENESIS  = pd.Timestamp("2009-01-03")
+PROJ_END = pd.Timestamp("2040-12-31")
+UA       = {"User-Agent": "btc-pl-pages/1.1"}
 
-# Band definitions (sigma multiples)
 LEVELS = {
     "Top":         +1.75,
     "Frothy":      +1.00,
@@ -28,26 +25,19 @@ LEVELS = {
     "Bear":        -0.50,
     "Support":     -1.50,
 }
-SIGMA_LABEL = {
-    "Top":         " (+1.75σ)",
-    "Frothy":      " (+1.00σ)",
-    "PL Best Fit": " (0.00σ)",
-    "Bear":        " (-0.50σ)",
-    "Support":     " (-1.50σ)",
-}
 COLORS = {
-    "Top":         "#16a34a",   # green
-    "Frothy":      "#86efac",   # light green
-    "PL Best Fit": "#ffffff",   # white
-    "Bear":        "#fda4af",   # light red
-    "Support":     "#ef4444",   # red
-    "BTC":         "#ffd166",   # gold line
-    "BTC_MARK":    "#ffd166",   # marker on BTC
+    "Top":         "#16a34a",
+    "Frothy":      "#86efac",
+    "PL Best Fit": "#ffffff",
+    "Bear":        "#fda4af",
+    "Support":     "#ef4444",
+    "BTC":         "#ffd166",
+    "BTC_MARK":    "#ffd166",
 }
 DASHES = {k: "dash" for k in LEVELS}
 DASHES["PL Best Fit"] = "dash"
 
-# --------------- loaders
+# --------------------- loaders
 def _read_csv(url: str) -> pd.DataFrame:
     r = requests.get(url, timeout=30, headers=UA)
     r.raise_for_status()
@@ -56,16 +46,16 @@ def _read_csv(url: str) -> pd.DataFrame:
 def _btc_stooq() -> pd.DataFrame:
     df = _read_csv("https://stooq.com/q/d/l/?s=btcusd&i=d")
     df.columns = [c.lower() for c in df.columns]
-    date_col  = [c for c in df.columns if "date" in c][0]
-    close_col = [c for c in df.columns if ("close" in c) or ("price" in c)][-1]
-    df = df.rename(columns={date_col: "Date", close_col: "BTC"})
+    dcol = [c for c in df.columns if "date" in c][0]
+    ccol = [c for c in df.columns if ("close" in c) or ("price" in c)][-1]
+    df = df.rename(columns={dcol: "Date", ccol: "BTC"})
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df["BTC"]  = pd.to_numeric(df["BTC"].astype(str).str.replace(",", ""), errors="coerce")
     return df.dropna().query("BTC>0").sort_values("Date")[["Date","BTC"]]
 
 def _btc_github() -> pd.DataFrame:
-    df  = _read_csv("https://raw.githubusercontent.com/datasets/bitcoin-price/master/data/bitcoin_price.csv")
-    df  = df.rename(columns={"Closing Price (USD)": "BTC"})
+    df = _read_csv("https://raw.githubusercontent.com/datasets/bitcoin-price/master/data/bitcoin_price.csv")
+    df = df.rename(columns={"Closing Price (USD)": "BTC"})
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df["BTC"]  = pd.to_numeric(df["BTC"], errors="coerce")
     return df.dropna().query("BTC>0").sort_values("Date")[["Date","BTC"]]
@@ -73,49 +63,37 @@ def _btc_github() -> pd.DataFrame:
 def _gold_stooq() -> pd.DataFrame:
     df = _read_csv("https://stooq.com/q/d/l/?s=xauusd&i=d")
     df.columns = [c.lower() for c in df.columns]
-    date_col  = [c for c in df.columns if "date" in c][0]
-    close_col = [c for c in df.columns if ("close" in c) or ("price" in c)][-1]
-    df = df.rename(columns={date_col: "Date", close_col: "Gold"})
+    dcol = [c for c in df.columns if "date" in c][0]
+    ccol = [c for c in df.columns if ("close" in c) or ("price" in c)][-1]
+    df = df.rename(columns={dcol: "Date", ccol: "Gold"})
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df["Gold"] = pd.to_numeric(df["Gold"].astype(str).str.replace(",", ""), errors="coerce")
     return df.dropna().query("Gold>0").sort_values("Date")[["Date","Gold"]]
 
 def _gold_lbma() -> pd.DataFrame:
-    df  = _read_csv("https://raw.githubusercontent.com/koindata/gold-prices/master/data/gold.csv")
+    df = _read_csv("https://raw.githubusercontent.com/koindata/gold-prices/master/data/gold.csv")
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    col = "USD (PM)" if "USD (PM)" in df.columns else ("USD (AM)" if "USD (AM)" in df.columns else None)
-    if col is None:
-        cand = [c for c in df.columns if "USD" in c.upper()]
-        col = cand[0]
+    col = "USD (PM)" if "USD (PM)" in df.columns else ("USD (AM)" if "USD (AM)" in df.columns else [c for c in df.columns if "USD" in c.upper()][0])
     df = df.rename(columns={col: "Gold"})
     df["Gold"] = pd.to_numeric(df["Gold"], errors="coerce")
     return df.dropna().query("Gold>0").sort_values("Date")[["Date","Gold"]]
 
 def load_btc_gold() -> pd.DataFrame:
-    # BTC
     try:
         btc = _btc_stooq()
-        if len(btc) < 1000:
-            raise ValueError("short")
+        if len(btc) < 1000: raise ValueError
     except Exception:
         btc = _btc_github()
-    # GOLD
     try:
         gold = _gold_stooq()
-        if len(gold) < 1000:
-            raise ValueError("short")
+        if len(gold) < 1000: raise ValueError
     except Exception:
         gold = _gold_lbma()
+    gold_ff = gold.set_index("Date").reindex(btc["Date"]).ffill().reset_index().rename(columns={"index":"Date"})
+    return btc.merge(gold_ff, on="Date", how="left").dropna()
 
-    # Align to BTC calendar; forward-fill gold to BTC dates
-    gold_ff = gold.set_index("Date").reindex(btc["Date"]).ffill().reset_index()
-    gold_ff = gold_ff.rename(columns={"index":"Date"})
-    df = btc.merge(gold_ff, on="Date", how="left").dropna()
-    return df
-
-# --------------- math
+# --------------------- math
 def log_days(dates) -> np.ndarray:
-    """Return log10(days since GENESIS) for Series or Index safely."""
     td = pd.to_datetime(dates) - GENESIS
     if isinstance(td, pd.Series):
         days = td.dt.days.to_numpy()
@@ -127,173 +105,155 @@ def log_days(dates) -> np.ndarray:
     return np.log10(days)
 
 def fit_power(dates: pd.Series, values: pd.Series):
-    """Fit y = m*x + b in log-log where x = log10(days), y = log10(values)."""
     X = log_days(dates)
     y = np.log10(values.to_numpy(dtype="float64"))
-    mask = np.isfinite(X) & np.isfinite(y)
-    m, b = np.polyfit(X[mask], y[mask], 1)
-    sigma = float(np.std(y[mask] - (m * X[mask] + b)))
+    m, b = np.polyfit(X[np.isfinite(X)], y[np.isfinite(X)], 1)
+    sigma = float(np.std(y[np.isfinite(X)] - (m*X[np.isfinite(X)] + b)))
     return m, b, sigma
 
-def build_bands(dates, m: float, b: float, sigma: float) -> dict:
-    """Return dict of arrays for each band over given dates (includes 'mid')."""
+def build_bands(dates, m, b, sigma) -> dict:
     X = log_days(dates)
-    mid_log = m * X + b
-    out = {"mid": 10 ** mid_log}
+    mid = 10 ** (m*X + b)
+    out = {"mid": mid}
     for name, k in LEVELS.items():
-        if name == "PL Best Fit":
-            continue
-        out[name] = 10 ** (mid_log + sigma * k)
+        if name == "PL Best Fit": continue
+        out[name] = 10 ** (m*X + b + sigma*k)
     return out
 
 def year_ticks(start=2012, dense_until=2020, end=2040):
-    """Year labels: every year through 2020, then every 2 years."""
-    years = list(range(start, dense_until + 1)) + list(range(dense_until + 2, end + 1, 2))
+    years = list(range(start, dense_until+1)) + list(range(dense_until+2, end+1, 2))
     vals  = log_days([pd.Timestamp(f"{y}-01-01") for y in years]).tolist()
     text  = [str(y) for y in years]
     return vals, text
 
-# --------------- figure
+# --------------------- figure
 def make_powerlaw_fig(df: pd.DataFrame):
-    # Series
-    usd_series = df["BTC"].astype(float)                  # USD / BTC
-    gld_series = (df["BTC"] / df["Gold"]).astype(float)   # Gold oz / BTC
+    usd = df["BTC"].astype(float)                 # USD / BTC
+    gld = (df["BTC"] / df["Gold"]).astype(float)  # Gold oz / BTC
 
-    # Fits
-    m_usd, b_usd, s_usd = fit_power(df["Date"], usd_series)
-    m_gld, b_gld, s_gld = fit_power(df["Date"], gld_series)
+    m_u, b_u, s_u = fit_power(df["Date"], usd)
+    m_g, b_g, s_g = fit_power(df["Date"], gld)
 
-    # Projection dates to 2040 (monthly)
     last = df["Date"].iloc[-1]
     future = pd.date_range(last + pd.offsets.MonthBegin(1), PROJ_END, freq="MS")
     full_dates = pd.Index(df["Date"]).append(future)
 
-    # Bands
-    bands_usd = build_bands(full_dates, m_usd, b_usd, s_usd)
-    bands_gld = build_bands(full_dates, m_gld, b_gld, s_gld)
+    bands_usd = build_bands(full_dates, m_u, b_u, s_u)
+    bands_gld = build_bands(full_dates, m_g, b_g, s_g)
 
-    # X (log-time)
     x_hist = log_days(df["Date"])
     x_full = log_days(full_dates)
 
-    # Labels
-    date_labels_full = pd.Series(pd.to_datetime(full_dates)).dt.strftime("%b %Y").to_numpy()
-    date_labels_hist = pd.Series(pd.to_datetime(df["Date"])).dt.strftime("%b %Y").to_numpy()
+    date_labels_full = pd.Series(pd.to_datetime(full_dates)).dt.strftime("%Y-%m-%d").to_numpy()
+    date_labels_hist = pd.Series(pd.to_datetime(df["Date"])).dt.strftime("%Y-%m-%d").to_numpy()
 
     fig = go.Figure()
 
-    # Trace order and styles
-    order = ["Top", "Frothy", "PL Best Fit", "Bear", "Support"]
+    order = ["Top","Frothy","PL Best Fit","Bear","Support"]
 
-    # USD traces (bands)
-    USD_BAND_IDX = []
-    for name in order:
-        label = name + SIGMA_LABEL[name]
-        y = bands_usd["mid"] if name == "PL Best Fit" else bands_usd[name]
-        fig.add_trace(go.Scatter(
-            x=x_full, y=y, mode="lines",
-            line=dict(color=COLORS[name], width=2, dash=DASHES[name]),
-            name=label, legendgroup="USD",
-            customdata=date_labels_full,
-            hovertemplate=label + " | %{customdata}, %{y:$,.0f}<extra></extra>",
-            visible=True
-        ))
-        USD_BAND_IDX.append(len(fig.data) - 1)
-    # USD BTC line
+    # ---- USD dummy "date row" (transparent) to act as first line in hover
     fig.add_trace(go.Scatter(
-        x=x_hist, y=usd_series, mode="lines",
-        line=dict(color=COLORS["BTC"], width=2.5),
-        name="BTC", legendgroup="USD",
-        customdata=date_labels_hist,
-        hovertemplate="BTC | %{customdata}, %{y:$,.0f}<extra></extra>",
+        x=x_full, y=[np.nan]*len(x_full), mode="markers",
+        marker=dict(size=0, color="rgba(0,0,0,0)"),
+        name=" ", legendgroup="USD", showlegend=False,
+        customdata=date_labels_full,
+        hovertemplate="<b>%{customdata}</b><extra></extra>",
         visible=True
     ))
-    USD_BTC_IDX = len(fig.data) - 1
-    # USD BTC marker (single point; updated via JS)
-    fig.add_trace(go.Scatter(
-        x=[None], y=[None], mode="markers",
-        marker=dict(color=COLORS["BTC_MARK"], size=8, line=dict(color="#000", width=0.5)),
-        name=" ", legendgroup="USD", showlegend=False, hoverinfo="skip", visible=True
-    ))
-    USD_MARK_IDX = len(fig.data) - 1
 
-    # Gold traces (bands) — hidden initially
-    GLD_BAND_IDX = []
+    # USD bands
     for name in order:
-        label = name + SIGMA_LABEL[name]
-        y = bands_gld["mid"] if name == "PL Best Fit" else bands_gld[name]
+        y = bands_usd["mid"] if name=="PL Best Fit" else bands_usd[name]
         fig.add_trace(go.Scatter(
             x=x_full, y=y, mode="lines",
             line=dict(color=COLORS[name], width=2, dash=DASHES[name]),
-            name=label, legendgroup="GLD",
-            customdata=date_labels_full,
-            hovertemplate=label + " | %{customdata}, %{y:,.2f} oz/BTC<extra></extra>",
-            visible=False
+            name=name, legendgroup="USD",
+            hovertemplate=f"{name} | "+"%{y:$,.0f}<extra></extra>",
+            visible=True
         ))
-        GLD_BAND_IDX.append(len(fig.data) - 1)
-    # Gold BTC line
+    # USD BTC line
     fig.add_trace(go.Scatter(
-        x=x_hist, y=gld_series, mode="lines",
+        x=x_hist, y=usd, mode="lines",
         line=dict(color=COLORS["BTC"], width=2.5),
-        name="BTC", legendgroup="GLD",
-        customdata=date_labels_hist,
-        hovertemplate="BTC | %{customdata}, %{y:,.2f} oz/BTC<extra></extra>",
-        visible=False
+        name="BTC", legendgroup="USD",
+        hovertemplate="BTC | %{y:$,.0f}<extra></extra>",
+        visible=True
     ))
-    GLD_BTC_IDX = len(fig.data) - 1
-    # Gold BTC marker
+    USD_BTC_IDX = len(fig.data)-1
+    # USD BTC marker
     fig.add_trace(go.Scatter(
         x=[None], y=[None], mode="markers",
-        marker=dict(color=COLORS["BTC_MARK"], size=8, line=dict(color="#000", width=0.5)),
+        marker=dict(color=COLORS["BTC_MARK"], size=8, line=dict(color="#000", width=.5)),
+        name=" ", legendgroup="USD", showlegend=False, hoverinfo="skip", visible=True
+    ))
+    USD_MARK_IDX = len(fig.data)-1
+
+    # ---- GOLD dummy "date row"
+    fig.add_trace(go.Scatter(
+        x=x_full, y=[np.nan]*len(x_full), mode="markers",
+        marker=dict(size=0, color="rgba(0,0,0,0)"),
+        name=" ", legendgroup="GLD", showlegend=False,
+        customdata=date_labels_full,
+        hovertemplate="<b>%{customdata}</b><extra></extra>",
+        visible=False
+    ))
+    # GOLD bands
+    for name in order:
+        y = bands_gld["mid"] if name=="PL Best Fit" else bands_gld[name]
+        fig.add_trace(go.Scatter(
+            x=x_full, y=y, mode="lines",
+            line=dict(color=COLORS[name], width=2, dash=DASHES[name]),
+            name=name, legendgroup="GLD",
+            hovertemplate=f"{name} | "+"%{y:,.2f} oz/BTC<extra></extra>",
+            visible=False
+        ))
+    # GOLD BTC line
+    fig.add_trace(go.Scatter(
+        x=x_hist, y=gld, mode="lines",
+        line=dict(color=COLORS["BTC"], width=2.5),
+        name="BTC", legendgroup="GLD",
+        hovertemplate="BTC | %{y:,.2f} oz/BTC<extra></extra>",
+        visible=False
+    ))
+    GLD_BTC_IDX = len(fig.data)-1
+    # GOLD BTC marker
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None], mode="markers",
+        marker=dict(color=COLORS["BTC_MARK"], size=8, line=dict(color="#000", width=.5)),
         name=" ", legendgroup="GLD", showlegend=False, hoverinfo="skip", visible=False
     ))
-    GLD_MARK_IDX = len(fig.data) - 1
+    GLD_MARK_IDX = len(fig.data)-1
 
-    # Axes (x is log-time)
     tickvals, ticktext = year_ticks(2012, 2020, 2040)
     fig.update_layout(
         template="plotly_dark",
-        hovermode="x unified",  # ← unified hover shows all lines
-        showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-        margin=dict(l=60, r=20, t=18, b=64),
-        paper_bgcolor="#0f1116", plot_bgcolor="#151821",
+        hovermode="x unified",
+        hoverdistance=15,
         xaxis=dict(
             title="Year (log-time)",
             tickmode="array", tickvals=tickvals, ticktext=ticktext,
+            # Blank the unified-hover header (we show date as first line)
+            hoverformat=" ",
             showgrid=True, gridcolor="#263041", zeroline=False
         ),
         yaxis=dict(
             title="USD / BTC", type="log", tickformat="$,d",
             showgrid=True, gridcolor="#263041", zeroline=False
-        )
+        ),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        margin=dict(l=60, r=24, t=18, b=64),
+        paper_bgcolor="#0f1116", plot_bgcolor="#151821",
+        meta=dict(USD_BTC_IDX=USD_BTC_IDX, USD_MARK_IDX=USD_MARK_IDX,
+                  GLD_BTC_IDX=GLD_BTC_IDX, GLD_MARK_IDX=GLD_MARK_IDX)
     )
+    return fig, full_dates, bands_usd, bands_gld, usd, gld
 
-    # Save helper indices into figure layout (so JS can read them)
-    fig.update_layout(
-        meta=dict(
-            USD_BTC_IDX=USD_BTC_IDX, USD_MARK_IDX=USD_MARK_IDX, USD_BAND_IDX=USD_BAND_IDX,
-            GLD_BTC_IDX=GLD_BTC_IDX, GLD_MARK_IDX=GLD_MARK_IDX, GLD_BAND_IDX=GLD_BAND_IDX
-        )
-    )
-
-    return fig, full_dates, bands_usd, bands_gld, usd_series, gld_series
-
-# --------------- HTML writer
-def write_index_html(fig: go.Figure,
-                     full_dates,
-                     bands_usd: dict,
-                     bands_gld: dict,
-                     usd_hist: pd.Series,
-                     gld_hist: pd.Series,
-                     out_path="dist/index.html",
-                     page_title="BTC Purchase Indicator"):
-
-    out = Path(out_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
+# --------------------- HTML writer
+def write_index_html(fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist,
+                     out_path="dist/index.html", page_title="BTC Purchase Indicator"):
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
 
     fig_json = pio.to_json(fig, pretty=False)
-
     dates_iso = pd.Series(pd.to_datetime(full_dates)).dt.strftime("%Y-%m-%d").tolist()
     hist_iso  = pd.Series(pd.to_datetime(full_dates[:len(usd_hist)])).dt.strftime("%Y-%m-%d").tolist()
 
@@ -304,20 +264,14 @@ def write_index_html(fig: go.Figure,
             "usd": pd.Series(usd_hist).astype(float).round(6).tolist(),
             "gld": pd.Series(gld_hist).astype(float).round(6).tolist(),
         },
-        "usd": {
-            "Top":      np.asarray(bands_usd["Top"]).astype(float).round(6).tolist(),
-            "Frothy":   np.asarray(bands_usd["Frothy"]).astype(float).round(6).tolist(),
-            "Mid":      np.asarray(bands_usd["mid"]).astype(float).round(6).tolist(),
-            "Bear":     np.asarray(bands_usd["Bear"]).astype(float).round(6).tolist(),
-            "Support":  np.asarray(bands_usd["Support"]).astype(float).round(6).tolist(),
-        },
-        "gld": {
-            "Top":      np.asarray(bands_gld["Top"]).astype(float).round(6).tolist(),
-            "Frothy":   np.asarray(bands_gld["Frothy"]).astype(float).round(6).tolist(),
-            "Mid":      np.asarray(bands_gld["mid"]).astype(float).round(6).tolist(),
-            "Bear":     np.asarray(bands_gld["Bear"]).astype(float).round(6).tolist(),
-            "Support":  np.asarray(bands_gld["Support"]).astype(float).round(6).tolist(),
-        }
+        "usd": {k: np.asarray(v).astype(float).round(6).tolist() for k,v in {
+            "Top": bands_usd["Top"], "Frothy": bands_usd["Frothy"],
+            "Mid": bands_usd["mid"], "Bear": bands_usd["Bear"], "Support": bands_usd["Support"]
+        }.items()},
+        "gld": {k: np.asarray(v).astype(float).round(6).tolist() for k,v in {
+            "Top": bands_gld["Top"], "Frothy": bands_gld["Frothy"],
+            "Mid": bands_gld["mid"], "Bear": bands_gld["Bear"], "Support": bands_gld["Support"]
+        }.items()}
     }
     arrays_json = json.dumps(payload, separators=(",", ":"))
 
@@ -328,26 +282,20 @@ def write_index_html(fig: go.Figure,
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>__TITLE__</title>
-<link rel="preconnect" href="https://cdn.plot.ly">
 <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
 <style>
-  :root {
-    color-scheme: dark;
-    --bg:#0f1116; --fg:#e7e9ee; --muted:#8e95a5; --card:#151821;
-  }
-  html,body { margin:0; background:var(--bg); color:var(--fg);
-              font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Inter,Roboto,Helvetica,Arial,sans-serif; }
-  .wrap { max-width:1100px; margin:24px auto; padding:0 16px; }
-  h1 { font-size:clamp(28px,4.5vw,44px); margin:0 0 12px; }
-  .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
-  .btn { background:var(--card); border:1px solid #263041; border-radius:14px; padding:10px 14px; cursor:pointer; color:var(--fg); }
-  select { background:var(--card); border:1px solid #263041; border-radius:12px; padding:8px 10px; color:var(--fg); font:inherit; }
-  #fig { height:70vh; min-height:430px; background:var(--card); border-radius:14px; padding:8px; }
-  .chip { background:var(--card); border:1px solid #263041; border-radius:999px; padding:8px 12px; display:inline-flex; align-items:center; gap:10px; }
-  .dot { width:12px; height:12px; border-radius:50%; background:#fff; }
-  .slider { width:100%; }
-  .check { display:flex; align-items:center; gap:8px; }
-  .stack { display:flex; flex-direction:column; gap:2px; font-size:0.95rem; }
+  :root { color-scheme:dark; --bg:#0f1116; --fg:#e7e9ee; --muted:#8e95a5; --card:#151821; }
+  html,body{margin:0;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Inter,Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:1100px;margin:24px auto;padding:0 16px}
+  h1{font-size:clamp(28px,4.5vw,44px);margin:0 0 12px}
+  .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+  .chip{background:var(--card);border:1px solid #263041;border-radius:999px;padding:8px 12px;display:inline-flex;align-items:center;gap:10px}
+  .dot{width:12px;height:12px;border-radius:50%;background:#fff}
+  .btn,select{background:var(--card);border:1px solid #263041;border-radius:12px;padding:8px 10px;color:var(--fg);font:inherit}
+  #fig{height:70vh;min-height:430px;background:var(--card);border-radius:14px;padding:8px}
+  .slider{width:100%}
+  .stack{display:flex;flex-direction:column;gap:2px;font-size:0.95rem}
 </style>
 </head>
 <body>
@@ -368,7 +316,7 @@ def write_index_html(fig: go.Figure,
 
     <div class="row" style="margin:6px 0 2px;">
       <label for="dateSlider">View at date:</label>
-      <label class="check"><input type="checkbox" id="chkToday"/> Today</label>
+      <label class="row" style="gap:6px;"><input type="checkbox" id="chkToday"/> Today</label>
     </div>
     <input id="dateSlider" class="slider" type="range" min="0" value="0" step="1"/>
     <div id="dateRead" class="stack" style="opacity:.95; margin:6px 0 12px 2px;"></div>
@@ -376,30 +324,20 @@ def write_index_html(fig: go.Figure,
     <div id="fig"></div>
   </div>
 
-  <!-- Safe JSON embeds -->
   <script type="application/json" id="figjson">__FIGJSON__</script>
   <script type="application/json" id="arrays">__ARRAYS__</script>
 
   <script>
     const FIG = JSON.parse(document.getElementById('figjson').textContent);
     const ARR = JSON.parse(document.getElementById('arrays').textContent);
-
     const figEl = document.getElementById('fig');
+
     Plotly.newPlot(figEl, FIG.data, FIG.layout, {displaylogo:false, responsive:true});
 
-    // Indices from fig.layout.meta (populated in Python)
-    const META = (FIG.layout && FIG.layout.meta) || {};
+    const META = FIG.layout.meta || {};
     const USD_BTC_IDX = META.USD_BTC_IDX, USD_MARK_IDX = META.USD_MARK_IDX;
     const GLD_BTC_IDX = META.GLD_BTC_IDX, GLD_MARK_IDX = META.GLD_MARK_IDX;
 
-    // Build band index arrays by legendgroup in case needed later
-    const USD_IDX = [], GLD_IDX = [];
-    (FIG.data||[]).forEach((tr,i)=>{
-      const grp = (tr.legendgroup||"");
-      if (grp === "GLD") GLD_IDX.push(i); else USD_IDX.push(i);
-    });
-
-    // Controls
     const denomSel = document.getElementById('denom');
     const legendBtn = document.getElementById('legendBtn');
     const slider = document.getElementById('dateSlider');
@@ -408,35 +346,31 @@ def write_index_html(fig: go.Figure,
     const zoneDot = document.getElementById('zoneDot');
     const dateRead = document.getElementById('dateRead');
 
-    // Weekly (Monday) slider index
+    // Weekly (Monday) slider
     const histDates = ARR.hist.dates;
-    const weeklyIdx = [];
-    const weeklyDates = [];
+    const weeklyIdx = []; const weeklyDates = [];
     for (let i=0;i<histDates.length;i++){
-      const d = new Date(histDates[i] + "T00:00:00Z");
+      const d = new Date(histDates[i]+"T00:00:00Z");
       if (d.getUTCDay() === 1) { weeklyIdx.push(i); weeklyDates.push(histDates[i]); }
     }
-    if (weeklyDates.length === 0){
-      for (let i=0;i<histDates.length;i+=7){ weeklyIdx.push(i); weeklyDates.push(histDates[i]); }
-    }
-    slider.max = Math.max(0, weeklyDates.length - 1);
+    if (weeklyIdx.length===0){ for(let i=0;i<histDates.length;i+=7){ weeklyIdx.push(i); weeklyDates.push(histDates[i]); } }
+    slider.max = Math.max(0, weeklyIdx.length-1);
     slider.value = slider.max;
 
     function setLegend(on){ Plotly.relayout(figEl, {"showlegend": !!on}); }
     let legendOn = true;
     legendBtn.addEventListener('click', ()=>{ legendOn = !legendOn; setLegend(legendOn); });
 
-    function fmtUSD(v){ return (v==null||!isFinite(v)) ? "—" : "$"+Math.round(v).toLocaleString(); }
+    function fmtUSD(v){ return (v==null||!isFinite(v))?"—":"$"+Math.round(v).toLocaleString(); }
     function fmtOzBTC(v){
-      if (v==null || !isFinite(v)) return "—";
-      const n = Math.round(v * 1e2) / 1e2;
-      return n.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2}) + " oz/BTC";
+      if (v==null||!isFinite(v)) return "—";
+      const n = Math.round(v*100)/100;
+      return n.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})+" oz/BTC";
     }
     function fmtTickGold(v){
-      if (!isFinite(v) || v<=0) return "";
-      if (v >= 1) return Math.round(v).toLocaleString();
-      let s = Number(v).toFixed(3).replace(/\.?0+$/,"");
-      return s;
+      if (!isFinite(v)||v<=0) return "";
+      if (v>=1) return Math.round(v).toLocaleString();
+      return Number(v).toFixed(3).replace(/\.?0+$/,"");
     }
     function zoneFor(val, bands){
       if (val==null) return "—";
@@ -456,68 +390,37 @@ def write_index_html(fig: go.Figure,
         default:                 return "#e5e7eb";
       }
     }
-
     function readBandsAt(dateISO, denom){
       const idx = ARR.dates.indexOf(dateISO);
-      if (idx < 0) return null;
+      if (idx<0) return null;
       const g = denom==="USD" ? ARR.usd : ARR.gld;
-      return {
-        Support: g.Support[idx],
-        Bear:    g.Bear[idx],
-        Mid:     g.Mid[idx],
-        Frothy:  g.Frothy[idx],
-        Top:     g.Top[idx],
-      };
+      return { Support:g.Support[idx], Bear:g.Bear[idx], Mid:g.Mid[idx], Frothy:g.Frothy[idx], Top:g.Top[idx] };
     }
-
-    // Custom ticks for Gold (oz/BTC)
     function setGoldTicks(){
       const G = ARR.gld;
-      const all = []
-        .concat(G.Support, G.Bear, G.Mid, G.Frothy, G.Top, ARR.hist.gld)
-        .filter(v => v>0 && isFinite(v));
-      if (all.length === 0){ return; }
-      const minV = Math.min.apply(null, all);
-      const maxV = Math.max.apply(null, all);
-      const candidates = [0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10,20,50,100,200,500,1000];
-      const ticks = candidates.filter(v => v>=minV*0.9 && v<=maxV*1.1);
-      const ticktext = ticks.map(fmtTickGold);
-      Plotly.relayout(figEl, {
-        "yaxis.tickvals": ticks,
-        "yaxis.ticktext": ticktext,
-        "yaxis.tickformat": ""
-      });
+      const all = [].concat(G.Support,G.Bear,G.Mid,G.Frothy,G.Top,ARR.hist.gld).filter(v=>v>0&&isFinite(v));
+      if (!all.length) return;
+      const minV = Math.min.apply(null,all), maxV = Math.max.apply(null,all);
+      const c = [0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10,20,50,100,200,500,1000];
+      const ticks = c.filter(v=>v>=minV*0.9 && v<=maxV*1.1);
+      const txt = ticks.map(fmtTickGold);
+      Plotly.relayout(figEl, {"yaxis.tickvals":ticks, "yaxis.ticktext":txt, "yaxis.tickformat":""});
     }
-    function clearCustomTicks(){
-      Plotly.relayout(figEl, {
-        "yaxis.tickvals": null,
-        "yaxis.ticktext": null,
-        "yaxis.tickformat": "$,d"
-      });
+    function clearGoldTicks(){
+      Plotly.relayout(figEl, {"yaxis.tickvals":null, "yaxis.ticktext":null, "yaxis.tickformat":"$,d"});
     }
 
     function setDenom(which){
-      const usdOn = (which === "USD");
-      const vis = new Array(FIG.data.length).fill(false);
-      // bands + line + marker: 6 + 1 + 1 per group
-      if (usdOn){
-        // show USD group, hide GLD
-        FIG.data.forEach((tr,i)=>{ vis[i] = (tr.legendgroup||"USD")==="USD"; });
-        Plotly.relayout(figEl, {"yaxis.title.text": "USD / BTC"});
-        clearCustomTicks();
-      }else{
-        FIG.data.forEach((tr,i)=>{ vis[i] = (tr.legendgroup||"USD")==="GLD"; });
-        Plotly.relayout(figEl, {"yaxis.title.text": "Gold oz / BTC"});
-        setGoldTicks();
-      }
+      const vis = (FIG.data||[]).map(tr => (tr.legendgroup||"USD") === (which==="USD"?"USD":"GLD"));
       Plotly.restyle(figEl, {"visible": vis});
+      if (which==="USD"){ Plotly.relayout(figEl, {"yaxis.title.text":"USD / BTC"}); clearGoldTicks(); }
+      else { Plotly.relayout(figEl, {"yaxis.title.text":"Gold oz / BTC"}); setGoldTicks(); }
       updateMarkerAndReadout();
     }
 
     function sliderToHistIndex(){
-      const i = parseInt(slider.value, 10);
-      const j = Math.max(0, Math.min(i, weeklyIdx.length-1));
-      return weeklyIdx[j] ?? (ARR.hist.dates.length-1);
+      const i = Math.max(0, Math.min(parseInt(slider.value,10), weeklyIdx.length-1));
+      return weeklyIdx[i] ?? (ARR.hist.dates.length-1);
     }
 
     function updateMarkerAndReadout(){
@@ -525,74 +428,52 @@ def write_index_html(fig: go.Figure,
       const denom = denomSel.value;
       const dISO = ARR.hist.dates[j];
       const bands = readBandsAt(dISO, denom);
-      if (!bands){ zoneTxt.textContent = "—"; dateRead.textContent = ""; return; }
+      if (!bands){ zoneTxt.textContent="—"; dateRead.textContent=""; return; }
 
-      // Update zone and readout (all lines)
       const priceUSD = ARR.hist.usd[j];
       const priceGLD = ARR.hist.gld[j];
-      const price    = (denom==="USD") ? priceUSD : priceGLD;
+      const price = (denom==="USD")?priceUSD:priceGLD;
       const zone = zoneFor(price, bands);
       zoneTxt.textContent = zone;
       zoneDot.style.background = zoneDotColor(zone);
 
-      // Build stacked lines text in order: Top, Frothy, PL, Bear, Support, BTC
-      const rows = [];
-      const mY = (denom==="USD")
-        ? (v)=> (v==null||!isFinite(v)) ? "—" : "$"+Math.round(v).toLocaleString()
-        : (v)=> (v==null||!isFinite(v)) ? "—" : (Math.round(v*100)/100).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})+" oz/BTC";
-      rows.push(`Top: ${mY(bands.Top)}`);
-      rows.push(`Frothy: ${mY(bands.Frothy)}`);
-      rows.push(`PL Best Fit: ${mY(bands.Mid)}`);
-      rows.push(`Bear: ${mY(bands.Bear)}`);
-      rows.push(`Support: ${mY(bands.Support)}`);
-      rows.push(`BTC: ${mY(price)}`);
+      // Readout: only date + BTC price
+      const line = (denom==="USD") ? fmtUSD(priceUSD) : fmtOzBTC(priceGLD);
+      dateRead.innerHTML = `<div style="font-weight:600">${dISO}</div><div>BTC: ${line}</div>`;
 
-      dateRead.innerHTML = `<div><b>${dISO}</b></div>` + rows.map(r=>`<div>${r}</div>`).join("");
-
-      // Move the BTC marker
-      // Find log-time x for the historical date index j
-      // Recompute here to avoid shipping extra arrays
+      // Move marker
       const genesis = new Date("2009-01-03T00:00:00Z").getTime();
-      const d = new Date(dISO + "T00:00:00Z").getTime();
+      const d = new Date(dISO+"T00:00:00Z").getTime();
       const days = Math.max(1, Math.round((d - genesis)/86400000));
       const xval = Math.log10(days);
-      if (denom==="USD"){
-        Plotly.restyle(figEl, {"x":[[xval]], "y":[[priceUSD]]}, [USD_MARK_IDX]);
-      }else{
-        Plotly.restyle(figEl, {"x":[[xval]], "y":[[priceGLD]]}, [GLD_MARK_IDX]);
-      }
+      if (denom==="USD"){ Plotly.restyle(figEl, {"x":[[xval]], "y":[[priceUSD]]}, [USD_MARK_IDX]); }
+      else { Plotly.restyle(figEl, {"x":[[xval]], "y":[[priceGLD]]}, [GLD_MARK_IDX]); }
     }
 
     denomSel.addEventListener('change', (e)=> setDenom(e.target.value));
-    slider.addEventListener('input', ()=>{ chkToday.checked = false; updateMarkerAndReadout(); });
-    chkToday.addEventListener('change', (e)=>{
-      if (e.target.checked){
-        slider.value = slider.max;
-        updateMarkerAndReadout();
-      }
-    });
+    slider.addEventListener('input', ()=>{ chkToday.checked=false; updateMarkerAndReadout(); });
+    chkToday.addEventListener('change', (e)=>{ if(e.target.checked){ slider.value = slider.max; updateMarkerAndReadout(); } });
+
+    // Tap/click outside → hide hover box
+    function outsideFig(el, target){ return !el.contains(target); }
+    function hideHover(){ try{ Plotly.Fx.unhover(figEl); }catch(e){} }
+    document.addEventListener('click', (ev)=>{ if(outsideFig(figEl, ev.target)) hideHover(); }, {passive:true});
+    document.addEventListener('touchstart', (ev)=>{ if(outsideFig(figEl, ev.target)) hideHover(); }, {passive:true});
 
     // Init
-    setDenom("USD");  // sets axis & vis
+    setDenom("USD");
     setLegend(true);
     updateMarkerAndReadout();
-
     window.addEventListener('resize', ()=> Plotly.Plots.resize(figEl));
   </script>
 </body>
 </html>
 """
+    html = TEMPLATE.replace("__TITLE__", page_title).replace("__FIGJSON__", fig_json).replace("__ARRAYS__", arrays_json)
+    Path(out_path).write_text(html, encoding="utf-8")
+    print("[build] wrote", out_path)
 
-    html = (
-        TEMPLATE
-        .replace("__TITLE__", page_title)
-        .replace("__FIGJSON__", fig_json)
-        .replace("__ARRAYS__", arrays_json)
-    )
-    out.write_text(html, encoding="utf-8")
-    print("[build] wrote", out)
-
-# --------------- main
+# --------------------- main
 def main():
     print("[build] loading BTC & Gold …")
     df = load_btc_gold()
