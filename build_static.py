@@ -3,8 +3,9 @@
 # build_static.py  ·  BTC Purchase Indicator (static Plotly)
 #  - Power-law bands on log-time (days since 2009-01-03)
 #  - Denomination: USD/BTC or Gold oz/BTC
-#  - Unified hover: shows all lines; top row = date
-#  - BTC marker follows weekly (Monday) slider
+#  - Unified hover: shows all lines; header = Month Year
+#  - Weekly (Monday) slider, snaps to nearest historical point
+#  - BTC marker follows slider
 #  - Readout shows only date + BTC price
 #  - Tap outside chart hides hover box
 # ─────────────────────────────────────────────────────────────
@@ -16,7 +17,7 @@ import plotly.io as pio
 
 GENESIS  = pd.Timestamp("2009-01-03")
 PROJ_END = pd.Timestamp("2040-12-31")
-UA       = {"User-Agent": "btc-pl-pages/1.1"}
+UA       = {"User-Agent": "btc-pl-pages/1.2"}
 
 LEVELS = {
     "Top":         +1.75,
@@ -144,24 +145,11 @@ def make_powerlaw_fig(df: pd.DataFrame):
     x_hist = log_days(df["Date"])
     x_full = log_days(full_dates)
 
-    date_labels_full = pd.Series(pd.to_datetime(full_dates)).dt.strftime("%Y-%m-%d").to_numpy()
-    date_labels_hist = pd.Series(pd.to_datetime(df["Date"])).dt.strftime("%Y-%m-%d").to_numpy()
-
     fig = go.Figure()
 
     order = ["Top","Frothy","PL Best Fit","Bear","Support"]
 
-    # ---- USD dummy "date row" (transparent) to act as first line in hover
-    fig.add_trace(go.Scatter(
-        x=x_full, y=[np.nan]*len(x_full), mode="markers",
-        marker=dict(size=0, color="rgba(0,0,0,0)"),
-        name=" ", legendgroup="USD", showlegend=False,
-        customdata=date_labels_full,
-        hovertemplate="<b>%{customdata}</b><extra></extra>",
-        visible=True
-    ))
-
-    # USD bands
+    # USD bands + price
     for name in order:
         y = bands_usd["mid"] if name=="PL Best Fit" else bands_usd[name]
         fig.add_trace(go.Scatter(
@@ -171,7 +159,6 @@ def make_powerlaw_fig(df: pd.DataFrame):
             hovertemplate=f"{name} | "+"%{y:$,.0f}<extra></extra>",
             visible=True
         ))
-    # USD BTC line
     fig.add_trace(go.Scatter(
         x=x_hist, y=usd, mode="lines",
         line=dict(color=COLORS["BTC"], width=2.5),
@@ -180,7 +167,6 @@ def make_powerlaw_fig(df: pd.DataFrame):
         visible=True
     ))
     USD_BTC_IDX = len(fig.data)-1
-    # USD BTC marker
     fig.add_trace(go.Scatter(
         x=[None], y=[None], mode="markers",
         marker=dict(color=COLORS["BTC_MARK"], size=8, line=dict(color="#000", width=.5)),
@@ -188,16 +174,7 @@ def make_powerlaw_fig(df: pd.DataFrame):
     ))
     USD_MARK_IDX = len(fig.data)-1
 
-    # ---- GOLD dummy "date row"
-    fig.add_trace(go.Scatter(
-        x=x_full, y=[np.nan]*len(x_full), mode="markers",
-        marker=dict(size=0, color="rgba(0,0,0,0)"),
-        name=" ", legendgroup="GLD", showlegend=False,
-        customdata=date_labels_full,
-        hovertemplate="<b>%{customdata}</b><extra></extra>",
-        visible=False
-    ))
-    # GOLD bands
+    # GOLD bands + price (initially hidden)
     for name in order:
         y = bands_gld["mid"] if name=="PL Best Fit" else bands_gld[name]
         fig.add_trace(go.Scatter(
@@ -207,7 +184,6 @@ def make_powerlaw_fig(df: pd.DataFrame):
             hovertemplate=f"{name} | "+"%{y:,.2f} oz/BTC<extra></extra>",
             visible=False
         ))
-    # GOLD BTC line
     fig.add_trace(go.Scatter(
         x=x_hist, y=gld, mode="lines",
         line=dict(color=COLORS["BTC"], width=2.5),
@@ -216,7 +192,6 @@ def make_powerlaw_fig(df: pd.DataFrame):
         visible=False
     ))
     GLD_BTC_IDX = len(fig.data)-1
-    # GOLD BTC marker
     fig.add_trace(go.Scatter(
         x=[None], y=[None], mode="markers",
         marker=dict(color=COLORS["BTC_MARK"], size=8, line=dict(color="#000", width=.5)),
@@ -232,8 +207,7 @@ def make_powerlaw_fig(df: pd.DataFrame):
         xaxis=dict(
             title="Year (log-time)",
             tickmode="array", tickvals=tickvals, ticktext=ticktext,
-            # Blank the unified-hover header (we show date as first line)
-            hoverformat=" ",
+            hoverformat=" ",  # blank default unified header
             showgrid=True, gridcolor="#263041", zeroline=False
         ),
         yaxis=dict(
@@ -346,17 +320,6 @@ def write_index_html(fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist,
     const zoneDot = document.getElementById('zoneDot');
     const dateRead = document.getElementById('dateRead');
 
-    // Weekly (Monday) slider
-    const histDates = ARR.hist.dates;
-    const weeklyIdx = []; const weeklyDates = [];
-    for (let i=0;i<histDates.length;i++){
-      const d = new Date(histDates[i]+"T00:00:00Z");
-      if (d.getUTCDay() === 1) { weeklyIdx.push(i); weeklyDates.push(histDates[i]); }
-    }
-    if (weeklyIdx.length===0){ for(let i=0;i<histDates.length;i+=7){ weeklyIdx.push(i); weeklyDates.push(histDates[i]); } }
-    slider.max = Math.max(0, weeklyIdx.length-1);
-    slider.value = slider.max;
-
     function setLegend(on){ Plotly.relayout(figEl, {"showlegend": !!on}); }
     let legendOn = true;
     legendBtn.addEventListener('click', ()=>{ legendOn = !legendOn; setLegend(legendOn); });
@@ -418,33 +381,89 @@ def write_index_html(fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist,
       updateMarkerAndReadout();
     }
 
+    // ----- Weekly (Monday) slider independent of data gaps
+    const histDatesISO = ARR.hist.dates;
+    const histMs = histDatesISO.map(d=>Date.parse(d+"T00:00:00Z"));
+    const MS_DAY = 86400000;
+    // find first Monday >= first date
+    let t0 = histMs[0];
+    let d0 = new Date(t0);
+    const firstMon = t0 + ((8 - d0.getUTCDay()) % 7) * MS_DAY;
+    const weeklyIdx = [], weeklyDates = [];
+    for (let t = firstMon; t <= histMs[histMs.length-1]; t += 7*MS_DAY){
+      // nearest index by lower-bound
+      let lo = 0, hi = histMs.length-1, pos = hi;
+      while (lo <= hi){
+        const mid = (lo+hi)>>1;
+        if (histMs[mid] >= t){ pos = mid; hi = mid-1; } else { lo = mid+1; }
+      }
+      // prefer the closest between pos and pos-1
+      let cand = pos;
+      if (pos>0 && Math.abs(histMs[pos-1]-t) <= Math.abs(histMs[pos]-t)) cand = pos-1;
+      weeklyIdx.push(cand);
+      weeklyDates.push(histDatesISO[cand]);
+    }
+    if (weeklyIdx.length===0){ weeklyIdx.push(histDatesISO.length-1); weeklyDates.push(histDatesISO.at(-1)); }
+    slider.max = Math.max(0, weeklyIdx.length-1);
+    slider.value = slider.max;
+
     function sliderToHistIndex(){
       const i = Math.max(0, Math.min(parseInt(slider.value,10), weeklyIdx.length-1));
-      return weeklyIdx[i] ?? (ARR.hist.dates.length-1);
+      return weeklyIdx[i] ?? (histDatesISO.length-1);
+    }
+
+    function updateHoverHeader(ev){
+      try{
+        if (!ev || !ev.points || !ev.points.length) return;
+        const idx = ev.points[0].pointIndex;
+        const dISO = ARR.dates[idx] || histDatesISO[Math.min(idx, histDatesISO.length-1)];
+        const dt = new Date(dISO+"T00:00:00Z");
+        const label = dt.toLocaleString('en-US', {month:'short', year:'numeric', timeZone:'UTC'});
+        // replace first tspan inside the unified hover
+        const layer = figEl.querySelector('.hoverlayer');
+        if (!layer) return;
+        const firstText = layer.querySelector('g.hovertext text tspan');
+        if (firstText) firstText.textContent = label;
+      }catch(_){}
     }
 
     function updateMarkerAndReadout(){
       const j = sliderToHistIndex();
       const denom = denomSel.value;
-      const dISO = ARR.hist.dates[j];
+      const dISO = histDatesISO[j];
       const bands = readBandsAt(dISO, denom);
       if (!bands){ zoneTxt.textContent="—"; dateRead.textContent=""; return; }
 
       const priceUSD = ARR.hist.usd[j];
       const priceGLD = ARR.hist.gld[j];
       const price = (denom==="USD")?priceUSD:priceGLD;
-      const zone = zoneFor(price, bands);
+      const zone = (function(){
+        if (price < bands.Support) return "SELL THE HOUSE!!";
+        if (price < bands.Bear)    return "Buy";
+        if (price < bands.Frothy)  return "DCA";
+        if (price < bands.Top)     return "Relax";
+        return "Frothy";
+      })();
       zoneTxt.textContent = zone;
-      zoneDot.style.background = zoneDotColor(zone);
+      zoneDot.style.background = (function(z){
+        switch(z){
+          case "SELL THE HOUSE!!": return "#ffffff";
+          case "Buy":              return "#f97316";
+          case "DCA":              return "#ffffff";
+          case "Relax":            return "#84cc16";
+          case "Frothy":           return "#ef4444";
+          default:                 return "#e5e7eb";
+        }
+      })(zone);
 
       // Readout: only date + BTC price
       const line = (denom==="USD") ? fmtUSD(priceUSD) : fmtOzBTC(priceGLD);
       dateRead.innerHTML = `<div style="font-weight:600">${dISO}</div><div>BTC: ${line}</div>`;
 
       // Move marker
-      const genesis = new Date("2009-01-03T00:00:00Z").getTime();
-      const d = new Date(dISO+"T00:00:00Z").getTime();
-      const days = Math.max(1, Math.round((d - genesis)/86400000));
+      const genesis = Date.parse("2009-01-03T00:00:00Z");
+      const dms = Date.parse(dISO+"T00:00:00Z");
+      const days = Math.max(1, Math.round((dms - genesis)/86400000));
       const xval = Math.log10(days);
       if (denom==="USD"){ Plotly.restyle(figEl, {"x":[[xval]], "y":[[priceUSD]]}, [USD_MARK_IDX]); }
       else { Plotly.restyle(figEl, {"x":[[xval]], "y":[[priceGLD]]}, [GLD_MARK_IDX]); }
@@ -459,6 +478,9 @@ def write_index_html(fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist,
     function hideHover(){ try{ Plotly.Fx.unhover(figEl); }catch(e){} }
     document.addEventListener('click', (ev)=>{ if(outsideFig(figEl, ev.target)) hideHover(); }, {passive:true});
     document.addEventListener('touchstart', (ev)=>{ if(outsideFig(figEl, ev.target)) hideHover(); }, {passive:true});
+
+    // Update hover header text to Month Year
+    figEl.on('plotly_hover', updateHoverHeader);
 
     // Init
     setDenom("USD");
