@@ -351,15 +351,19 @@ def make_powerlaw_fig(df: pd.DataFrame):
 
 # --------------------- HTML writer
 def write_index_html(fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist,
-                     out_path="dist/index.html", page_title="BTC Purchase Indicator"):
+                     out_path="dist/index.html", page_title="BTC Purchase Indicator",
+                     template_path="template.html"):
     from pathlib import Path
     import json, numpy as np, pandas as pd
     import plotly.io as pio
 
+    # ensure output folder exists
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
 
+    # 1) serialize plotly figure
     fig_json = pio.to_json(fig, pretty=False)
 
+    # 2) pack arrays payload
     dates_iso = pd.to_datetime(full_dates).strftime("%Y-%m-%d").tolist()
     hist_len  = len(usd_hist)
     hist_iso  = pd.to_datetime(full_dates[:hist_len]).strftime("%Y-%m-%d").tolist()
@@ -382,347 +386,18 @@ def write_index_html(fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist,
     }
     arrays_json = json.dumps(payload, separators=(",", ":"))
 
-    # ------------------------- HTML TEMPLATE -------------------------
-    TEMPLATE = r'''<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>__TITLE__</title>
-<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
-<style>
-  :root { color-scheme:dark; --bg:#0f1116; --fg:#e7e9ee; --muted:#8e95a5; --card:#151821; }
-  html,body{margin:0;background:var(--bg);color:var(--fg);
-    font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Inter,Roboto,Helvetica,Arial,sans-serif}
-  .wrap{max-width:1100px;margin:24px auto;padding:0 16px}
-  h1{font-size:clamp(28px,4.5vw,44px);margin:0 0 12px}
-  .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
-  .chip{background:var(--card);border:1px solid #263041;border-radius:999px;padding:8px 12px;display:inline-flex;align-items:center;gap:10px}
-  .dot{width:12px;height:12px;border-radius:50%;background:#fff}
-  .btn,select{background:var(--card);border:1px solid #263041;border-radius:12px;padding:8px 10px;color:var(--fg);font:inherit;cursor:pointer}
-  #fig{height:70vh;min-height:430px;background:var(--card);border-radius:14px;padding:8px;position:relative}
-  .slider{width:100%}
-  .stack{display:flex;flex-direction:column;gap:2px;font-size:0.95rem}
-  #hoverBox{
-    position:fixed; right:20px; bottom:20px; z-index:10;
-    background:rgba(20,24,32,0.88); border:1px solid #3b4455;
-    border-radius:10px; padding:10px 12px; min-width:220px; max-width:320px;
-    font-size:0.92rem; line-height:1.25rem; display:none; user-select:none;
-  }
-  #hoverBox .hdr{font-weight:700; margin-bottom:6px; color:#e7e9ee}
-  #hoverBox .rowline{display:flex; justify-content:space-between; gap:8px}
-</style>
-</head>
-<body>
-  <div class="wrap">
-    <h1>BTC Purchase Indicator</h1>
+    # 3) read template and replace placeholders
+    tpl_path = Path(template_path)
+    if not tpl_path.exists():
+        raise FileNotFoundError(f"Template not found: {tpl_path.resolve()}")
 
-    <div class="row" style="margin-bottom:8px;">
-      <div class="chip"><span id="zoneDot" class="dot"></span> <b>Price Zone:</b> <span id="zoneTxt" style="margin-left:6px">—</span></div>
-      <div class="row" style="gap:8px;">
-        <label for="denom">Denomination</label>
-        <select id="denom" style="min-width:6.0rem;">
-          <option value="USD" selected>USD</option>
-          <option value="Gold">Gold</option>
-        </select>
-      </div>
-      <button class="btn" id="legendBtn">Legend</button>
-    </div>
-
-    <div class="row" style="margin:6px 0 2px;">
-      <label for="dateSlider">View at date:</label>
-      <label class="row" style="gap:6px;"><input type="checkbox" id="chkToday"/> Today</label>
-    </div>
-    <input id="dateSlider" class="slider" type="range" min="0" value="0" step="1"/>
-    <div id="dateRead" class="stack" style="opacity:.95; margin:6px 0 12px 2px;"></div>
-
-    <div id="fig"></div>
-  </div>
-
-  <div id="hoverBox">
-    <div class="hdr" id="hb_hdr">—</div>
-    <div class="rowline"><span style="color:#22c55e">Top</span> <span id="hb_top">—</span></div>
-    <div class="rowline"><span style="color:#86efac">Frothy</span> <span id="hb_fro">—</span></div>
-    <div class="rowline"><span style="color:#e5e7eb">PL Best Fit</span> <span id="hb_mid">—</span></div>
-    <div class="rowline"><span style="color:#fca5a5">Bear</span> <span id="hb_bear">—</span></div>
-    <div class="rowline"><span style="color:#ef4444">Support</span> <span id="hb_sup">—</span></div>
-    <div class="rowline"><span style="color:#facc15">BTC</span> <span id="hb_btc">—</span></div>
-  </div>
-
-  <script type="application/json" id="figjson">__FIGJSON__</script>
-  <script type="application/json" id="arrays">__ARRAYS__</script>
-
-  <script>
-    const FIG = JSON.parse(document.getElementById('figjson').textContent);
-    const ARR = JSON.parse(document.getElementById('arrays').textContent);
-    const figEl = document.getElementById('fig');
-
-    Plotly.newPlot(figEl, FIG.data, FIG.layout, {displaylogo:false, responsive:true});
-
-    const META = FIG.layout.meta || {};
-    const USD_MARK_IDX = META.USD_MARK_IDX;
-    const GLD_MARK_IDX = META.GLD_MARK_IDX;
-
-    const denomSel = document.getElementById('denom');
-    const legendBtn = document.getElementById('legendBtn');
-    const slider = document.getElementById('dateSlider');
-    const chkToday = document.getElementById('chkToday');
-    const zoneTxt = document.getElementById('zoneTxt');
-    const zoneDot = document.getElementById('zoneDot');
-    const dateRead = document.getElementById('dateRead');
-
-    const hb = document.getElementById('hoverBox');
-    const hb_hdr = document.getElementById('hb_hdr');
-    const hb_top = document.getElementById('hb_top');
-    const hb_fro = document.getElementById('hb_fro');
-    const hb_mid = document.getElementById('hb_mid');
-    const hb_bear= document.getElementById('hb_bear');
-    const hb_sup = document.getElementById('hb_sup');
-    const hb_btc = document.getElementById('hb_btc');
-
-    const fullDatesISO = ARR.dates;
-    const fullMs = fullDatesISO.map(d=>Date.parse(d+"T00:00:00Z"));
-
-    let hoverShapes = { v: null, h: null };
-    let guideShapes = { v: null, h: null };
-
-    function refreshShapes(){
-      const arr = [];
-      if (guideShapes.v) arr.push(guideShapes.v);
-      if (guideShapes.h) arr.push(guideShapes.h);
-      if (hoverShapes.v) arr.push(hoverShapes.v);
-      if (hoverShapes.h) arr.push(hoverShapes.h);
-      Plotly.relayout(figEl, { shapes: arr });
-    }
-
-    function setHoverCrosshair(x, y){
-      const w = "rgba(255,255,255,0.6)";
-      hoverShapes.v = { type:"line", xref:"x", x0:x, x1:x, yref:"paper", y0:0, y1:1, line:{color:w,width:1} };
-      hoverShapes.h = { type:"line", xref:"paper", x0:0, x1:1, yref:"y",     y0:y, y1:y, line:{color:w,width:1} };
-      refreshShapes();
-      hb.style.display = "block";
-    }
-    function clearHoverCrosshair(){
-      hoverShapes.v = null; hoverShapes.h = null;
-      refreshShapes();
-    }
-
-    function setMarkerGuides(x, y){
-      const yel = "rgba(250,204,21,0.6)";
-      guideShapes.v = { type:"line", xref:"x", x0:x, x1:x, yref:"paper", y0:0, y1:1, line:{color:yel,width:1} };
-      guideShapes.h = { type:"line", xref:"paper", x0:0, x1:1, yref:"y",     y0:y, y1:y, line:{color:yel,width:1} };
-      refreshShapes();
-    }
-    function clearMarkerGuides(){
-      guideShapes.v = null; guideShapes.h = null;
-      refreshShapes();
-    }
-
-    function getLegend(){ return !!(figEl._fullLayout && figEl._fullLayout.showlegend); }
-    function setLegend(on){ Plotly.relayout(figEl, {"showlegend": !!on}); }
-    legendBtn.addEventListener('click', ()=> setLegend(!getLegend()));
-
-    function fmtUSD(v){ return (v==null||!isFinite(v))?"—":"$"+Math.round(v).toLocaleString(); }
-    function fmtOzBTC(v){
-      if (v==null||!isFinite(v)) return "—";
-      const n = Math.round(v*100)/100;
-      return n.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})+" oz/BTC";
-    }
-    function fmtTickGold(v){
-      if (!isFinite(v)||v<=0) return "";
-      if (v>=1) return Math.round(v).toLocaleString();
-      return Number(v).toFixed(3).replace(/\.?0+$/,"");
-    }
-
-    function nearestFullIndex(ms){
-      let lo=0, hi=fullMs.length-1, pos=hi;
-      while (lo<=hi){ const mid=(lo+hi)>>1; if (fullMs[mid]>=ms){pos=mid; hi=mid-1;} else lo=mid+1; }
-      if (pos>0 && Math.abs(fullMs[pos-1]-ms) <= Math.abs(fullMs[pos]-ms)) return pos-1;
-      return pos;
-    }
-
-    function zoneDotColor(z){
-      switch(z){
-        case "SELL THE HOUSE!!": return "#ffffff";
-        case "Buy":              return "#f97316";
-        case "DCA":              return "#ffffff";
-        case "Relax":            return "#84cc16";
-        case "Frothy":           return "#ef4444";
-        default:                 return "#e5e7eb";
-      }
-    }
-
-    function readBandsAtIdx(idx, denom){
-      const g = denom==="USD" ? ARR.usd : ARR.gld;
-      return { Support:g.Support[idx], Bear:g.Bear[idx], Mid:g.Mid[idx], Frothy:g.Frothy[idx], Top:g.Top[idx] };
-    }
-
-    function setGoldTicks(){
-      const G = ARR.gld;
-      const all = [].concat(G.Support,G.Bear,G.Mid,G.Frothy,G.Top,ARR.hist.gld).filter(v=>v>0&&isFinite(v));
-      if (!all.length) return;
-      const minV = Math.min.apply(null,all), maxV = Math.max.apply(null,all);
-      const c = [0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10,20,50,100,200,500,1000];
-      const ticks = c.filter(v=>v>=minV*0.9 && v<=maxV*1.1);
-      const txt = ticks.map(fmtTickGold);
-      Plotly.relayout(figEl, {"yaxis.tickvals":ticks, "yaxis.ticktext":txt, "yaxis.tickformat":""});
-    }
-    function clearGoldTicks(){
-      Plotly.relayout(figEl, {"yaxis.tickvals":null, "yaxis.ticktext":null, "yaxis.tickformat":"$,d"});
-    }
-
-    function setDenom(which){
-      const want = which==="USD" ? "USD" : "GLD";
-      const vis = (FIG.data||[]).map(tr => {
-        const grp = tr.legendgroup || "";
-        if (grp) return grp === want;
-        const nm = (tr.name || "").toLowerCase();
-        if (want==="USD") return !/oz\/btc/.test(nm);
-        return /oz\/btc/.test(nm);
-      });
-      Plotly.restyle(figEl, {"visible": vis});
-      if (which==="USD"){ Plotly.relayout(figEl, {"yaxis.title.text":"USD / BTC"}); clearGoldTicks(); }
-      else { Plotly.relayout(figEl, {"yaxis.title.text":"Gold oz / BTC"}); setGoldTicks(); }
-      updateMarkerAndReadout();
-    }
-
-    const histDatesISO = ARR.hist.dates;
-    const histMs = histDatesISO.map(d=>Date.parse(d+"T00:00:00Z"));
-    const MS_DAY = 86400000;
-    const firstDate = new Date(histMs[0]);
-    const firstMon = histMs[0] + ((8 - firstDate.getUTCDay()) % 7) * MS_DAY;
-    const weeklyIdx = [], weeklyDates = [];
-    for (let t = firstMon; t <= histMs[histMs.length-1]; t += 7*MS_DAY){
-      let lo = 0, hi = histMs.length-1, pos = hi;
-      while (lo <= hi){ const mid=(lo+hi)>>1; if (histMs[mid] >= t){ pos=mid; hi=mid-1; } else { lo=mid+1; } }
-      let cand = pos;
-      if (pos>0 && Math.abs(histMs[pos-1]-t) <= Math.abs(histMs[pos]-t)) cand = pos-1;
-      weeklyIdx.push(cand);
-      weeklyDates.push(histDatesISO[cand]);
-    }
-    if (weeklyIdx.length===0){ weeklyIdx.push(histDatesISO.length-1); weeklyDates.push(histDatesISO.at(-1)); }
-    const sliderEl = slider;
-    sliderEl.max = Math.max(0, weeklyIdx.length-1);
-    sliderEl.value = sliderEl.max;
-
-    function sliderToHistIndex(){
-      const i = Math.max(0, Math.min(parseInt(sliderEl.value,10), weeklyIdx.length-1));
-      return weeklyIdx[i] ?? (histDatesISO.length-1);
-    }
-
-    function updateMarkerAndReadout(){
-      const j = sliderToHistIndex();
-      const denom = denomSel.value;
-      const dISO = histDatesISO[j];
-
-      const priceUSD = ARR.hist.usd[j];
-      const priceGLD = ARR.hist.gld[j];
-
-      const ms = Date.parse(dISO+"T00:00:00Z");
-      const k = nearestFullIndex(ms);
-      const bands = readBandsAtIdx(k, denom);
-      const price = (denom==="USD")?priceUSD:priceGLD;
-
-      const zone = (function(){
-        if (price < bands.Support) return "SELL THE HOUSE!!";
-        if (price < bands.Bear)    return "Buy";
-        if (price < bands.Frothy)  return "DCA";
-        if (price < bands.Top)     return "Relax";
-        return "Frothy";
-      })();
-      zoneTxt.textContent = zone;
-      zoneDot.style.background = zoneDotColor(zone);
-
-      const line = (denom==="USD") ? fmtUSD(priceUSD) : fmtOzBTC(priceGLD);
-      dateRead.innerHTML = `<div style="font-weight:600">${dISO}</div><div>BTC: ${line}</div>`;
-
-      const genesis = Date.parse("2009-01-03T00:00:00Z");
-      const dms = Date.parse(dISO+"T00:00:00Z");
-      const days = Math.max(1, Math.round((dms - genesis)/86400000));
-      const xval = Math.log10(days);
-
-      if (denom==="USD"){
-        Plotly.restyle(figEl, {"x":[[xval]], "y":[[priceUSD]]}, [USD_MARK_IDX]);
-        if (!chkToday.checked) setMarkerGuides(xval, priceUSD); else clearMarkerGuides();
-      } else {
-        Plotly.restyle(figEl, {"x":[[xval]], "y":[[priceGLD]]}, [GLD_MARK_IDX]);
-        if (!chkToday.checked) setMarkerGuides(xval, priceGLD); else clearMarkerGuides();
-      }
-    }
-
-    function updatePinnedHoverFromX(logx){
-      const days = Math.max(1, Math.round(Math.pow(10, logx)));
-      const ms = Date.parse("2009-01-03T00:00:00Z") + days*86400000;
-      const idx = nearestFullIndex(ms);
-      const dateISO = fullDatesISO[idx];
-      const denom = denomSel.value;
-      const b = readBandsAtIdx(idx, denom);
-
-      let lo=0, hi=histMs.length-1, pos=hi;
-      while (lo<=hi){ const mid=(lo+hi)>>1; if (histMs[mid]>=ms){ pos=mid; hi=mid-1; } else lo=mid+1; }
-      if (pos>0 && Math.abs(histMs[pos-1]-ms)<=Math.abs(histMs[pos]-ms)) pos=pos-1;
-      const usd = ARR.hist.usd[pos];
-      const gld = ARR.hist.gld[pos];
-
-      hb_hdr.textContent = dateISO;
-      if (denom==="USD"){
-        hb_top.textContent = fmtUSD(b.Top);
-        hb_fro.textContent = fmtUSD(b.Frothy);
-        hb_mid.textContent = fmtUSD(b.Mid);
-        hb_bear.textContent= fmtUSD(b.Bear);
-        hb_sup.textContent = fmtUSD(b.Support);
-        hb_btc.textContent = fmtUSD(usd);
-      } else {
-        hb_top.textContent = fmtOzBTC(b.Top);
-        hb_fro.textContent = fmtOzBTC(b.Frothy);
-        hb_mid.textContent = fmtOzBTC(b.Mid);
-        hb_bear.textContent= fmtOzBTC(b.Bear);
-        hb_sup.textContent = fmtOzBTC(b.Support);
-        hb_btc.textContent = fmtOzBTC(gld);
-      }
-      hb.style.display = "block";
-    }
-
-    denomSel.addEventListener('change', (e)=> setDenom(e.target.value));
-    sliderEl.addEventListener('input', ()=>{ chkToday.checked=false; updateMarkerAndReadout(); });
-    chkToday.addEventListener('change', (e)=>{ if(e.target.checked){ sliderEl.value = sliderEl.max; } updateMarkerAndReadout(); });
-
-    function outsideFig(el, target){ return !el.contains(target); }
-    function hideHover(){ try{ Plotly.Fx.unhover(figEl); }catch(e){} clearHoverCrosshair(); }
-    document.addEventListener('click', (ev)=>{ if(outsideFig(figEl, ev.target)) hideHover(); }, {passive:true});
-    document.addEventListener('touchstart', (ev)=>{ if(outsideFig(figEl, ev.target)) hideHover(); }, {passive:true});
-
-    figEl.on('plotly_hover', (ev) => {
-      if (!ev || !ev.points || !ev.points.length) return;
-      const p = ev.points[0];
-      setHoverCrosshair(p.x, p.y);
-      updatePinnedHoverFromX(p.x);
-    });
-    figEl.on('plotly_unhover', () => { clearHoverCrosshair(); });
-
-    setDenom("USD");
-    setLegend(True);   // legend visible at load
-    updateMarkerAndReadout();
-    (function initPinned(){
-      const lastISO = ARR.hist.dates.at(-1);
-      const ms = Date.parse(lastISO+"T00:00:00Z");
-      const genesis = Date.parse("2009-01-03T00:00:00Z");
-      const days = Math.max(1, Math.round((ms-genesis)/86400000));
-      updatePinnedHoverFromX(Math.log10(days));
-      hb.style.display = "block";
-    })();
-
-    window.addEventListener('resize', ()=> Plotly.Plots.resize(figEl));
-  </script>
-</body>
-</html>'''
-    # ----------------------- END TEMPLATE -----------------------
-
-    html = (TEMPLATE
+    tpl = tpl_path.read_text(encoding="utf-8")
+    html = (tpl
             .replace("__TITLE__", page_title)
             .replace("__FIGJSON__", fig_json)
             .replace("__ARRAYS__", arrays_json))
 
+    # 4) write to dist/index.html
     Path(out_path).write_text(html, encoding="utf-8")
     print("[build] wrote", out_path)
 
