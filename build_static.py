@@ -20,12 +20,21 @@ PROJ_END = pd.Timestamp("2040-12-31")
 UA       = {"User-Agent": "btc-pl-pages/1.2"}
 
 LEVELS = {
-    "Top":         +1.75,
-    "Frothy":      +1,
-    "PL Best Fit":  0,
+    "Top":         +2.0,    
+    "Frothy":      +1.0,
+    "PL Best Fit":  0.0,
     "Bear":        -0.5,
     "Support":     -1.5,
 }
+
+def _fmt_sigma_for_legend(k: float) -> str:
+    """Format kσ for legend with only significant figures:
+       +2, +1, 0, -0.5, -1.5 …"""
+    if abs(k) < 1e-12:
+        return "0"
+    # +g keeps only significant digits and adds the sign
+    return f"{k:+g}"
+    
 COLORS = {
     "Top":         "#16a34a",
     "Frothy":      "#86efac",
@@ -137,6 +146,7 @@ def make_powerlaw_fig(df: pd.DataFrame):
       - Colored hover rows matching line colors
       - Slider-driven BTC marker (indices exposed via layout.meta)
       - Projection of bands monthly to 2040-12
+      - Legend names include σ with significant figures, e.g. Top (+2σ), Frothy (+1σ) …
     Returns: fig, full_dates, bands_usd, bands_gld, usd_hist, gld_hist
     """
     # ----- series -----
@@ -180,10 +190,13 @@ def make_powerlaw_fig(df: pd.DataFrame):
     # Lines (suppress their own hover; we’ll use one composite)
     for name in order:
         y = bands_usd["mid"] if name == "PL Best Fit" else bands_usd[name]
+        # Legend name with σ in significant figures
+        sig = _fmt_sigma_for_legend(LEVELS[name])
+        legend_name = f"{name} ({sig}σ)"
         fig.add_trace(go.Scatter(
             x=x_full, y=y, mode="lines",
             line=dict(color=COLORS[name], width=2, dash=DASHES[name]),
-            name=name, legendgroup="USD",
+            name=legend_name, legendgroup="USD",
             hoverinfo="skip",  # <- only composite hover shows
             visible=True
         ))
@@ -242,10 +255,12 @@ def make_powerlaw_fig(df: pd.DataFrame):
     # ================= GOLD group (hidden) =================
     for name in order:
         y = bands_gld["mid"] if name == "PL Best Fit" else bands_gld[name]
+        sig = _fmt_sigma_for_legend(LEVELS[name])
+        legend_name = f"{name} ({sig}σ)"
         fig.add_trace(go.Scatter(
             x=x_full, y=y, mode="lines",
             line=dict(color=COLORS[name], width=2, dash=DASHES[name]),
-            name=name, legendgroup="GLD",
+            name=legend_name, legendgroup="GLD",
             hoverinfo="skip",
             visible=False
         ))
@@ -325,11 +340,11 @@ def make_powerlaw_fig(df: pd.DataFrame):
         ),
         margin=dict(l=60, r=24, t=18, b=64),
         paper_bgcolor="#0f1116", plot_bgcolor="#151821",
-        # expose indices for page JS to move the markers & toggle denom
         meta=dict(
             USD_MARK_IDX=USD_MARK_IDX,
             GLD_MARK_IDX=GLD_MARK_IDX
-        )
+        ),
+        showlegend=True  # ensure legend is visible initially
     )
 
     return fig, full_dates, bands_usd, bands_gld, usd, gld
