@@ -23,7 +23,7 @@ LEVELS = {
     "Top":         +2.0,    
     "Frothy":      +1.0,
     "PL Best Fit":  0.0,
-    "Bear":        -0.5,
+    "Bear":        -0.75,
     "Support":     -1.5,
 }
 
