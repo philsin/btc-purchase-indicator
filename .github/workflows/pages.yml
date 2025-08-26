@@ -1,0 +1,55 @@
+name: Build & Deploy Pages
+
+on:
+  push:
+    branches: [ main ]  # or your default branch
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Build static site
+        env:
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}  # optional
+        run: |
+          python build_static.py
+          # Our script writes to docs/index.html. Pages expects any folder.
+          # We'll publish the docs/ folder as the artifact.
+          test -f docs/index.html
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./docs
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
