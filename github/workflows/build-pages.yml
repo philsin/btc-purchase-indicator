@@ -5,7 +5,7 @@ on:
   push:
     branches: [ main ]
   schedule:
-    - cron: "0 */6 * * *"  # every 6h
+    - cron: "0 */6 * * *"  # every 6 hours
 
 concurrency:
   group: "pages"
@@ -36,13 +36,18 @@ jobs:
       - name: Install deps
         run: pip install -r requirements-pages.txt
 
-      # NEW: configure Pages (sets baseUrl & prepares deployment)
       - name: Configure Pages
         id: pages
         uses: actions/configure-pages@v5
 
       - name: Build static site
-        run: python build_static.py  # writes ./dist/index.html
+        run: |
+          rm -rf dist
+          python build_static.py
+
+      - name: Verify artifact
+        run: |
+          test -f dist/index.html || (echo "dist/index.html missing" && exit 1)
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
