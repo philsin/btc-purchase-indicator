@@ -1,336 +1,622 @@
-# build_static.py  — builds dist/index.html with FIG & ARR JSON for template
-import os, json, math, io, sys
-from datetime import datetime, timedelta
-import pandas as pd
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Static builder for BTC Purchase Indicator (Power-Law bands)
+- Robust column detection (no hard-coded 'Price')
+- BTC/USD and Gold oz/BTC denominations
+- Outputs a single dist/index.html file
+"""
+
+import os, io, json, math, textwrap
+from datetime import datetime
 import numpy as np
+import pandas as pd
 
-OUTDIR = "dist"
-TEMPLATE = "template.html"
+# ----------------- constants -----------------
+GENESIS   = pd.Timestamp("2009-01-03")
+PROJ_END  = pd.Timestamp("2040-12-31")
+UA        = {"User-Agent": "btc-pl-static/1.0"}
 
-GENESIS = pd.Timestamp("2009-01-03")
-PROJ_END = pd.Timestamp("2040-12-31")
-FD_SUPPLY = 21_000_000  # not used here; price-only bands (denom handled later)
-
-# -------------------- Data loaders (Stooq + fallbacks) --------------------
-def _read_stooq_csv(url, date_col="Date", price_col="Close"):
-    df = pd.read_csv(url)
-    cols = [c.lower() for c in df.columns]
-    dcol = [c for c in df.columns if "date" in c.lower()][0]
-    pcol = [c for c in df.columns if ("close" in c.lower()) or ("price" in c.lower())][0]
-    df = df.rename(columns={dcol: "Date", pcol: "Price"})
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    df["Price"] = pd.to_numeric(
-        df["Price"].astype(str).str.replace(",", ""), errors="coerce"
-    )
-    df = df.dropna().sort_values("Date")
-    return df[["Date", "Price"]]
-
-def load_btc():
-    # BTC from Stooq
-    return _read_stooq_csv("https://stooq.com/q/d/l/?s=btcusd&i=d")
-
-def load_gold():
-    # Gold (XAUUSD) from Stooq
-    return _read_stooq_csv("https://stooq.com/q/d/l/?s=xauusd&i=d")
-
-def load_spy():
-    # SPY ETF from Stooq (USD)
-    return _read_stooq_csv("https://stooq.com/q/d/l/?s=spy.us&i=d")
-
-# -------------------- Power-law fit & bands (on BTC/USD) --------------------
-def fit_power(df_price):
-    # df_price: columns Date, Price (BTC/USD)
-    X = np.log10(np.maximum(1.0, (df_price["Date"] - GENESIS).dt.days.values))
-    y = np.log10(df_price["Price"].values)
-    slope, intercept = np.polyfit(X, y, 1)
-    mid_log = slope * X + intercept
-    resid = y - mid_log
-    sigma = np.std(resid)
-    return slope, intercept, max(sigma, 0.25)
-
+# band levels (latest requirements)
 LEVELS = {
     "Support": -1.5,
-    "Bear":    -0.75,  # updated per your request
-    "Mid":      0.0,   # PL Best Fit
-    "Frothy":  +1.0,
-    "Top":     +2.0,   # updated to +2.0σ
+    "Bear":    -0.75,   # updated
+    "Mid":      0.0,
+    "Frothy":   1.0,
+    "Top":      2.0,    # updated
 }
 
-# -------------------- Build time series to 2040 --------------------
-def build_full_dates(last_hist_date):
-    # end monthly to PROJ_END (first day of month)
-    future = pd.date_range(
-        last_hist_date + pd.offsets.MonthBegin(1),
-        PROJ_END, freq="MS", inclusive="both"
-    )
-    return future
+# colors
+COLORS = {
+    "Support": "#ef4444",         # red
+    "Bear":    "rgba(255,100,100,1)",
+    "Mid":     "#ffffff",
+    "Frothy":  "rgba(100,255,100,1)",
+    "Top":     "#22c55e",         # green
+    "BTC":     "#fbbf24",         # amber/yellow
+}
 
-def halving_dates():
-    # Known + projected (approx. every 210k blocks ~4 years)
-    # Use actual dates for past, estimate for future mid-April windows
-    dates = [
-        "2012-11-28",
-        "2016-07-09",
-        "2020-05-11",
-        "2024-04-20"  # 2024 actual
-    ]
-    # Next estimates (approx every 4 years, mid-April)
-    last = pd.Timestamp("2024-04-20")
-    for yr in (2028, 2032, 2036, 2040):
-        dates.append(f"{yr}-04-15")
-    return [pd.Timestamp(d) for d in dates]
+# candidate price column names to look for automatically
+PRICE_CANDIDATES = ["Price", "Close", "Adj Close", "AdjClose", "BTC", "USD", "Value"]
 
-# -------------------- Main build --------------------
-def main():
-    btc = load_btc()
-    gold = load_gold()
-    spy = load_spy()
+# ----------------- robust helpers -----------------
+def detect_price_col(df, hint=None, label="series"):
+    """
+    Return a usable price column name from df.
+    Priority:
+      1) explicit `hint` if present
+      2) known PRICE_CANDIDATES in order
+      3) first numeric, non-Date column
+    """
+    if "Date" not in df.columns:
+        raise ValueError(f"{label}: missing 'Date' column. Have: {list(df.columns)}")
 
-    # align (inner join) btc/gold/spy on Date for ratios and shared calendar
-    df = btc.merge(gold.rename(columns={"Price": "Gold"}), on="Date", how="inner")
-    df = df.merge(spy.rename(columns={"Price": "SPY"}), on="Date", how="inner")
-    # sanity
-    df = df[(df["Price"] > 0) & (df["Gold"] > 0) & (df["SPY"] > 0)].copy()
-    df = df.rename(columns={"Price": "BTC"})
-    df = df.sort_values("Date").reset_index(drop=True)
+    if hint and hint in df.columns:
+        return hint
 
-    # Fit power law on BTC/USD
-    slope, intercept, sigma = fit_power(df[["Date", "BTC"]])
-    days_full = np.maximum(1, (df["Date"] - GENESIS).dt.days.values)
-    mid_log_hist = slope * np.log10(days_full) + intercept
-    mid_hist = 10 ** mid_log_hist
+    for c in PRICE_CANDIDATES:
+        if c in df.columns:
+            return c
 
-    # extend monthly to 2040 for band projections
-    future = build_full_dates(df["Date"].iloc[-1])
-    full = pd.concat([df[["Date"]], pd.DataFrame({"Date": future})], ignore_index=True)
-    full["days"] = np.maximum(1, (full["Date"] - GENESIS).dt.days)
-    mid_log = slope * np.log10(full["days"].values) + intercept
-    mid = 10 ** mid_log
+    for c in df.columns:
+        if c != "Date" and pd.api.types.is_numeric_dtype(df[c]):
+            return c
 
-    # Construct USD bands on the full monthly grid
-    bands_usd = {}
+    raise ValueError(f"{label}: could not find a numeric price column in columns {list(df.columns)}")
+
+def fit_power(df_price, price_col=None, label="series"):
+    """
+    Log-log linear fit on (days since GENESIS, price).
+    Works with any price column name.
+    Returns (slope, intercept, sigma>=0.25).
+    """
+    if price_col is None:
+        price_col = detect_price_col(df_price, label=label)
+
+    need = {"Date", price_col}
+    if not need.issubset(df_price.columns):
+        raise ValueError(
+            f"{label}: expected columns {sorted(need)}; got {list(df_price.columns)}"
+        )
+
+    days = (pd.to_datetime(df_price["Date"]) - GENESIS).dt.days.to_numpy()
+    days = np.maximum(days, 1)  # avoid log10(0)
+    X = np.log10(days)
+
+    y_raw = pd.to_numeric(df_price[price_col], errors="coerce").to_numpy()
+    y = np.log10(y_raw)
+
+    mask = np.isfinite(X) & np.isfinite(y)
+    if not mask.any():
+        raise ValueError(f"{label}: no finite data to fit after cleaning")
+
+    X = X[mask]
+    y = y[mask]
+
+    slope, intercept = np.polyfit(X, y, 1)
+    resid  = y - (slope * X + intercept)
+    sigma  = float(np.std(resid))
+    return slope, intercept, max(sigma, 0.25)
+
+def require_cols(df, cols, label):
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"{label} missing columns {missing}. Have: {list(df.columns)}")
+
+# ----------------- data loaders -----------------
+def _btc_stooq():
+    url = "https://stooq.com/q/d/l/?s=btcusd&i=d"
+    df = pd.read_csv(url)
+    df.columns = [c.lower() for c in df.columns]
+    # find date & close
+    date_col  = next(c for c in df.columns if "date" in c)
+    price_col = next(c for c in df.columns if c in ("close", "c"))
+    out = pd.DataFrame({
+        "Date":  pd.to_datetime(df[date_col], errors="coerce"),
+        "BTC":   pd.to_numeric(df[price_col].astype(str).str.replace(",",""), errors="coerce"),
+    })
+    return out.dropna().sort_values("Date")
+
+def _btc_github():
+    raw = "https://raw.githubusercontent.com/datasets/bitcoin-price/master/data/bitcoin_price.csv"
+    df  = pd.read_csv(raw)
+    out = pd.DataFrame({
+        "Date": pd.to_datetime(df["Date"], errors="coerce"),
+        "BTC":  pd.to_numeric(df["Closing Price (USD)"], errors="coerce"),
+    })
+    return out.dropna().sort_values("Date")
+
+def load_btc():
+    try:
+        df = _btc_stooq()
+        if len(df) > 1000:
+            return df
+    except Exception:
+        pass
+    return _btc_github()
+
+def _gold_stooq():
+    url = "https://stooq.com/q/d/l/?s=xauusd&i=d"  # USD/oz
+    df = pd.read_csv(url)
+    df.columns = [c.lower() for c in df.columns]
+    date_col  = next(c for c in df.columns if "date" in c)
+    price_col = next(c for c in df.columns if c in ("close", "c"))
+    out = pd.DataFrame({
+        "Date":  pd.to_datetime(df[date_col], errors="coerce"),
+        "GoldUSD": pd.to_numeric(df[price_col].astype(str).str.replace(",",""), errors="coerce"),
+    })
+    return out.dropna().sort_values("Date")
+
+def _gold_lbma():
+    url = "https://raw.githubusercontent.com/koindata/gold-prices/master/data/gold.csv"
+    df = pd.read_csv(url)
+    out = pd.DataFrame({
+        "Date":   pd.to_datetime(df["Date"], errors="coerce"),
+        "GoldUSD": pd.to_numeric(df["USD (PM)"], errors="coerce"),
+    })
+    return out.dropna().sort_values("Date")
+
+def load_gold():
+    try:
+        g = _gold_stooq()
+        if len(g) >= 1000:
+            return g
+        raise ValueError("Too few gold rows from Stooq")
+    except Exception:
+        return _gold_lbma()
+
+# ----------------- compute helpers -----------------
+def extend_monthly_dates(last_hist_date, end_date=PROJ_END):
+    start = (pd.to_datetime(last_hist_date) + pd.offsets.MonthBegin(1))
+    fut = pd.date_range(start, end_date, freq="MS", inclusive="both")
+    return fut
+
+def build_bands_over(dates, slope, intercept, sigma):
+    """Return dict of band arrays keyed by level name, same length as dates."""
+    days = (pd.to_datetime(dates) - GENESIS).dt.days.to_numpy()
+    days = np.maximum(days, 1)
+    mid_log = slope * np.log10(days) + intercept
+    out = {}
     for name, k in LEVELS.items():
-        bands_usd[name] = (10 ** (mid_log + sigma * k)).tolist()
+        out[name] = (10 ** (mid_log + sigma * k)).tolist()
+    return out
 
-    # Construct Gold & SPY denominations by dividing USD bands by Gold/SPY price
-    # We need Gold/SPY price on the same monthly grid -> forward-fill from last known daily
-    daily = df.set_index("Date")[["BTC", "Gold", "SPY"]].copy()
-    # fill to cover future range for ffill
-    last_daily = daily.index[-1]
-    ext_idx = pd.date_range(daily.index[0], PROJ_END, freq="D")
-    daily_ext = daily.reindex(ext_idx).ffill()
+# ----------------- HTML template (no f-string braces conflicts) -----------------
+HTML_TEMPLATE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>BTC Purchase Indicator</title>
+<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+<style>
+  :root { color-scheme:dark; --bg:#0f1116; --fg:#e7e9ee; --muted:#8e95a5; --card:#151821; }
+  html,body{margin:0;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Inter,Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:1100px;margin:24px auto;padding:0 16px}
+  h1{font-size:clamp(28px,4.5vw,44px);margin:0 0 12px}
+  .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+  .chip{background:var(--card);border:1px solid #263041;border-radius:999px;padding:8px 12px;display:inline-flex;align-items:center;gap:10px}
+  .dot{width:12px;height:12px;border-radius:50%;background:#fff}
+  .btn,select{background:var(--card);border:1px solid #263041;border-radius:12px;padding:8px 10px;color:var(--fg);font:inherit}
+  #fig{height:72vh;min-height:460px;background:var(--card);border-radius:14px;padding:8px}
+  .slider{width:100%}
+  .stack{display:flex;flex-direction:column;gap:2px;font-size:0.95rem}
+  .hoverbox{
+      position:absolute; right:26px; bottom:26px; background:rgba(15,17,22,.88);
+      border:1px solid #263041; border-radius:10px; padding:10px 12px; min-width:140px; max-width:180px;
+      backdrop-filter: blur(6px);
+  }
+  .hoverrow{display:flex;justify-content:space-between;gap:6px;line-height:1.15}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>BTC Purchase Indicator</h1>
 
-    # Helper: map monthly date -> latest available daily price (same or before)
-    def snap_monthly_prices(monthly_idx, col):
-        # For each monthly date, use that exact day if present, else previous day.
-        out = []
-        for d in monthly_idx:
-            if d in daily_ext.index:
-                out.append(float(daily_ext.loc[d, col]))
-            else:
-                # pick last available before d
-                loc = daily_ext.index.searchsorted(d) - 1
-                if loc < 0:
-                    out.append(float('nan'))
-                else:
-                    out.append(float(daily_ext.iloc[loc][col]))
-        return out
+    <div class="row" style="margin-bottom:8px;">
+      <div class="chip"><span id="zoneDot" class="dot"></span> <b>Price Zone:</b> <span id="zoneTxt" style="margin-left:6px">—</span></div>
+      <div class="row" style="gap:8px;">
+        <label for="denom">Denomination</label>
+        <select id="denom" style="min-width:5.6rem;">
+          <option value="USD" selected>USD</option>
+          <option value="Gold">Gold</option>
+        </select>
+      </div>
+    </div>
 
-    full_gold = snap_monthly_prices(full["Date"], "Gold")
-    full_spy  = snap_monthly_prices(full["Date"], "SPY")
+    <div class="row" style="margin:6px 0 2px;">
+      <label for="dateSlider">View at date (Wednesdays):</label>
+      <label class="row" style="gap:6px;"><input type="checkbox" id="chkToday"/> Today</label>
+    </div>
+    <input id="dateSlider" class="slider" type="range" min="0" value="0" step="1"/>
+    <div id="dateRead" class="stack" style="opacity:.95; margin:6px 0 12px 2px;"></div>
 
-    def safe_div(num_list, den_list):
-        out = []
-        for n, d in zip(num_list, den_list):
-            if d and d > 0 and np.isfinite(n) and np.isfinite(d):
-                out.append(n / d)
-            else:
-                out.append(float('nan'))
-        return out
+    <div style="position:relative">
+      <div id="fig"></div>
+      <div id="hoverbox" class="hoverbox" style="display:none"></div>
+    </div>
+  </div>
 
-    bands_gld = {name: safe_div(bands_usd[name], full_gold) for name in LEVELS.keys()}
-    bands_spy = {name: safe_div(bands_usd[name], full_spy)  for name in LEVELS.keys()}
+  <script type="application/json" id="figjson">__FIGJSON__</script>
+  <script type="application/json" id="arrays">__ARRAYS__</script>
 
-    # Historical series for hover/slider (BTC in USD, Gold-denom, SPY-denom)
-    hist_usd = df["BTC"].tolist()
-    hist_gld = (df["BTC"] / df["Gold"]).tolist()  # BTC / (USD per oz) = oz/BTC
-    hist_spy = (df["BTC"] / df["SPY"]).tolist()   # BTC / (USD per SPY) = SPY/BTC
+  <script>
+    const FIG = JSON.parse(document.getElementById('figjson').textContent);
+    const ARR = JSON.parse(document.getElementById('arrays').textContent);
+    const figEl = document.getElementById('fig');
+    const hoverEl = document.getElementById('hoverbox');
 
-    # Build FIG (traces) on log-time x = log10(days since genesis)
-    def logx_from_dates(dts):
-        d = np.maximum(1, (np.array(dts) - GENESIS).astype("timedelta64[D]").astype(int))
-        return np.log10(d)
+    Plotly.newPlot(figEl, FIG.data, FIG.layout, {displaylogo:false, responsive:true});
 
-    # full monthly x, hist daily x
-    x_full = logx_from_dates(full["Date"].values)
-    x_hist = logx_from_dates(df["Date"].values)
+    // indices exposed by layout.meta
+    const META = FIG.layout.meta || {};
+    const USD_MARK_IDX = META.USD_MARK_IDX;
+    const GLD_MARK_IDX = META.GLD_MARK_IDX;
 
-    # Colors
-    C = {
-        "top": "#22c55e",        # green
-        "frothy": "#86efac",
-        "mid": "#e5e7eb",        # white
-        "bear": "#fca5a5",
-        "support": "#ef4444",
-        "btc": "#facc15",        # yellow
-        "zone_soft": {
-            "buy":"rgba(239,68,68,0.10)",
-            "bear":"rgba(252,165,165,0.10)",
-            "mid":"rgba(229,231,235,0.06)",
-            "frothy":"rgba(134,239,172,0.10)"
-        }
+    // controls
+    const denomSel = document.getElementById('denom');
+    const slider = document.getElementById('dateSlider');
+    const chkToday = document.getElementById('chkToday');
+    const zoneTxt = document.getElementById('zoneTxt');
+    const zoneDot = document.getElementById('zoneDot');
+    const dateRead = document.getElementById('dateRead');
+
+    // formatters
+    function fmtUSD(v){ return (v==null||!isFinite(v))?"—":"$"+Math.round(v).toLocaleString(); }
+    function fmtOzBTC(v){
+      if (v==null||!isFinite(v)) return "—";
+      const n = Math.round(v*100)/100;
+      return n.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})+" oz/BTC";
+    }
+    function fmtTickGold(v){
+      if (!isFinite(v)||v<=0) return "";
+      if (v>=1) return Math.round(v).toLocaleString();
+      return Number(v).toFixed(3).replace(/\.?0+$/,"");
+    }
+    function monthYear(iso){
+      const d = new Date(iso+"T00:00:00Z");
+      const fmt = new Intl.DateTimeFormat(undefined,{year:"numeric", month:"short", timeZone:"UTC"});
+      return fmt.format(d);
     }
 
-    # Build traces for each denomination as legendgroups: USD, GLD, SPY
-    def band_traces(group, ydict, visible):
-        # zone fills (Support-Bear, Bear-Mid, Mid-Frothy, Frothy-Top)
-        t = []
-        # Support to Bear
-        t += [dict(type="scatter", mode="lines", x=x_full.tolist(), y=ydict["Support"],
-                   line=dict(color="rgba(0,0,0,0)"),
-                   fill=None, name="", hoverinfo="skip",
-                   legendgroup=group, showlegend=False, visible=visible)]
-        t += [dict(type="scatter", mode="lines", x=x_full.tolist(), y=ydict["Bear"],
-                   line=dict(color="rgba(0,0,0,0)"),
-                   fill="tonexty", fillcolor=C["zone_soft"]["buy"], name="",
-                   hoverinfo="skip", legendgroup=group, showlegend=False, visible=visible)]
-        # Bear to Mid
-        t += [dict(type="scatter", mode="lines", x=x_full.tolist(), y=ydict["Mid"],
-                   line=dict(color="rgba(0,0,0,0)"),
-                   fill="tonexty", fillcolor=C["zone_soft"]["bear"], name="",
-                   hoverinfo="skip", legendgroup=group, showlegend=False, visible=visible)]
-        # Mid to Frothy
-        t += [dict(type="scatter", mode="lines", x=x_full.tolist(), y=ydict["Frothy"],
-                   line=dict(color="rgba(0,0,0,0)"),
-                   fill="tonexty", fillcolor=C["zone_soft"]["mid"], name="",
-                   hoverinfo="skip", legendgroup=group, showlegend=False, visible=visible)]
-        # Frothy to Top
-        t += [dict(type="scatter", mode="lines", x=x_full.tolist(), y=ydict["Top"],
-                   line=dict(color="rgba(0,0,0,0)"),
-                   fill="tonexty", fillcolor=C["zone_soft"]["frothy"], name="",
-                   hoverinfo="skip", legendgroup=group, showlegend=False, visible=visible)]
+    // zone helpers
+    function zoneFor(val, bands){
+      if (val==null) return "—";
+      if (val < bands.Support) return "SELL THE HOUSE!!";
+      if (val < bands.Bear)    return "Buy";
+      if (val < bands.Frothy)  return "DCA";
+      if (val < bands.Top)     return "Relax";
+      return "Frothy";
+    }
+    function zoneDotColor(z){
+      switch(z){
+        case "SELL THE HOUSE!!": return "#ffffff";
+        case "Buy":              return "#f97316";
+        case "DCA":              return "#ffffff";
+        case "Relax":            return "#84cc16";
+        case "Frothy":           return "#ef4444";
+        default:                 return "#e5e7eb";
+      }
+    }
 
-        # Band lines (dashed)
-        t += [
-            dict(type="scatter", mode="lines", x=x_full.tolist(), y=ydict["Top"],
-                 line=dict(color=C["top"], dash="dash", width=1.5),
-                 name="Top (+2σ)", legendgroup=group, visible=visible),
-            dict(type="scatter", mode="lines", x=x_full.tolist(), y=ydict["Frothy"],
-                 line=dict(color=C["frothy"], dash="dash", width=1.5),
-                 name="Frothy (+1σ)", legendgroup=group, visible=visible),
-            dict(type="scatter", mode="lines", x=x_full.tolist(), y=ydict["Mid"],
-                 line=dict(color=C["mid"], dash="dash", width=1.5),
-                 name="PL Best Fit (0σ)", legendgroup=group, visible=visible),
-            dict(type="scatter", mode="lines", x=x_full.tolist(), y=ydict["Bear"],
-                 line=dict(color=C["bear"], dash="dash", width=1.5),
-                 name="Bear (-0.75σ)", legendgroup=group, visible=visible),
-            dict(type="scatter", mode="lines", x=x_full.tolist(), y=ydict["Support"],
-                 line=dict(color=C["support"], dash="dash", width=1.5),
-                 name="Support (-1.5σ)", legendgroup=group, visible=visible),
-        ]
-        return t
+    // gold ticks for oz/BTC
+    function setGoldTicks(){
+      const G = ARR.gld;
+      const all = [].concat(G.Support,G.Bear,G.Mid,G.Frothy,G.Top,ARR.hist.gld).filter(v=>v>0&&isFinite(v));
+      if (!all.length) return;
+      const minV = Math.min.apply(null,all), maxV = Math.max.apply(null,all);
+      const c = [0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10,20,50,100,200,500,1000];
+      const ticks = c.filter(v=>v>=minV*0.9 && v<=maxV*1.1);
+      const txt = ticks.map(fmtTickGold);
+      Plotly.relayout(figEl, {"yaxis.tickvals":ticks, "yaxis.ticktext":txt, "yaxis.tickformat":""});
+    }
+    function clearGoldTicks(){
+      Plotly.relayout(figEl, {"yaxis.tickvals":null, "yaxis.ticktext":null, "yaxis.tickformat":"$,d"});
+    }
+
+    // denomination toggle (show only traces in that legendgroup)
+    function setDenom(which){
+      const vis = (FIG.data||[]).map(tr => (tr.legendgroup||"USD") === (which==="USD"?"USD":"GLD"));
+      Plotly.restyle(figEl, {"visible": vis});
+      if (which==="USD"){ Plotly.relayout(figEl, {"yaxis.title.text":"USD / BTC"}); clearGoldTicks(); }
+      else { Plotly.relayout(figEl, {"yaxis.title.text":"Gold oz / BTC"}); setGoldTicks(); }
+      updateMarkerAndReadout(); // redraw marker in correct units
+    }
+
+    // ----- Weekly (Wednesday) slider independent of data gaps
+    const histDatesISO = ARR.hist.dates;
+    const histMs = histDatesISO.map(d=>Date.parse(d+"T00:00:00Z"));
+    const MS_DAY = 86400000;
+    // first Wednesday on/after first data date
+    const firstDate = new Date(histMs[0]);
+    const firstWed = histMs[0] + ((10 - firstDate.getUTCDay()) % 7) * MS_DAY; // Wed=3 → (10-DoW)%7
+    const weeklyIdx = [], weeklyDates = [];
+    for (let t = firstWed; t <= histMs[histMs.length-1]; t += 7*MS_DAY){
+      // nearest index by lower-bound
+      let lo = 0, hi = histMs.length-1, pos = hi;
+      while (lo <= hi){
+        const mid = (lo+hi)>>1;
+        if (histMs[mid] >= t){ pos = mid; hi = mid-1; } else { lo = mid+1; }
+      }
+      let cand = pos;
+      if (pos>0 && Math.abs(histMs[pos-1]-t) <= Math.abs(histMs[pos]-t)) cand = pos-1;
+      weeklyIdx.push(cand);
+      weeklyDates.push(histDatesISO[cand]);
+    }
+    if (weeklyIdx.length===0){ weeklyIdx.push(histDatesISO.length-1); weeklyDates.push(histDatesISO.at(-1)); }
+    slider.max = Math.max(0, weeklyIdx.length-1);
+    slider.value = slider.max;
+
+    function sliderToHistIndex(){
+      const i = Math.max(0, Math.min(parseInt(slider.value,10), weeklyIdx.length-1));
+      return weeklyIdx[i] ?? (histDatesISO.length-1);
+    }
+
+    function colorize(txt, color){ return `<span style="color:${color}">${txt}</span>`; }
+
+    function updateHoverBox(dISO, denom, bands, priceUSD, priceGLD){
+      const head = monthYear(dISO);
+      const rows = [];
+      if (denom==="USD"){
+        rows.push(`<div class="hoverrow"><span>${colorize("Top","#22c55e")}</span><span>${fmtUSD(bands.Top)}</span></div>`);
+        rows.push(`<div class="hoverrow"><span>${colorize("Frothy","rgba(100,255,100,1)")}</span><span>${fmtUSD(bands.Frothy)}</span></div>`);
+        rows.push(`<div class="hoverrow"><span>${colorize("PL Best Fit","#fff")}</span><span>${fmtUSD(bands.Mid)}</span></div>`);
+        rows.push(`<div class="hoverrow"><span>${colorize("Bear","rgba(255,100,100,1)")}</span><span>${fmtUSD(bands.Bear)}</span></div>`);
+        rows.push(`<div class="hoverrow"><span>${colorize("Support","#ef4444")}</span><span>${fmtUSD(bands.Support)}</span></div>`);
+        // price (hide if >6 months after last hist date)
+        if (!ARR.hist.hidePrice) rows.push(`<div class="hoverrow"><span>${colorize("BTC","#fbbf24")}</span><span>${fmtUSD(priceUSD)}</span></div>`);
+      } else {
+        rows.push(`<div class="hoverrow"><span>${colorize("Top","#22c55e")}</span><span>${fmtOzBTC(bands.Top)}</span></div>`);
+        rows.push(`<div class="hoverrow"><span>${colorize("Frothy","rgba(100,255,100,1)")}</span><span>${fmtOzBTC(bands.Frothy)}</span></div>`);
+        rows.push(`<div class="hoverrow"><span>${colorize("PL Best Fit","#fff")}</span><span>${fmtOzBTC(bands.Mid)}</span></div>`);
+        rows.push(`<div class="hoverrow"><span>${colorize("Bear","rgba(255,100,100,1)")}</span><span>${fmtOzBTC(bands.Bear)}</span></div>`);
+        rows.push(`<div class="hoverrow"><span>${colorize("Support","#ef4444")}</span><span>${fmtOzBTC(bands.Support)}</span></div>`);
+        if (!ARR.hist.hidePrice) rows.push(`<div class="hoverrow"><span>${colorize("BTC","#fbbf24")}</span><span>${fmtOzBTC(priceGLD)}</span></div>`);
+      }
+      hoverEl.innerHTML = `<div style="font-weight:700;margin-bottom:6px">${head}</div>${rows.join("")}`;
+      hoverEl.style.display = "block";
+    }
+
+    function readBandsAt(dateISO, denom){
+      const idx = ARR.dates.indexOf(dateISO);
+      if (idx<0) return null;
+      const g = denom==="USD" ? ARR.usd : ARR.gld;
+      return { Support:g.Support[idx], Bear:g.Bear[idx], Mid:g.Mid[idx], Frothy:g.Frothy[idx], Top:g.Top[idx] };
+    }
+
+    function updateMarkerAndReadout(){
+      const j = sliderToHistIndex();
+      const denom = denomSel.value;
+      const dISO = weeklyDates[j];
+      const bands = readBandsAt(dISO, denom);
+      if (!bands){ zoneTxt.textContent="—"; dateRead.textContent=""; return; }
+
+      // determine if hover price should be hidden (> ~6 months after last history)
+      const lastISO = ARR.hist.dates.at(-1);
+      const msLast = Date.parse(lastISO+"T00:00:00Z");
+      const msCur  = Date.parse(dISO+"T00:00:00Z");
+      ARR.hist.hidePrice = (msCur - msLast) > (183*86400000);
+
+      const priceUSD = ARR.hist.usd[j];
+      const priceGLD = ARR.hist.gld[j];
+      const price = (denom==="USD")?priceUSD:priceGLD;
+      const zone = (function(){
+        if (price < bands.Support) return "SELL THE HOUSE!!";
+        if (price < bands.Bear)    return "Buy";
+        if (price < bands.Frothy)  return "DCA";
+        if (price < bands.Top)     return "Relax";
+        return "Frothy";
+      })();
+      zoneTxt.textContent = zone;
+      zoneDot.style.background = (function(z){
+        switch(z){
+          case "SELL THE HOUSE!!": return "#ffffff";
+          case "Buy":              return "#f97316";
+          case "DCA":              return "#ffffff";
+          case "Relax":            return "#84cc16";
+          case "Frothy":           return "#ef4444";
+          default:                 return "#e5e7eb";
+        }
+      })(zone);
+
+      const line = (denom==="USD") ? fmtUSD(priceUSD) : fmtOzBTC(priceGLD);
+      dateRead.innerHTML = `<div style="font-weight:600">${dISO}</div><div>BTC: ${line}</div>`;
+
+      // Move marker
+      const genesis = Date.parse("2009-01-03T00:00:00Z");
+      const dms = Date.parse(dISO+"T00:00:00Z");
+      const days = Math.max(1, Math.round((dms - genesis)/86400000));
+      const xval = Math.log10(days);
+
+      if (denom==="USD"){
+        Plotly.restyle(figEl, {"x":[[xval]], "y":[[priceUSD]]}, [USD_MARK_IDX]);
+      } else {
+        Plotly.restyle(figEl, {"x":[[xval]], "y":[[priceGLD]]}, [GLD_MARK_IDX]);
+      }
+
+      updateHoverBox(dISO, denom, bands, priceUSD, priceGLD);
+    }
+
+    function setDenomAndRefresh(which){
+      denomSel.value = which;
+      setDenom(which);
+    }
+
+    denomSel.addEventListener('change', (e)=> setDenomAndRefresh(e.target.value));
+    slider.addEventListener('input', ()=>{ chkToday.checked=false; updateMarkerAndReadout(); });
+    chkToday.addEventListener('change', (e)=>{ if(e.target.checked){ slider.value = slider.max; updateMarkerAndReadout(); } });
+
+    // Init
+    setDenom("USD");
+    updateMarkerAndReadout();
+    window.addEventListener('resize', ()=> Plotly.Plots.resize(figEl));
+  </script>
+</body>
+</html>
+"""
+
+# ----------------- build figure data -----------------
+def make_power_data_arrays(dates, hist_usd, bands_usd, hist_gld, bands_gld):
+    """
+    Build the Plotly traces (data) and layout for both denominations.
+    We'll use legendgroup = 'USD' or 'GLD' and toggle via JS.
+    """
+    import plotly.graph_objects as go
+
+    # x = log10(days since genesis)
+    days = (pd.to_datetime(dates) - GENESIS).dt.days.to_numpy()
+    days = np.maximum(days, 1)
+    x = np.log10(days).tolist()
 
     data = []
-    # USD group (default visible)
-    data += band_traces("USD", bands_usd, True)
-    data += [dict(type="scatter", mode="lines", x=x_hist.tolist(), y=hist_usd,
-                  line=dict(color=C["btc"], width=2), name="BTC",
-                  legendgroup="USD", visible=True)]
-    # Yellow marker (USD)
-    data += [dict(type="scatter", mode="markers", x=[x_hist[-1]], y=[hist_usd[-1]],
-                  marker=dict(color=C["btc"], size=8), name="",
-                  hoverinfo="skip", legendgroup="USD", visible=True)]
 
-    # GLD group (hidden initially)
-    data += band_traces("GLD", bands_gld, False)
-    data += [dict(type="scatter", mode="lines", x=x_hist.tolist(), y=hist_gld,
-                  line=dict(color=C["btc"], width=2), name="BTC",
-                  legendgroup="GLD", visible=False)]
-    data += [dict(type="scatter", mode="markers", x=[x_hist[-1]], y=[hist_gld[-1]],
-                  marker=dict(color=C["btc"], size=8), name="", hoverinfo="skip",
-                  legendgroup="GLD", visible=False)]
-
-    # SPY group (hidden initially)
-    data += band_traces("SPY", bands_spy, False)
-    data += [dict(type="scatter", mode="lines", x=x_hist.tolist(), y=hist_spy,
-                  line=dict(color=C["btc"], width=2), name="BTC",
-                  legendgroup="SPY", visible=False)]
-    data += [dict(type="scatter", mode="markers", x=[x_hist[-1]], y=[hist_spy[-1]],
-                  marker=dict(color=C["btc"], size=8), name="", hoverinfo="skip",
-                  legendgroup="SPY", visible=False)]
-
-    # Remember indices of the three marker traces (for slider moves)
-    USD_MARK_IDX = len(data) - 6  # marker in USD group
-    GLD_MARK_IDX = len(data) - 4
-    SPY_MARK_IDX = len(data) - 2
-
-    # Halving vertical shapes (by x in log-time)
-    def x_from_date(dt):
-        d = max(1, (pd.Timestamp(dt) - GENESIS).days)
-        return math.log10(d)
-    halvings = halving_dates()
-    halving_shapes = []
-    for d in halvings:
-        x = x_from_date(d)
-        halving_shapes.append(dict(
-            type="line", xref="x", x0=x, x1=x, yref="paper", y0=0, y1=1,
-            line=dict(color="rgba(255,255,255,0.25)", width=1, dash="dot")
+    # helper to add band traces
+    def add_band(group, name, y, color):
+        data.append(go.Scatter(
+            x=x, y=y, name=name, legendgroup=group, visible=True,
+            line=dict(color=color, dash="dash", width=1.5), hoverinfo="skip"
         ))
+
+    # USD bands
+    add_band("USD", "Top (USD)",     bands_usd["Top"],    COLORS["Top"])
+    add_band("USD", "Frothy (USD)",  bands_usd["Frothy"], COLORS["Frothy"])
+    add_band("USD", "PL Best Fit (USD)", bands_usd["Mid"], COLORS["Mid"])
+    add_band("USD", "Bear (USD)",    bands_usd["Bear"],   COLORS["Bear"])
+    add_band("USD", "Support (USD)", bands_usd["Support"],COLORS["Support"])
+
+    # USD price
+    usd_trace = go.Scatter(
+        x=x, y=hist_usd, name="BTC (USD)", legendgroup="USD",
+        line=dict(color=COLORS["BTC"], width=2),
+        hoverinfo="skip"
+    )
+    data.append(usd_trace)
+
+    # marker for USD (single-point scatter; index stored in layout.meta)
+    data.append(go.Scatter(
+        x=[None], y=[None], mode="markers",
+        marker=dict(color=COLORS["BTC"], size=8, line=dict(color="#000", width=1)),
+        name="",
+        legendgroup="USD", hoverinfo="skip"
+    ))
+    usd_mark_idx = len(data) - 1
+
+    # GLD bands
+    add_band("GLD", "Top (Gold)",     bands_gld["Top"],    COLORS["Top"])
+    add_band("GLD", "Frothy (Gold)",  bands_gld["Frothy"], COLORS["Frothy"])
+    add_band("GLD", "PL Best Fit (Gold)", bands_gld["Mid"], COLORS["Mid"])
+    add_band("GLD", "Bear (Gold)",    bands_gld["Bear"],   COLORS["Bear"])
+    add_band("GLD", "Support (Gold)", bands_gld["Support"],COLORS["Support"])
+
+    # GLD price
+    gld_trace = go.Scatter(
+        x=x, y=hist_gld, name="BTC (Gold)", legendgroup="GLD",
+        line=dict(color=COLORS["BTC"], width=2),
+        hoverinfo="skip", visible=True
+    )
+    data.append(gld_trace)
+
+    # marker for GLD
+    data.append(go.Scatter(
+        x=[None], y=[None], mode="markers",
+        marker=dict(color=COLORS["BTC"], size=8, line=dict(color="#000", width=1)),
+        name="",
+        legendgroup="GLD", hoverinfo="skip"
+    ))
+    gld_mark_idx = len(data) - 1
 
     layout = dict(
         template="plotly_dark",
+        font=dict(family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif", size=12),
+        xaxis=dict(title="Year (log-time)", showgrid=True, gridwidth=0.5),
+        yaxis=dict(type="log", title="USD / BTC", tickformat="$,d", showgrid=True, gridwidth=0.5),
+        plot_bgcolor="#111", paper_bgcolor="#111",
         showlegend=True,
-        xaxis=dict(
-            title="Year (log-time)",
-            type="linear",  # log of time already used in x values
-            showgrid=True, gridwidth=0.5,
-        ),
-        yaxis=dict(
-            title="USD / BTC",
-            type="log",
-            showgrid=True, gridwidth=0.5,
-            tickformat="$,d"
-        ),
-        paper_bgcolor="#0f1116",
-        plot_bgcolor="#151821",
-        margin=dict(l=60, r=30, t=40, b=50),
-        shapes=halving_shapes,
-        meta=dict(
-            USD_MARK_IDX=USD_MARK_IDX,
-            GLD_MARK_IDX=GLD_MARK_IDX,
-            SPY_MARK_IDX=SPY_MARK_IDX
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.02),
+        meta=dict(USD_MARK_IDX=usd_mark_idx, GLD_MARK_IDX=gld_mark_idx)
+    )
+
+    fig = dict(data=[tr.to_plotly_json() for tr in data], layout=layout)
+    return fig
+
+# ----------------- main -----------------
+def main():
+    # Load history
+    btc = load_btc()
+    gold = load_gold()
+
+    require_cols(btc, ["Date", "BTC"], "BTC")
+    require_cols(gold, ["Date", "GoldUSD"], "Gold")
+
+    # Merge on Date
+    df = pd.merge(btc, gold, on="Date", how="inner").sort_values("Date").reset_index(drop=True)
+    df = df[df["BTC"] > 0]
+    df = df[df["GoldUSD"] > 0]
+
+    # Derived Gold oz/BTC
+    df["GoldBTC"] = df["GoldUSD"] / df["BTC"]
+
+    # Extend monthly to 2040
+    fut = extend_monthly_dates(df["Date"].iloc[-1], PROJ_END)
+    full_dates = pd.Index(df["Date"].tolist() + fut.tolist())
+
+    # Fit USD
+    usd_price_col = detect_price_col(df, hint="BTC", label="USD/BTC")
+    ms, bs, ss = fit_power(df[["Date", usd_price_col]], price_col=usd_price_col, label="USD/BTC")
+    bands_usd = build_bands_over(full_dates, ms, bs, ss)
+
+    # Fit Gold (oz/BTC)
+    gld_price_col = detect_price_col(df, hint="GoldBTC", label="Gold/BTC")
+    gs, gi, gsig = fit_power(df[["Date", gld_price_col]], price_col=gld_price_col, label="Gold/BTC")
+    bands_gld = build_bands_over(full_dates, gs, gi, gsig)
+
+    # Prepare arrays for JS
+    dates_iso = pd.to_datetime(full_dates).strftime("%Y-%m-%d").tolist()
+    hist_dates_iso = pd.to_datetime(df["Date"]).dt.strftime("%Y-%m-%d").tolist()
+
+    # y-series (full x covers to 2040; historical series are aligned by same x)
+    # For plotting convenience we use the same x for all (log days); y for hist continues with NaN after history
+    # Build hist arrays aligned to full_dates:
+    full_map = {d:i for i,d in enumerate(dates_iso)}
+    hist_idx = [full_map[d] for d in hist_dates_iso]
+    hist_usd = [None]*len(dates_iso)
+    hist_gld = [None]*len(dates_iso)
+    for k, i in enumerate(hist_idx):
+        hist_usd[i] = float(df["BTC"].iloc[k])
+        hist_gld[i] = float(df["GoldBTC"].iloc[k])
+
+    # Build Plotly figure payload
+    fig = make_power_data_arrays(
+        dates_iso,
+        hist_usd, bands_usd,
+        hist_gld, bands_gld
+    )
+
+    # arrays for UI
+    arr = dict(
+        dates = dates_iso,
+        usd = bands_usd,
+        gld = bands_gld,
+        hist = dict(
+            dates = hist_dates_iso,
+            usd   = [float(x) if x is not None else None for x in df["BTC"].tolist()],
+            gld   = [float(x) if x is not None else None for x in df["GoldBTC"].tolist()],
+            hidePrice = False
         )
     )
 
-    FIG = dict(data=data, layout=layout)
-
-    # -------------------- ARR payload for the client --------------------
-    ARR = dict(
-        dates=[d.strftime("%Y-%m-%d") for d in full["Date"]],
-        usd=bands_usd,
-        gld=bands_gld,
-        spy=bands_spy,
-        hist=dict(
-            dates=[d.strftime("%Y-%m-%d") for d in df["Date"]],
-            usd=hist_usd,
-            gld=hist_gld,
-            spy=hist_spy
-        )
-    )
-
-    # -------------------- Emit template --------------------
-    with open(TEMPLATE, "r", encoding="utf-8") as f:
-        html = f.read()
-    html = html.replace("__TITLE__", "BTC Purchase Indicator")
-    html = html.replace("__FIGJSON__", json.dumps(FIG, separators=(",",":")))
-    html = html.replace("__ARRAYS__", json.dumps(ARR, separators=(",",":")))
-
-    os.makedirs(OUTDIR, exist_ok=True)
-    with open(os.path.join(OUTDIR, "index.html"), "w", encoding="utf-8") as f:
+    # write HTML
+    os.makedirs("dist", exist_ok=True)
+    html = HTML_TEMPLATE.replace("__FIGJSON__", json.dumps(fig, separators=(",",":")))
+    html = html.replace("__ARRAYS__", json.dumps(arr, separators=(",",":")))
+    out = os.path.join("dist", "index.html")
+    with open(out, "w", encoding="utf-8") as f:
         f.write(html)
 
-    print(f"[build] rows: {len(df):,}  (BTC/Gold/SPY)")
-    print("[build] wrote dist/index.html")
+    print(f"[build] rows: {len(df):,}  (BTC & Gold)")
+    print(f"[build] wrote {out}")
 
 if __name__ == "__main__":
     main()
