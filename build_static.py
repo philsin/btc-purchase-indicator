@@ -473,7 +473,7 @@ const denomSel = document.getElementById('denomSel');
 const detected = Object.keys(PRECOMP).filter(k => k !== 'USD');
 document.getElementById('denomsDetected').textContent = detected.length ? detected.join(', ') : '(none)';
 ['USD', ...detected].forEach(k => {
-  const opt=document.createElement('option'); opt.value=k; opt.textContent=(k==='USD'?'USD/None':k);
+  const opt=document.createElement('option'); opt.value=k; opt.textContent=(k==='USD'?'USD/None':k),
   denomSel.appendChild(opt);
 });
 
