@@ -1,0 +1,50 @@
+name: build-gh-pages
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: "0 */6 * * *"  # every 6 hours
+
+permissions:
+  contents: write  # needed to push to gh-pages
+
+concurrency:
+  group: "gh-pages"
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements-pages.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
+
+      - name: Install deps
+        run: pip install -r requirements-pages.txt
+
+      - name: Build static site
+        run: |
+          rm -rf dist
+          python build_static.py
+          test -f dist/index.html || (echo "dist/index.html missing" && exit 1)
+
+      - name: Deploy to gh-pages branch
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: dist
+          # makes the branch a single-commit history; avoids stale files
+          force_orphan: true
