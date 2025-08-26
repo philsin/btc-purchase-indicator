@@ -32,7 +32,7 @@ BTC_FILE = os.path.join(DATA_DIR, "btc_usd.csv")
 def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
 
-def fetch_btc_if_missing():
+def _btc_if_missing():
     """Create data/btc_usd.csv using CoinGecko daily prices if file missing."""
     if os.path.exists(BTC_FILE):
         return
@@ -136,7 +136,30 @@ def rgba(hex_color, a):
 
 # ------------------------------ Load / Prepare
 
-fetch_btc_if_missing()  # <-- new: auto-create BTC CSV if missing
+def fetch_btc_if_missing():
+    """Create data/btc_usd.csv if missing, trying CoinGecko Pro (with key) then Blockchain.com Charts."""
+    if os.path.exists(BTC_FILE):
+        return
+    ensure_dir(DATA_DIR)
+    df = None
+    # 1) Try CoinGecko Pro if key present
+    try:
+        if os.environ.get("COINGECKO_API_KEY") or os.environ.get("X_CG_PRO_API_KEY"):
+            df = fetch_btc_from_coingecko()
+    except Exception as e:
+        print(f"[warn] CoinGecko fetch failed: {e}")
+
+    # 2) Fallback to Blockchain.com Charts (no key)
+    if df is None:
+        try:
+            df = fetch_btc_from_blockchain()
+        except Exception as e:
+            raise RuntimeError(
+                "Could not fetch BTC data from CoinGecko (needs API key) or Blockchain.com Charts."
+                f" Last error: {e}"
+            )
+
+    df.to_csv(BTC_FILE, index=False)
 
 btc = load_series_csv(BTC_FILE).rename(columns={"price":"btc"})
 denoms = collect_denominators()
