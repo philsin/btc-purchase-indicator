@@ -174,8 +174,8 @@ def extend_monthly_dates(last_hist_date, end_date=PROJ_END):
 
 def build_bands_over(dates, slope, intercept, sigma):
     """Return dict of band arrays keyed by level name, same length as dates."""
-    days = (pd.to_datetime(dates) - GENESIS).dt.days.to_numpy()
-    days = np.maximum(days, 1)
+    days = (pd.to_datetime(dates) - GENESIS).astype("timedelta64[D]").astype(int)
+    days = np.maximum(days, 1)  # avoid log10(0)
     mid_log = slope * np.log10(days) + intercept
     out = {}
     for name, k in LEVELS.items():
