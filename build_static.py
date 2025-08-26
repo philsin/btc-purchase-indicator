@@ -1,11 +1,11 @@
-#!/usr/bin/env python3 
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
 Static builder for BTC Purchase Indicator (Power-Law bands)
 - Robust loaders with fallbacks & clear errors
-- BTC/USD and Gold oz/BTC denominations
-- Hover panel (fixed), weekly (Wed) slider, Today toggle, denomination toggle
+- BTC/USD and Gold oz/BTC denominations (oz per 1 BTC)
+- Fixed hover panel (bottom-right), weekly (Wed) slider, Today toggle, denomination toggle
 - Outputs a single dist/index.html suitable for GitHub Pages
 """
 
@@ -15,16 +15,16 @@ import numpy as np
 import pandas as pd
 
 # ----------------- constants -----------------
-GENESIS   = pd.Timestamp("2009-01-03")
-PROJ_END  = pd.Timestamp("2040-12-31")
+GENESIS  = pd.Timestamp("2009-01-03")
+PROJ_END = pd.Timestamp("2040-12-31")
 
-# band levels (latest requirements)
+# band levels (your latest)
 LEVELS = {
     "Support": -1.5,
-    "Bear":    -0.75,  # updated per your change
+    "Bear":    -0.75,  # updated
     "Mid":      0.0,
     "Frothy":   1.0,
-    "Top":      2.0,   # updated per your change
+    "Top":      2.0,   # updated
 }
 
 # colors
@@ -37,7 +37,7 @@ COLORS = {
     "BTC":     "#fbbf24",               # amber/yellow
 }
 
-# candidate price column names to look for automatically
+# candidate price column names to auto-detect
 PRICE_CANDIDATES = ["Price", "Close", "Adj Close", "AdjClose", "BTC", "USD", "Value"]
 
 # ----------------- utility -----------------
@@ -52,27 +52,27 @@ def safe_read_csv(url, **kwargs) -> pd.DataFrame:
 
 def detect_price_col(df, hint=None, label="series"):
     """
-    Return a usable price column name from df.
-    Priority:
-      1) explicit `hint` if present
-      2) known PRICE_CANDIDATES in order
-      3) first numeric, non-Date column
+    Choose a usable price column from df:
+      1) explicit hint if present
+      2) known PRICE_CANDIDATES
+      3) first numeric non-Date column
     """
-    if "Date" not in df.columns:
-        raise ValueError(f"{label}: missing 'Date' column. Have: {list(df.columns)}")
+    cols = list(df.columns)
+    if "Date" not in cols:
+        raise ValueError(f"{label}: missing 'Date' column. Have: {cols}")
 
-    if hint and hint in df.columns:
+    if hint and hint in cols:
         return hint
 
     for c in PRICE_CANDIDATES:
-        if c in df.columns:
+        if c in cols:
             return c
 
-    for c in df.columns:
+    for c in cols:
         if c != "Date" and pd.api.types.is_numeric_dtype(df[c]):
             return c
 
-    raise ValueError(f"{label}: could not find a numeric price column in columns {list(df.columns)}")
+    raise ValueError(f"{label}: could not find a numeric price column in {cols}")
 
 def _days_since_genesis(dates_like) -> np.ndarray:
     """
@@ -80,7 +80,6 @@ def _days_since_genesis(dates_like) -> np.ndarray:
     Returns int numpy array of days >= 1.
     """
     td = pd.to_datetime(dates_like) - GENESIS
-    # Avoid unsupported casts: divide by 1-day timedelta
     days = (td.to_numpy() / np.timedelta64(1, "D")).astype(float)
     days = np.maximum(days, 1.0).astype(int)
     return days
@@ -95,9 +94,7 @@ def fit_power(df_price, price_col=None, label="series"):
 
     need = {"Date", price_col}
     if not need.issubset(df_price.columns):
-        raise ValueError(
-            f"{label}: expected columns {sorted(need)}; got {list(df_price.columns)}"
-        )
+        raise ValueError(f"{label}: expected {sorted(need)}; got {list(df_price.columns)}")
 
     days = _days_since_genesis(df_price["Date"])
     X = np.log10(days)
@@ -127,12 +124,11 @@ def _btc_stooq():
     url = "https://stooq.com/q/d/l/?s=btcusd&i=d"
     df = safe_read_csv(url)
     df.columns = [c.lower() for c in df.columns]
-    # find date & close
     date_col  = next(c for c in df.columns if "date" in c)
     price_col = next(c for c in df.columns if c in ("close", "c"))
     out = pd.DataFrame({
-        "Date":  pd.to_datetime(df[date_col], errors="coerce"),
-        "BTC":   pd.to_numeric(df[price_col].astype(str).str.replace(",", ""), errors="coerce"),
+        "Date": pd.to_datetime(df[date_col], errors="coerce"),
+        "BTC":  pd.to_numeric(df[price_col].astype(str).str.replace(",", ""), errors="coerce"),
     })
     return out.dropna().sort_values("Date")
 
@@ -195,7 +191,7 @@ def extend_monthly_dates(last_hist_date, end_date=PROJ_END):
 
 def build_bands_over(dates, slope, intercept, sigma):
     """Return dict of band arrays keyed by level name, same length as dates."""
-    days = _days_since_genesis(dates)  # robust day computation
+    days = _days_since_genesis(dates)
     mid_log = slope * np.log10(days) + intercept
     out = {}
     for name, k in LEVELS.items():
@@ -342,7 +338,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       Plotly.restyle(figEl, {"visible": vis});
       if (which==="USD"){ Plotly.relayout(figEl, {"yaxis.title.text":"USD / BTC"}); clearGoldTicks(); }
       else { Plotly.relayout(figEl, {"yaxis.title.text":"Gold oz / BTC"}); setGoldTicks(); }
-      updateMarkerAndReadout(); // redraw marker in correct units
+      updateMarkerAndReadout();
     }
 
     // ----- Weekly (Wednesday) slider independent of data gaps
@@ -351,7 +347,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     const MS_DAY = 86400000;
     // first Wednesday on/after first data date
     const firstDate = new Date(histMs[0]);
-    const firstWed = histMs[0] + ((10 - firstDate.getUTCDay()) % 7) * MS_DAY; // Wed=3 → (10-DoW)%7
+    const firstWed = histMs[0] + ((10 - firstDate.getUTCDay()) % 7) * MS_DAY; // Wed=3
     const weeklyIdx = [], weeklyDates = [];
     for (let t = firstWed; t <= histMs[histMs.length-1]; t += 7*MS_DAY){
       // nearest index by lower-bound
@@ -412,7 +408,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       const bands = readBandsAt(dISO, denom);
       if (!bands){ zoneTxt.textContent="—"; dateRead.textContent=""; return; }
 
-      // determine if hover price should be hidden (> ~6 months after last history)
+      // hide BTC price in hover >~6 months after last history
       const lastISO = ARR.hist.dates.at(-1);
       const msLast = Date.parse(lastISO+"T00:00:00Z");
       const msCur  = Date.parse(dISO+"T00:00:00Z");
@@ -446,6 +442,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         Plotly.restyle(figEl, {"x":[[xval]], "y":[[priceGLD]]}, [GLD_MARK_IDX]);
       }
 
+      // update hover panel
       updateHoverBox(dISO, denom, bands, priceUSD, priceGLD);
     }
 
@@ -489,48 +486,44 @@ def make_power_data_arrays(dates, hist_usd, bands_usd, hist_gld, bands_gld):
         ))
 
     # USD bands
-    add_band("USD", "Top (USD)",     bands_usd["Top"],    COLORS["Top"])
-    add_band("USD", "Frothy (USD)",  bands_usd["Frothy"], COLORS["Frothy"])
-    add_band("USD", "PL Best Fit (USD)", bands_usd["Mid"], COLORS["Mid"])
-    add_band("USD", "Bear (USD)",    bands_usd["Bear"],   COLORS["Bear"])
-    add_band("USD", "Support (USD)", bands_usd["Support"],COLORS["Support"])
+    add_band("USD", "Top (USD)",        bands_usd["Top"],    COLORS["Top"])
+    add_band("USD", "Frothy (USD)",     bands_usd["Frothy"], COLORS["Frothy"])
+    add_band("USD", "PL Best Fit (USD)",bands_usd["Mid"],    COLORS["Mid"])
+    add_band("USD", "Bear (USD)",       bands_usd["Bear"],   COLORS["Bear"])
+    add_band("USD", "Support (USD)",    bands_usd["Support"],COLORS["Support"])
 
     # USD price
     data.append(go.Scatter(
         x=x, y=hist_usd, name="BTC (USD)", legendgroup="USD",
-        line=dict(color=COLORS["BTC"], width=2),
-        hoverinfo="skip"
+        line=dict(color=COLORS["BTC"], width=2), hoverinfo="skip"
     ))
 
     # marker for USD (single-point scatter; index stored in layout.meta)
     data.append(go.Scatter(
         x=[None], y=[None], mode="markers",
         marker=dict(color=COLORS["BTC"], size=8, line=dict(color="#000", width=1)),
-        name="",
-        legendgroup="USD", hoverinfo="skip"
+        name="", legendgroup="USD", hoverinfo="skip"
     ))
     usd_mark_idx = len(data) - 1
 
     # GLD bands
-    add_band("GLD", "Top (Gold)",     bands_gld["Top"],    COLORS["Top"])
-    add_band("GLD", "Frothy (Gold)",  bands_gld["Frothy"], COLORS["Frothy"])
-    add_band("GLD", "PL Best Fit (Gold)", bands_gld["Mid"], COLORS["Mid"])
-    add_band("GLD", "Bear (Gold)",    bands_gld["Bear"],   COLORS["Bear"])
-    add_band("GLD", "Support (Gold)", bands_gld["Support"],COLORS["Support"])
+    add_band("GLD", "Top (Gold)",        bands_gld["Top"],    COLORS["Top"])
+    add_band("GLD", "Frothy (Gold)",     bands_gld["Frothy"], COLORS["Frothy"])
+    add_band("GLD", "PL Best Fit (Gold)",bands_gld["Mid"],    COLORS["Mid"])
+    add_band("GLD", "Bear (Gold)",       bands_gld["Bear"],   COLORS["Bear"])
+    add_band("GLD", "Support (Gold)",    bands_gld["Support"],COLORS["Support"])
 
     # GLD price (oz/BTC)
     data.append(go.Scatter(
         x=x, y=hist_gld, name="BTC (Gold)", legendgroup="GLD",
-        line=dict(color=COLORS["BTC"], width=2),
-        hoverinfo="skip", visible=True
+        line=dict(color=COLORS["BTC"], width=2), hoverinfo="skip", visible=True
     ))
 
     # marker for GLD
     data.append(go.Scatter(
         x=[None], y=[None], mode="markers",
         marker=dict(color=COLORS["BTC"], size=8, line=dict(color="#000", width=1)),
-        name="",
-        legendgroup="GLD", hoverinfo="skip"
+        name="", legendgroup="GLD", hoverinfo="skip"
     ))
     gld_mark_idx = len(data) - 1
 
@@ -551,36 +544,36 @@ def make_power_data_arrays(dates, hist_usd, bands_usd, hist_gld, bands_gld):
 # ----------------- main -----------------
 def main():
     # Load history
-    btc = load_btc()
-    gold = load_gold()
+    btc  = load_btc()   # cols: Date, BTC (USD)
+    gold = load_gold()  # cols: Date, GoldUSD (USD/oz)
 
     require_cols(btc, ["Date", "BTC"], "BTC")
     require_cols(gold, ["Date", "GoldUSD"], "Gold")
 
     # Merge on Date
     df = pd.merge(btc, gold, on="Date", how="inner").sort_values("Date").reset_index(drop=True)
-    df = df[df["BTC"] > 0]
-    df = df[df["GoldUSD"] > 0]
+    df = df[(df["BTC"] > 0) & (df["GoldUSD"] > 0)]
 
-    # Derived Gold oz/BTC
-    df["GoldBTC"] = df["GoldUSD"] / df["BTC"]
+    # Back-compat: 'Price' alias for legacy code paths (USD)
+    df["Price"] = pd.to_numeric(df["BTC"], errors="coerce")
+
+    # Gold denomination: oz per BTC (BTC/USD divided by Gold USD/oz)
+    df["OzPerBTC"] = df["BTC"] / df["GoldUSD"]
 
     # Extend monthly to 2040
     fut = extend_monthly_dates(df["Date"].iloc[-1], PROJ_END)
     full_dates = pd.Index(df["Date"].tolist() + fut.tolist())
 
-    # Fit USD
-    usd_price_col = detect_price_col(df, hint="BTC", label="USD/BTC")
-    ms, bs, ss = fit_power(df[["Date", usd_price_col]], price_col=usd_price_col, label="USD/BTC")
-    bands_usd = build_bands_over(full_dates, ms, bs, ss)
+    # Fit USD on BTC column
+    ms, bs, ss = fit_power(df[["Date","BTC"]], price_col="BTC", label="USD/BTC")
+    bands_usd  = build_bands_over(full_dates, ms, bs, ss)
 
-    # Fit Gold (oz/BTC)
-    gld_price_col = detect_price_col(df, hint="GoldBTC", label="Gold/BTC")
-    gs, gi, gsig = fit_power(df[["Date", gld_price_col]], price_col=gld_price_col, label="Gold/BTC")
-    bands_gld = build_bands_over(full_dates, gs, gi, gsig)
+    # Fit Gold on OzPerBTC
+    gs, gi, gsig = fit_power(df[["Date","OzPerBTC"]], price_col="OzPerBTC", label="Gold/BTC")
+    bands_gld    = build_bands_over(full_dates, gs, gi, gsig)
 
     # Prepare arrays for JS
-    dates_iso = pd.to_datetime(full_dates).strftime("%Y-%m-%d").tolist()
+    dates_iso      = pd.to_datetime(full_dates).strftime("%Y-%m-%d").tolist()
     hist_dates_iso = pd.to_datetime(df["Date"]).dt.strftime("%Y-%m-%d").tolist()
 
     # Align historical y-series to full x (None after history)
@@ -590,7 +583,7 @@ def main():
     hist_gld_aligned = [None]*len(dates_iso)
     for k, i in enumerate(hist_idx):
         hist_usd_aligned[i] = float(df["BTC"].iloc[k])
-        hist_gld_aligned[i] = float(df["GoldBTC"].iloc[k])
+        hist_gld_aligned[i] = float(df["OzPerBTC"].iloc[k])
 
     # Build Plotly figure payload
     fig = make_power_data_arrays(
@@ -607,7 +600,7 @@ def main():
         hist = dict(
             dates = hist_dates_iso,
             usd   = [float(x) for x in df["BTC"].tolist()],
-            gld   = [float(x) for x in df["GoldBTC"].tolist()],
+            gld   = [float(x) for x in df["OzPerBTC"].tolist()],
             hidePrice = False
         )
     )
