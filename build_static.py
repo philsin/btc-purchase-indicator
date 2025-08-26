@@ -316,7 +316,9 @@ def add_band(pair_key, ql, qh):
                              line=dict(width=0.5, color=BAND_COLORS[ql]),
                              hoverinfo="skip", showlegend=False,
                              fill="tonexty", fillcolor=rgba(BAND_COLORS[qh], 0.18)))
-    vis_norm += [True, True]; vis_cmp += [False, False]
+    # was: vis_norm += [True, True]; vis_cmp += [False, False]
+    vis_norm.extend([True, True])
+    vis_cmp.extend([False, False])
 
 add_band("0.3-0.5",0.3,0.5); add_band("0.5-0.7",0.5,0.7); add_band("0.1-0.3",0.1,0.3); add_band("0.7-0.9",0.7,0.9)
 
@@ -573,7 +575,7 @@ document.getElementById('copyBtn').addEventListener('click', async ()=>{
 </html>
 """)
 
-html = html_tpl.substitute(
+html = html_tpl.safe_substitute(
     PLOT_HTML=plot_html,
     PRECOMP_JSON=precomp_json,
     BAND_COLORS_JS=band_colors_js,
