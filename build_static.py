@@ -3,21 +3,22 @@
 BTC Purchase Indicator — Bitbo-style plot with right-side panel & copy-to-clipboard
 
 - Data autoload (BTC): CoinGecko Pro (if COINGECKO_API_KEY) else Blockchain.com Charts.
-- Optional denominators from CSV: data/denominator_*.csv with columns: date,price
-- Start date: 2011-01-01; extend quantile bands to 2040-12-31
-- Axes: x = log(days since start) with YEAR ticks only (angled), y = log value
-  * y shows a faux bottom tick label "0", then 1, 10, 100... with comma separators
+- Optional denominators: data/denominator_*.csv with columns: date,price
+- Start at 2011-01-01; extend quantile bands to 2040-12-31
+- Axes: x = log(days since start) with YEAR ticks only (angled), y = log
+  * y shows a faux "0" tick label (at a tiny >0) then 1, 10, 100… with comma separators
   * y-axis title: "BTC / <DENOMINATOR>"
-- Right panel: bold date on top, color-coded values per band, main value with commas
-- Legend fixed on right; compare-mode preserved (rebased)
-- Denominator selector (HTML <select>) updates figure + panel
-- Copy Snapshot copies chart + panel; iOS/Safari fallback opens PNG
-- Bands enforced non-crossing + slight gap to avoid touching
+- Right panel: bold date on top; band values colored to match; main value with commas
+- Legend fixed on the right; Compare mode preserved (rebased)
+- Denominator <select> updates chart + panel
+- Copy Snapshot copies chart+panel; on iOS/Safari it opens a PNG fallback
+- Bands enforced non-crossing + soft gap so they don't touch
 """
 
 import os, io, glob, time, math, json
-from typing import Optional, Dict, Tuple, List
+from typing import Optional, Dict, Tuple
 from datetime import datetime, timedelta, timezone
+from string import Template
 
 import numpy as np
 import pandas as pd
@@ -57,7 +58,7 @@ BAND_NAMES = {
 # band fill order (inner → outer)
 BAND_PAIRS = [(0.3, 0.5), (0.5, 0.7), (0.1, 0.3), (0.7, 0.9)]
 
-# minimum *log-space* separation between adjacent quantile curves (soft, to avoid visual touching)
+# minimum *log-space* separation between adjacent quantile curves (soft gap)
 MIN_GAP_LOG10 = 1e-3  # ~0.23% spacing
 
 # ---------------------------- UTILS -----------------------------
@@ -157,7 +158,7 @@ def days_since_start(dates: pd.Series, start: datetime) -> pd.Series:
     return (dates - start).dt.days.astype(float) + 1.0  # avoid log(0)
 
 def make_year_ticks(start: datetime, end: datetime):
-    # whole-year ticks (Jan 1) -> x_days + label = year
+    # whole-year ticks (Jan 1)
     vals=[]; labs=[]
     year = start.year
     if start.month>1 or start.day>1: year += 1
@@ -186,25 +187,20 @@ def fit_quantile_params(x: np.ndarray, y: np.ndarray, qs=QUANTILES) -> Dict[floa
 
 def predict_grid(params: Dict[float,Tuple[float,float]], x_grid: np.ndarray,
                  enforce=True, min_gap_log10=MIN_GAP_LOG10) -> Dict[float,np.ndarray]:
-    # predict each quantile on x_grid
     preds={}
     lx=np.log10(x_grid)
     for q,(a,b) in params.items():
         z=a+b*lx
         preds[q]=10**z
-
     if not enforce: return preds
 
     # enforce non-crossing + soft spacing in log-space
-    # at each x index, make q10<=q30<=... and separate by min_gap_log10
     qs=sorted(preds.keys())
     if not qs: return preds
-    mat=np.vstack([np.log10(preds[q]) for q in qs])  # shape (nq, n)
+    mat=np.vstack([np.log10(preds[q]) for q in qs])  # (nq, n)
     for j in range(mat.shape[1]):
-        # isotonic-like pass
         for i in range(1, mat.shape[0]):
             mat[i,j] = max(mat[i,j], mat[i-1,j] + min_gap_log10)
-    # back to linear
     for i,q in enumerate(qs):
         preds[q]=10**mat[i,:]
     return preds
@@ -222,9 +218,8 @@ def rebase_to_one(s: pd.Series) -> pd.Series:
     if s.empty or s.iloc[0]<=0: return pd.Series(s)*np.nan
     return pd.Series(s)/s.iloc[0]
 
-def classify_band(y_last: float, x_last: float, params: Dict[float,Tuple[float,float]]) -> Tuple[str,float,str]:
-    qs_sorted=sorted(params.keys())
-    if len(qs_sorted)<5: return "N/A",0.0,"#222"
+def classify_band(y_last: float, x_last: float, params: Dict[float,Tuple[float,float]]):
+    if len(params)<5: return "N/A",0.0,"#222"
     def pred(q): a,b=params[q]; return 10**(a+b*math.log10(x_last))
     q10,q30,q50,q70,q90 = (pred(0.1), pred(0.3), pred(0.5), pred(0.7), pred(0.9))
     if y_last < q10:   return BAND_NAMES[0.1], 0.05, BAND_COLORS[0.1]
@@ -264,15 +259,14 @@ def build_payload(denom_key: Optional[str]):
     params = fit_quantile_params(x_vals, y_main.values, QUANTILES)
     preds  = predict_grid(params, x_grid, enforce=True, min_gap_log10=MIN_GAP_LOG10)
 
-    # band classification at last point
     valid_idx = np.where(np.isfinite(y_main.values))[0]
     last_idx  = int(valid_idx[-1])
     x_last    = float(base["x_days"].iloc[last_idx])
     y_last    = float(y_main.iloc[last_idx])
     band_txt, p_est, color = classify_band(y_last, x_last, params)
 
-    payload = {
-        "label": y_label,          # e.g., "BTC / USD"
+    return {
+        "label": y_label,
         "x_main": base["x_days"].tolist(),
         "y_main": y_main.tolist(),
         "x_grid": x_grid.tolist(),
@@ -291,7 +285,6 @@ def build_payload(denom_key: Optional[str]):
         "denom_rebased": rebase_to_one(denom_series).tolist() if denom_series is not None else [math.nan]*len(base),
         "band_label": band_txt, "percentile": p_est, "line_color": color,
     }
-    return payload
 
 PRECOMP = {"USD": build_payload(None)}
 for k in sorted(denoms.keys()):
@@ -304,7 +297,7 @@ init = PRECOMP["USD"]
 # traces (fixed order: 0..15)
 traces=[]; vis_norm=[]; vis_cmp=[]
 
-# 0..4 quantile lines on extended grid (no hover; right panel handles it)
+# 0..4 quantile lines
 for q in Q_ORDER:
     traces.append(go.Scatter(
         x=init["x_grid"], y=init["q_lines"][str(q)], mode="lines",
@@ -344,14 +337,19 @@ fig = go.Figure(data=traces)
 
 # X ticks: whole years (angled)
 xtickvals, xticktext = make_year_ticks(start_date, END_PROJ)
-# Y ticks: faux "0" then powers of 10 with comma separators
+
+# Y ticks: faux "0" + powers of 10 with commas
 def make_y_ticks(max_y: float):
     exp_max = int(math.ceil(math.log10(max(1.0, max_y))))
     vals=[1e-8] + [10**e for e in range(0, exp_max+1)]
-    texts=["0"] + [f"{int(v):,}" for v in [10**e for e in range(0, exp_max+1)]]
+    texts=["0"] + [f"{int(10**e):,}" for e in range(0, exp_max+1)]
     return vals, texts
 
-y_max = max(np.nanmax(init["y_main"]), *(np.nanmax(init["q_lines"][str(q)]) if len(init["q_lines"][str(q)]) else 1.0 for q in Q_ORDER))
+y_candidates = [np.nanmax(init["y_main"])]
+for q in Q_ORDER:
+    arr = init["q_lines"][str(q)]
+    if len(arr): y_candidates.append(np.nanmax(arr))
+y_max = max(y_candidates)
 ytickvals, yticktext = make_y_ticks(y_max)
 
 fig.update_layout(
@@ -366,7 +364,7 @@ fig.update_layout(
     ),
     yaxis=dict(
         type="log",
-        title=init["label"],  # already "BTC / <DENOM>"
+        title=init["label"],  # "BTC / <DENOM>"
         tickmode="array", tickvals=ytickvals, ticktext=yticktext
     ),
     legend=dict(x=1.02, xanchor="left", y=1.0, yanchor="top", bgcolor="rgba(255,255,255,0.0)"),
@@ -398,44 +396,44 @@ band_names_js  = json.dumps(BAND_NAMES)
 xgrid_json     = json.dumps(init["x_grid"])
 start_iso      = start_date.strftime("%Y-%m-%d")
 
-html = f"""<!DOCTYPE html>
+html_tpl = Template(r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>BTC Purchase Indicator</title>
 <style>
-  :root {{ --panelW: 320px; }}
-  body {{ font-family: Inter, Roboto, -apple-system, Segoe UI, Arial, sans-serif; margin: 0; }}
-  .layout {{
+  :root { --panelW: 320px; }
+  body { font-family: Inter, Roboto, -apple-system, Segoe UI, Arial, sans-serif; margin: 0; }
+  .layout {
     display: grid;
     grid-template-columns: 1fr var(--panelW);
     height: 100vh;
-  }}
-  .left {{ padding: 8px 0 8px 8px; }}
-  .right {{
+  }
+  .left { padding: 8px 0 8px 8px; }
+  .right {
     border-left: 1px solid #e5e7eb; padding: 12px; display: flex; flex-direction: column; gap: 12px;
-  }}
-  #readout {{ border:1px solid #e5e7eb; border-radius:12px; padding:12px; background:#fafafa; font-size:14px; }}
-  #readout .date {{ font-weight:700; margin-bottom:6px; }}
-  #controls select, #controls button {{
+  }
+  #readout { border:1px solid #e5e7eb; border-radius:12px; padding:12px; background:#fafafa; font-size:14px; }
+  #readout .date { font-weight:700; margin-bottom:6px; }
+  #controls select, #controls button {
     font-size:14px; padding:8px 10px; border-radius:8px; border:1px solid #d1d5db; background:white;
-  }}
-  #copyBtn {{ cursor:pointer; }}
-  /* Hide Plotly hover popups (we use the side panel) */
-  .hoverlayer {{ display:none !important; }}
+  }
+  #copyBtn { cursor:pointer; }
+  /* Hide Plotly hover popups */
+  .hoverlayer { display:none !important; }
 
   /* Mobile (Safari-friendly) */
-  @media (max-width: 900px) {{
-    .layout {{ grid-template-columns: 1fr; height: auto; }}
-    .right {{ border-left:none; border-top:1px solid #e5e7eb; }}
-    .left .js-plotly-plot {{ max-width: 100vw; }}
-  }}
+  @media (max-width: 900px) {
+    .layout { grid-template-columns: 1fr; height: auto; }
+    .right { border-left:none; border-top:1px solid #e5e7eb; }
+    .left .js-plotly-plot { max-width: 100vw; }
+  }
 </style>
 </head>
 <body>
 <div id="capture" class="layout">
-  <div class="left">{plot_html}</div>
+  <div class="left">$PLOT_HTML</div>
   <div class="right">
     <div id="controls" style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
       <label for="denomSel"><b>Denominator:</b></label>
@@ -448,42 +446,42 @@ html = f"""<!DOCTYPE html>
     <div id="readout">
       <div class="date">—</div>
       <div id="bands">
-        <div><span style="color:{BAND_COLORS[0.1]};">q10</span>: <span id="q10">—</span> <em>({BAND_NAMES[0.1]})</em></div>
-        <div><span style="color:{BAND_COLORS[0.3]};">q30</span>: <span id="q30">—</span> <em>({BAND_NAMES[0.3]})</em></div>
-        <div><span style="color:{BAND_COLORS[0.5]};">q50</span>: <span id="q50">—</span> <em>({BAND_NAMES[0.5]})</em></div>
-        <div><span style="color:{BAND_COLORS[0.7]};">q70</span>: <span id="q70">—</span> <em>({BAND_NAMES[0.7]})</em></div>
-        <div><span style="color:{BAND_COLORS[0.9]};">q90</span>: <span id="q90">—</span> <em>({BAND_NAMES[0.9]})</em></div>
+        <div><span style="color:$COL_10;">q10</span>: <span id="q10">—</span> <em>(Bottom 10%)</em></div>
+        <div><span style="color:$COL_30;">q30</span>: <span id="q30">—</span> <em>(10–30%)</em></div>
+        <div><span style="color:$COL_50;">q50</span>: <span id="q50">—</span> <em>(30–50%)</em></div>
+        <div><span style="color:$COL_70;">q70</span>: <span id="q70">—</span> <em>(50–70%)</em></div>
+        <div><span style="color:$COL_90;">q90</span>: <span id="q90">—</span> <em>(70–90%)</em></div>
       </div>
       <div style="margin-top:8px;"><b>Main:</b> <span id="mainVal">—</span></div>
-      <div><b>Band:</b> <span id="bandLbl">{init['band_label']}</span> <span style="color:#6b7280;">(p≈{init['percentile']:.2f})</span></div>
+      <div><b>Band:</b> <span id="bandLbl">$INIT_BAND</span> <span style="color:#6b7280;">(p≈$INIT_PCT)</span></div>
     </div>
   </div>
 </div>
 
 <script src="https://unpkg.com/html-to-image@1.11.11/dist/html-to-image.umd.js"></script>
 <script>
-const PRECOMP      = {json.dumps(PRECOMP)};
-const BAND_COLORS  = {band_colors_js};
-const BAND_NAMES   = {band_names_js};
-const XGRID        = {xgrid_json};
-const START_ISO    = "{start_iso}";
+const PRECOMP      = $PRECOMP_JSON;
+const BAND_COLORS  = $BAND_COLORS_JS;
+const BAND_NAMES   = $BAND_NAMES_JS;
+const XGRID        = $XGRID_JSON;
+const START_ISO    = "$START_ISO";
 
 // Build denominator selector
 const denomSel = document.getElementById('denomSel');
 const detected = Object.keys(PRECOMP).filter(k => k !== 'USD');
 document.getElementById('denomsDetected').textContent = detected.length ? detected.join(', ') : '(none)';
 ['USD', ...detected].forEach(k => {
-  const opt=document.createElement('option'); opt.value=k; opt.textContent=(k==='USD'?'USD/None':k),
+  const opt = document.createElement('option');
+  opt.value = k;
+  opt.textContent = (k === 'USD') ? 'USD/None' : k;
   denomSel.appendChild(opt);
 });
 
 // helpers
 function numFmt(v){
   if(!isFinite(v)) return '—';
-  // Comma formatting for USD-like magnitudes
   if (v >= 1000) return Number(v).toLocaleString(undefined, {maximumFractionDigits: 2});
-  if (v >= 1) return Number(v).toLocaleString(undefined, {maximumFractionDigits: 6});
-  // small values
+  if (v >= 1)    return Number(v).toLocaleString(undefined, {maximumFractionDigits: 6});
   return Number(v).toExponential(2);
 }
 function dateFromX(x){
@@ -573,7 +571,23 @@ document.getElementById('copyBtn').addEventListener('click', async ()=>{
 </script>
 </body>
 </html>
-"""
+""")
+
+html = html_tpl.substitute(
+    PLOT_HTML=plot_html,
+    PRECOMP_JSON=precomp_json,
+    BAND_COLORS_JS=band_colors_js,
+    BAND_NAMES_JS=band_names_js,
+    XGRID_JSON=xgrid_json,
+    START_ISO=start_iso,
+    COL_10=BAND_COLORS[0.1],
+    COL_30=BAND_COLORS[0.3],
+    COL_50=BAND_COLORS[0.5],
+    COL_70=BAND_COLORS[0.7],
+    COL_90=BAND_COLORS[0.9],
+    INIT_BAND=init["band_label"],
+    INIT_PCT=f"{init['percentile']:.2f}",
+)
 
 with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
     f.write(html)
