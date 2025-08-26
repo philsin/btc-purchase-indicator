@@ -1,4 +1,4 @@
-name: build-gh-pages
+name: build-gh-pages 
 
 on:
   workflow_dispatch:
