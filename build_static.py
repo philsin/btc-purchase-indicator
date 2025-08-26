@@ -1,4 +1,4 @@
-#!/usr/bin/env python3 
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
@@ -8,7 +8,7 @@ Static builder for BTC Purchase Indicator (Power-Law bands)
 - Outputs a single dist/index.html file
 """
 
-import os, io, json, math, textwrap
+import os, json
 from datetime import datetime
 import numpy as np
 import pandas as pd
@@ -16,7 +16,6 @@ import pandas as pd
 # ----------------- constants -----------------
 GENESIS   = pd.Timestamp("2009-01-03")
 PROJ_END  = pd.Timestamp("2040-12-31")
-UA        = {"User-Agent": "btc-pl-static/1.0"}
 
 # band levels (latest requirements)
 LEVELS = {
@@ -65,6 +64,17 @@ def detect_price_col(df, hint=None, label="series"):
 
     raise ValueError(f"{label}: could not find a numeric price column in columns {list(df.columns)}")
 
+def _days_since_genesis(dates_like) -> np.ndarray:
+    """
+    Robust day counts for Series, DatetimeIndex, list[str], etc.
+    Returns int numpy array of days >= 1.
+    """
+    td = pd.to_datetime(dates_like) - GENESIS
+    # Pandas doesn't support astype('timedelta64[D]'); divide by 1 day instead:
+    days = (td.to_numpy() / np.timedelta64(1, "D")).astype(float)
+    days = np.maximum(days, 1.0).astype(int)
+    return days
+
 def fit_power(df_price, price_col=None, label="series"):
     """
     Log-log linear fit on (days since GENESIS, price).
@@ -80,8 +90,7 @@ def fit_power(df_price, price_col=None, label="series"):
             f"{label}: expected columns {sorted(need)}; got {list(df_price.columns)}"
         )
 
-    days = (pd.to_datetime(df_price["Date"]) - GENESIS).dt.days.to_numpy()
-    days = np.maximum(days, 1)  # avoid log10(0)
+    days = _days_since_genesis(df_price["Date"])
     X = np.log10(days)
 
     y_raw = pd.to_numeric(df_price[price_col], errors="coerce").to_numpy()
@@ -143,8 +152,8 @@ def _gold_stooq():
     date_col  = next(c for c in df.columns if "date" in c)
     price_col = next(c for c in df.columns if c in ("close", "c"))
     out = pd.DataFrame({
-        "Date":  pd.to_datetime(df[date_col], errors="coerce"),
-        "GoldUSD": pd.to_numeric(df[price_col].astype(str).str.replace(",",""), errors="coerce"),
+        "Date":   pd.to_datetime(df[date_col], errors="coerce"),
+        "GoldUSD": pd.to_numeric(df[price_col].astype(str).str_replace(",",""), errors="coerce"),
     })
     return out.dropna().sort_values("Date")
 
@@ -174,15 +183,14 @@ def extend_monthly_dates(last_hist_date, end_date=PROJ_END):
 
 def build_bands_over(dates, slope, intercept, sigma):
     """Return dict of band arrays keyed by level name, same length as dates."""
-    days = (pd.to_datetime(dates) - GENESIS).astype("timedelta64[D]").astype(int)
-    days = np.maximum(days, 1)  # avoid log10(0)
+    days = _days_since_genesis(dates)  # FIXED: robust day computation (no .dt / no 'D' casting)
     mid_log = slope * np.log10(days) + intercept
     out = {}
     for name, k in LEVELS.items():
         out[name] = (10 ** (mid_log + sigma * k)).tolist()
     return out
 
-# ----------------- HTML template (no f-string braces conflicts) -----------------
+# ----------------- HTML template -----------------
 HTML_TEMPLATE = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -365,7 +373,6 @@ HTML_TEMPLATE = r"""<!doctype html>
         rows.push(`<div class="hoverrow"><span>${colorize("PL Best Fit","#fff")}</span><span>${fmtUSD(bands.Mid)}</span></div>`);
         rows.push(`<div class="hoverrow"><span>${colorize("Bear","rgba(255,100,100,1)")}</span><span>${fmtUSD(bands.Bear)}</span></div>`);
         rows.push(`<div class="hoverrow"><span>${colorize("Support","#ef4444")}</span><span>${fmtUSD(bands.Support)}</span></div>`);
-        // price (hide if >6 months after last hist date)
         if (!ARR.hist.hidePrice) rows.push(`<div class="hoverrow"><span>${colorize("BTC","#fbbf24")}</span><span>${fmtUSD(priceUSD)}</span></div>`);
       } else {
         rows.push(`<div class="hoverrow"><span>${colorize("Top","#22c55e")}</span><span>${fmtOzBTC(bands.Top)}</span></div>`);
@@ -410,16 +417,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         return "Frothy";
       })();
       zoneTxt.textContent = zone;
-      zoneDot.style.background = (function(z){
-        switch(z){
-          case "SELL THE HOUSE!!": return "#ffffff";
-          case "Buy":              return "#f97316";
-          case "DCA":              return "#ffffff";
-          case "Relax":            return "#84cc16";
-          case "Frothy":           return "#ef4444";
-          default:                 return "#e5e7eb";
-        }
-      })(zone);
+      zoneDot.style.background = zoneDotColor(zone);
 
       const line = (denom==="USD") ? fmtUSD(priceUSD) : fmtOzBTC(priceGLD);
       dateRead.innerHTML = `<div style="font-weight:600">${dISO}</div><div>BTC: ${line}</div>`;
@@ -466,8 +464,7 @@ def make_power_data_arrays(dates, hist_usd, bands_usd, hist_gld, bands_gld):
     import plotly.graph_objects as go
 
     # x = log10(days since genesis)
-    days = (pd.to_datetime(dates) - GENESIS).dt.days.to_numpy()
-    days = np.maximum(days, 1)
+    days = _days_since_genesis(dates)
     x = np.log10(days).tolist()
 
     data = []
@@ -487,12 +484,11 @@ def make_power_data_arrays(dates, hist_usd, bands_usd, hist_gld, bands_gld):
     add_band("USD", "Support (USD)", bands_usd["Support"],COLORS["Support"])
 
     # USD price
-    usd_trace = go.Scatter(
+    data.append(go.Scatter(
         x=x, y=hist_usd, name="BTC (USD)", legendgroup="USD",
         line=dict(color=COLORS["BTC"], width=2),
         hoverinfo="skip"
-    )
-    data.append(usd_trace)
+    ))
 
     # marker for USD (single-point scatter; index stored in layout.meta)
     data.append(go.Scatter(
@@ -511,12 +507,11 @@ def make_power_data_arrays(dates, hist_usd, bands_usd, hist_gld, bands_gld):
     add_band("GLD", "Support (Gold)", bands_gld["Support"],COLORS["Support"])
 
     # GLD price
-    gld_trace = go.Scatter(
+    data.append(go.Scatter(
         x=x, y=hist_gld, name="BTC (Gold)", legendgroup="GLD",
         line=dict(color=COLORS["BTC"], width=2),
         hoverinfo="skip", visible=True
-    )
-    data.append(gld_trace)
+    ))
 
     # marker for GLD
     data.append(go.Scatter(
@@ -576,22 +571,20 @@ def main():
     dates_iso = pd.to_datetime(full_dates).strftime("%Y-%m-%d").tolist()
     hist_dates_iso = pd.to_datetime(df["Date"]).dt.strftime("%Y-%m-%d").tolist()
 
-    # y-series (full x covers to 2040; historical series are aligned by same x)
-    # For plotting convenience we use the same x for all (log days); y for hist continues with NaN after history
-    # Build hist arrays aligned to full_dates:
+    # Align historical y-series to full x (None after history)
     full_map = {d:i for i,d in enumerate(dates_iso)}
     hist_idx = [full_map[d] for d in hist_dates_iso]
-    hist_usd = [None]*len(dates_iso)
-    hist_gld = [None]*len(dates_iso)
+    hist_usd_aligned = [None]*len(dates_iso)
+    hist_gld_aligned = [None]*len(dates_iso)
     for k, i in enumerate(hist_idx):
-        hist_usd[i] = float(df["BTC"].iloc[k])
-        hist_gld[i] = float(df["GoldBTC"].iloc[k])
+        hist_usd_aligned[i] = float(df["BTC"].iloc[k])
+        hist_gld_aligned[i] = float(df["GoldBTC"].iloc[k])
 
     # Build Plotly figure payload
     fig = make_power_data_arrays(
         dates_iso,
-        hist_usd, bands_usd,
-        hist_gld, bands_gld
+        hist_usd_aligned, bands_usd,
+        hist_gld_aligned, bands_gld
     )
 
     # arrays for UI
@@ -601,8 +594,8 @@ def main():
         gld = bands_gld,
         hist = dict(
             dates = hist_dates_iso,
-            usd   = [float(x) if x is not None else None for x in df["BTC"].tolist()],
-            gld   = [float(x) if x is not None else None for x in df["GoldBTC"].tolist()],
+            usd   = [float(x) for x in df["BTC"].tolist()],
+            gld   = [float(x) for x in df["GoldBTC"].tolist()],
             hidePrice = False
         )
     )
