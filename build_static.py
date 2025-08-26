@@ -1,336 +1,336 @@
-# build_static.py · BTC Purchase Indicator (static build)
-# --------------------------------------------------------
-# Outputs: ./dist/index.html (uses template.html)
-# Data sources: Stooq BTC & Gold (public daily CSVs)
-#
-# How to run:
-#   python build_static.py
-#
-# Key design:
-# - X axis is log10(days since Genesis), matching your power-law view.
-# - Bands are fit in USD space, then converted to Gold oz/BTC by dividing by gold price.
-# - "Gold" denomination = Gold oz / BTC = (BTCUSD / GoldUSD).
-# - Hover panel hides BTC row when the selected date is > 6 months past last historical day.
-#
-# Edit points you'll most likely tweak in the future:
-#  (A) Sigma levels (Support/Bear/Mid/Frothy/Top)
-#  (B) How far projections go (PROJ_END)
-#  (C) Styling: names, colors, dash, widths
-#
-# --------------------------------------------------------
-
-import os, json, math, io
-from datetime import datetime, timezone
-import numpy as np
+# build_static.py  — builds dist/index.html with FIG & ARR JSON for template
+import os, json, math, io, sys
+from datetime import datetime, timedelta
 import pandas as pd
-import plotly.graph_objects as go
+import numpy as np
 
-# ------------------ Parameters you can safely tweak ------------------
+OUTDIR = "dist"
+TEMPLATE = "template.html"
 
-GENESIS = pd.Timestamp("2009-01-03", tz="UTC")
-PROJ_END = pd.Timestamp("2040-12-31", tz="UTC")
+GENESIS = pd.Timestamp("2009-01-03")
+PROJ_END = pd.Timestamp("2040-12-31")
+FD_SUPPLY = 21_000_000  # not used here; price-only bands (denom handled later)
 
-# (A) Sigma levels (legend names are applied in the template)
-LEVELS = {
-    "Support":    -1.5,
-    "Bear":       -0.75,   # << updated as requested
-    "PL Best Fit": 0.0,
-    "Frothy":     +1.0,
-    "Top":        +2.0,    # << Top at +2σ
-}
-
-COLORS = {
-    "Support":    "red",
-    "Bear":       "rgba(255,100,100,1)",
-    "PL Best Fit":"white",
-    "Frothy":     "rgba(100,255,100,1)",
-    "Top":        "green",
-    "BTC":        "gold",
-}
-
-LINE_DASH = {
-    "Support":    "dash",
-    "Bear":       "dash",
-    "PL Best Fit":"dash",
-    "Frothy":     "dash",
-    "Top":        "dash",
-    "BTC":        "solid",
-}
-
-# Fallback sigma floor so bands never collapse visually
-SIGMA_FLOOR = 0.25
-
-# --------------------------------------------------------------------
-
-
-def _read_csv(url: str, date_col_guess=("Date", "date")) -> pd.DataFrame:
+# -------------------- Data loaders (Stooq + fallbacks) --------------------
+def _read_stooq_csv(url, date_col="Date", price_col="Close"):
     df = pd.read_csv(url)
-    # normalize column names
-    df.columns = [c.lower() for c in df.columns]
-    # find date column
-    date_col = None
-    for dc in date_col_guess:
-        if dc.lower() in df.columns:
-            date_col = dc.lower()
-            break
-    if date_col is None:
-        # try best guess
-        for c in df.columns:
-            if "date" in c:
-                date_col = c
-                break
-    if date_col is None:
-        raise RuntimeError("No date column found for CSV at " + url)
-    # standardize
-    df = df.rename(columns={date_col: "date"})
-    df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
-    return df.dropna(subset=["date"]).sort_values("date")
+    cols = [c.lower() for c in df.columns]
+    dcol = [c for c in df.columns if "date" in c.lower()][0]
+    pcol = [c for c in df.columns if ("close" in c.lower()) or ("price" in c.lower())][0]
+    df = df.rename(columns={dcol: "Date", pcol: "Price"})
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["Price"] = pd.to_numeric(
+        df["Price"].astype(str).str.replace(",", ""), errors="coerce"
+    )
+    df = df.dropna().sort_values("Date")
+    return df[["Date", "Price"]]
 
+def load_btc():
+    # BTC from Stooq
+    return _read_stooq_csv("https://stooq.com/q/d/l/?s=btcusd&i=d")
 
-def fetch_btc_daily() -> pd.DataFrame:
-    # Stooq BTC/USD daily
-    url = "https://stooq.com/q/d/l/?s=btcusd&i=d"
-    df = _read_csv(url)
-    # price column (stooq uses 'close')
-    price_col = None
-    for c in df.columns:
-        if "close" in c or "price" in c:
-            price_col = c
-            break
-    if price_col is None:
-        raise RuntimeError("No price/close column found in BTC CSV")
-    df = df.rename(columns={price_col: "btc"})
-    df["btc"] = pd.to_numeric(df["btc"].astype(str).str.replace(",", ""), errors="coerce")
-    return df.dropna(subset=["btc"])[["date", "btc"]]
+def load_gold():
+    # Gold (XAUUSD) from Stooq
+    return _read_stooq_csv("https://stooq.com/q/d/l/?s=xauusd&i=d")
 
+def load_spy():
+    # SPY ETF from Stooq (USD)
+    return _read_stooq_csv("https://stooq.com/q/d/l/?s=spy.us&i=d")
 
-def fetch_gold_daily() -> pd.DataFrame:
-    # Stooq XAU/USD daily
-    url = "https://stooq.com/q/d/l/?s=xauusd&i=d"
-    df = _read_csv(url)
-    price_col = None
-    for c in df.columns:
-        if "close" in c or "price" in c:
-            price_col = c
-            break
-    if price_col is None:
-        raise RuntimeError("No price/close column found in Gold CSV")
-    df = df.rename(columns={price_col: "gold"})
-    df["gold"] = pd.to_numeric(df["gold"].astype(str).str.replace(",", ""), errors="coerce")
-    return df.dropna(subset=["gold"])[["date", "gold"]]
-
-
-def daily_calendar(start: pd.Timestamp, end: pd.Timestamp) -> pd.DatetimeIndex:
-    return pd.date_range(start.normalize(), end.normalize(), freq="D", tz="UTC")
-
-
-def log_time_days(dts: pd.Series) -> np.ndarray:
-    # days since GENESIS (minimum 1 day), then log10
-    days = (dts - GENESIS).dt.days.clip(lower=1).astype(float)
-    return np.log10(days.to_numpy())
-
-
-def fit_power_usd(dates: pd.Series, price_usd: pd.Series):
-    X = log_time_days(dates)
-    y = np.log10(price_usd.to_numpy())
+# -------------------- Power-law fit & bands (on BTC/USD) --------------------
+def fit_power(df_price):
+    # df_price: columns Date, Price (BTC/USD)
+    X = np.log10(np.maximum(1.0, (df_price["Date"] - GENESIS).dt.days.values))
+    y = np.log10(df_price["Price"].values)
     slope, intercept = np.polyfit(X, y, 1)
     mid_log = slope * X + intercept
     resid = y - mid_log
-    sigma = float(np.std(resid))
-    return slope, intercept, sigma, mid_log
+    sigma = np.std(resid)
+    return slope, intercept, max(sigma, 0.25)
 
+LEVELS = {
+    "Support": -1.5,
+    "Bear":    -0.75,  # updated per your request
+    "Mid":      0.0,   # PL Best Fit
+    "Frothy":  +1.0,
+    "Top":     +2.0,   # updated to +2.0σ
+}
 
-def build_projection_frame(hist: pd.DataFrame) -> pd.DataFrame:
-    # extend to monthly steps through PROJ_END (bands only)
-    last_hist = hist["date"].max()
-    if last_hist.tz is None:
-        last_hist = last_hist.tz_localize("UTC")
-    if PROJ_END <= last_hist:
-        future = pd.DatetimeIndex([], tz="UTC")
-    else:
-        future = pd.date_range(last_hist + pd.offsets.MonthBegin(1), PROJ_END, freq="MS", tz="UTC")
-    full = pd.concat([hist[["date", "btc", "gold"]], pd.DataFrame({"date": future})], ignore_index=True)
-    return full
+# -------------------- Build time series to 2040 --------------------
+def build_full_dates(last_hist_date):
+    # end monthly to PROJ_END (first day of month)
+    future = pd.date_range(
+        last_hist_date + pd.offsets.MonthBegin(1),
+        PROJ_END, freq="MS", inclusive="both"
+    )
+    return future
 
+def halving_dates():
+    # Known + projected (approx. every 210k blocks ~4 years)
+    # Use actual dates for past, estimate for future mid-April windows
+    dates = [
+        "2012-11-28",
+        "2016-07-09",
+        "2020-05-11",
+        "2024-04-20"  # 2024 actual
+    ]
+    # Next estimates (approx every 4 years, mid-April)
+    last = pd.Timestamp("2024-04-20")
+    for yr in (2028, 2032, 2036, 2040):
+        dates.append(f"{yr}-04-15")
+    return [pd.Timestamp(d) for d in dates]
 
-def compute_series():
-    # 1) Fetch
-    btc = fetch_btc_daily()
-    gold = fetch_gold_daily()
+# -------------------- Main build --------------------
+def main():
+    btc = load_btc()
+    gold = load_gold()
+    spy = load_spy()
 
-    # 2) Align onto a daily calendar (inner join on date then reindex on full daily union)
-    start = max(btc["date"].min(), gold["date"].min())
-    end = min(btc["date"].max(), gold["date"].max())
-    cal = daily_calendar(start, end)
+    # align (inner join) btc/gold/spy on Date for ratios and shared calendar
+    df = btc.merge(gold.rename(columns={"Price": "Gold"}), on="Date", how="inner")
+    df = df.merge(spy.rename(columns={"Price": "SPY"}), on="Date", how="inner")
+    # sanity
+    df = df[(df["Price"] > 0) & (df["Gold"] > 0) & (df["SPY"] > 0)].copy()
+    df = df.rename(columns={"Price": "BTC"})
+    df = df.sort_values("Date").reset_index(drop=True)
 
-    df = pd.merge_asof(
-        btc.sort_values("date"),
-        gold.sort_values("date"),
-        on="date",
-        direction="nearest",
-        tolerance=pd.Timedelta("1D"),
-    ).dropna()
+    # Fit power law on BTC/USD
+    slope, intercept, sigma = fit_power(df[["Date", "BTC"]])
+    days_full = np.maximum(1, (df["Date"] - GENESIS).dt.days.values)
+    mid_log_hist = slope * np.log10(days_full) + intercept
+    mid_hist = 10 ** mid_log_hist
 
-    # Reindex to strict daily calendar with ffill to fill any small gaps
-    df = df.set_index("date").reindex(cal).ffill().reset_index().rename(columns={"index": "date"})
+    # extend monthly to 2040 for band projections
+    future = build_full_dates(df["Date"].iloc[-1])
+    full = pd.concat([df[["Date"]], pd.DataFrame({"Date": future})], ignore_index=True)
+    full["days"] = np.maximum(1, (full["Date"] - GENESIS).dt.days)
+    mid_log = slope * np.log10(full["days"].values) + intercept
+    mid = 10 ** mid_log
 
-    # 3) Gold denomination: Gold oz / BTC = BTCUSD / GoldUSD
-    df["oz_per_btc"] = df["btc"] / df["gold"]
+    # Construct USD bands on the full monthly grid
+    bands_usd = {}
+    for name, k in LEVELS.items():
+        bands_usd[name] = (10 ** (mid_log + sigma * k)).tolist()
 
-    # 4) Fit USD power-law on historical range
-    slope, intercept, sigma, mid_log_hist = fit_power_usd(df["date"], df["btc"])
-    sigma_vis = max(sigma, SIGMA_FLOOR)
+    # Construct Gold & SPY denominations by dividing USD bands by Gold/SPY price
+    # We need Gold/SPY price on the same monthly grid -> forward-fill from last known daily
+    daily = df.set_index("Date")[["BTC", "Gold", "SPY"]].copy()
+    # fill to cover future range for ffill
+    last_daily = daily.index[-1]
+    ext_idx = pd.date_range(daily.index[0], PROJ_END, freq="D")
+    daily_ext = daily.reindex(ext_idx).ffill()
 
-    # 5) Build projection frame (for bands out to 2040)
-    full = build_projection_frame(df)
-    X_full = log_time_days(full["date"])
-    mid_log_full = slope * X_full + intercept
-    mid_full_usd = 10 ** mid_log_full
+    # Helper: map monthly date -> latest available daily price (same or before)
+    def snap_monthly_prices(monthly_idx, col):
+        # For each monthly date, use that exact day if present, else previous day.
+        out = []
+        for d in monthly_idx:
+            if d in daily_ext.index:
+                out.append(float(daily_ext.loc[d, col]))
+            else:
+                # pick last available before d
+                loc = daily_ext.index.searchsorted(d) - 1
+                if loc < 0:
+                    out.append(float('nan'))
+                else:
+                    out.append(float(daily_ext.iloc[loc][col]))
+        return out
 
-    # 6) USD bands
-    bands_usd = {name: 10 ** (mid_log_full + sigma_vis * k) for name, k in LEVELS.items()}
+    full_gold = snap_monthly_prices(full["Date"], "Gold")
+    full_spy  = snap_monthly_prices(full["Date"], "SPY")
 
-    # 7) Convert USD bands to Gold oz/BTC by dividing by gold price (forward-fill for future months)
-    full["gold"] = full["gold"].ffill()
-    with np.errstate(divide="ignore", invalid="ignore"):
-        bands_gld = {name: np.where(full["gold"].to_numpy() > 0,
-                                    bands_usd[name] / full["gold"].to_numpy(),
-                                    np.nan) for name in LEVELS.keys()}
+    def safe_div(num_list, den_list):
+        out = []
+        for n, d in zip(num_list, den_list):
+            if d and d > 0 and np.isfinite(n) and np.isfinite(d):
+                out.append(n / d)
+            else:
+                out.append(float('nan'))
+        return out
 
-    # 8) Arrays for template
-    arrays = {
-        "dates": [d.strftime("%Y-%m-%d") for d in full["date"]],
-        "usd": {name: bands_usd[name].tolist() for name in LEVELS.keys()},
-        "gld": {name: bands_gld[name].tolist() for name in LEVELS.keys()},
-        "hist": {
-            "dates": [d.strftime("%Y-%m-%d") for d in df["date"]],
-            "usd": df["btc"].round(0).tolist(),
-            "gld": df["oz_per_btc"].tolist(),  # keep decimals; template formats
-        },
+    bands_gld = {name: safe_div(bands_usd[name], full_gold) for name in LEVELS.keys()}
+    bands_spy = {name: safe_div(bands_usd[name], full_spy)  for name in LEVELS.keys()}
+
+    # Historical series for hover/slider (BTC in USD, Gold-denom, SPY-denom)
+    hist_usd = df["BTC"].tolist()
+    hist_gld = (df["BTC"] / df["Gold"]).tolist()  # BTC / (USD per oz) = oz/BTC
+    hist_spy = (df["BTC"] / df["SPY"]).tolist()   # BTC / (USD per SPY) = SPY/BTC
+
+    # Build FIG (traces) on log-time x = log10(days since genesis)
+    def logx_from_dates(dts):
+        d = np.maximum(1, (np.array(dts) - GENESIS).astype("timedelta64[D]").astype(int))
+        return np.log10(d)
+
+    # full monthly x, hist daily x
+    x_full = logx_from_dates(full["Date"].values)
+    x_hist = logx_from_dates(df["Date"].values)
+
+    # Colors
+    C = {
+        "top": "#22c55e",        # green
+        "frothy": "#86efac",
+        "mid": "#e5e7eb",        # white
+        "bear": "#fca5a5",
+        "support": "#ef4444",
+        "btc": "#facc15",        # yellow
+        "zone_soft": {
+            "buy":"rgba(239,68,68,0.10)",
+            "bear":"rgba(252,165,165,0.10)",
+            "mid":"rgba(229,231,235,0.06)",
+            "frothy":"rgba(134,239,172,0.10)"
+        }
     }
 
-    # 9) Build figure
-    fig = build_fig(arrays)
+    # Build traces for each denomination as legendgroups: USD, GLD, SPY
+    def band_traces(group, ydict, visible):
+        # zone fills (Support-Bear, Bear-Mid, Mid-Frothy, Frothy-Top)
+        t = []
+        # Support to Bear
+        t += [dict(type="scatter", mode="lines", x=x_full.tolist(), y=ydict["Support"],
+                   line=dict(color="rgba(0,0,0,0)"),
+                   fill=None, name="", hoverinfo="skip",
+                   legendgroup=group, showlegend=False, visible=visible)]
+        t += [dict(type="scatter", mode="lines", x=x_full.tolist(), y=ydict["Bear"],
+                   line=dict(color="rgba(0,0,0,0)"),
+                   fill="tonexty", fillcolor=C["zone_soft"]["buy"], name="",
+                   hoverinfo="skip", legendgroup=group, showlegend=False, visible=visible)]
+        # Bear to Mid
+        t += [dict(type="scatter", mode="lines", x=x_full.tolist(), y=ydict["Mid"],
+                   line=dict(color="rgba(0,0,0,0)"),
+                   fill="tonexty", fillcolor=C["zone_soft"]["bear"], name="",
+                   hoverinfo="skip", legendgroup=group, showlegend=False, visible=visible)]
+        # Mid to Frothy
+        t += [dict(type="scatter", mode="lines", x=x_full.tolist(), y=ydict["Frothy"],
+                   line=dict(color="rgba(0,0,0,0)"),
+                   fill="tonexty", fillcolor=C["zone_soft"]["mid"], name="",
+                   hoverinfo="skip", legendgroup=group, showlegend=False, visible=visible)]
+        # Frothy to Top
+        t += [dict(type="scatter", mode="lines", x=x_full.tolist(), y=ydict["Top"],
+                   line=dict(color="rgba(0,0,0,0)"),
+                   fill="tonexty", fillcolor=C["zone_soft"]["frothy"], name="",
+                   hoverinfo="skip", legendgroup=group, showlegend=False, visible=visible)]
 
-    return arrays, fig
+        # Band lines (dashed)
+        t += [
+            dict(type="scatter", mode="lines", x=x_full.tolist(), y=ydict["Top"],
+                 line=dict(color=C["top"], dash="dash", width=1.5),
+                 name="Top (+2σ)", legendgroup=group, visible=visible),
+            dict(type="scatter", mode="lines", x=x_full.tolist(), y=ydict["Frothy"],
+                 line=dict(color=C["frothy"], dash="dash", width=1.5),
+                 name="Frothy (+1σ)", legendgroup=group, visible=visible),
+            dict(type="scatter", mode="lines", x=x_full.tolist(), y=ydict["Mid"],
+                 line=dict(color=C["mid"], dash="dash", width=1.5),
+                 name="PL Best Fit (0σ)", legendgroup=group, visible=visible),
+            dict(type="scatter", mode="lines", x=x_full.tolist(), y=ydict["Bear"],
+                 line=dict(color=C["bear"], dash="dash", width=1.5),
+                 name="Bear (-0.75σ)", legendgroup=group, visible=visible),
+            dict(type="scatter", mode="lines", x=x_full.tolist(), y=ydict["Support"],
+                 line=dict(color=C["support"], dash="dash", width=1.5),
+                 name="Support (-1.5σ)", legendgroup=group, visible=visible),
+        ]
+        return t
 
+    data = []
+    # USD group (default visible)
+    data += band_traces("USD", bands_usd, True)
+    data += [dict(type="scatter", mode="lines", x=x_hist.tolist(), y=hist_usd,
+                  line=dict(color=C["btc"], width=2), name="BTC",
+                  legendgroup="USD", visible=True)]
+    # Yellow marker (USD)
+    data += [dict(type="scatter", mode="markers", x=[x_hist[-1]], y=[hist_usd[-1]],
+                  marker=dict(color=C["btc"], size=8), name="",
+                  hoverinfo="skip", legendgroup="USD", visible=True)]
 
-def build_fig(arrays: dict) -> go.Figure:
-    """Construct Plotly figure with both denominations present, controlled by legendgroup."""
-    dates_iso = arrays["dates"]
-    dates_dt = pd.to_datetime(dates_iso, utc=True)
-    x_log = np.log10(((dates_dt - GENESIS).days.clip(lower=1)).astype(float))
+    # GLD group (hidden initially)
+    data += band_traces("GLD", bands_gld, False)
+    data += [dict(type="scatter", mode="lines", x=x_hist.tolist(), y=hist_gld,
+                  line=dict(color=C["btc"], width=2), name="BTC",
+                  legendgroup="GLD", visible=False)]
+    data += [dict(type="scatter", mode="markers", x=[x_hist[-1]], y=[hist_gld[-1]],
+                  marker=dict(color=C["btc"], size=8), name="", hoverinfo="skip",
+                  legendgroup="GLD", visible=False)]
 
-    # helper
-    def add_line(fig, y, name, color, dash, group, visible):
-        fig.add_trace(go.Scatter(
-            x=x_log, y=y,
-            name=name, legendgroup=group, showlegend=True,
-            visible=visible,
-            mode="lines",
-            line=dict(color=color, dash=dash, width=2),
-            hoverinfo="skip",
+    # SPY group (hidden initially)
+    data += band_traces("SPY", bands_spy, False)
+    data += [dict(type="scatter", mode="lines", x=x_hist.tolist(), y=hist_spy,
+                  line=dict(color=C["btc"], width=2), name="BTC",
+                  legendgroup="SPY", visible=False)]
+    data += [dict(type="scatter", mode="markers", x=[x_hist[-1]], y=[hist_spy[-1]],
+                  marker=dict(color=C["btc"], size=8), name="", hoverinfo="skip",
+                  legendgroup="SPY", visible=False)]
+
+    # Remember indices of the three marker traces (for slider moves)
+    USD_MARK_IDX = len(data) - 6  # marker in USD group
+    GLD_MARK_IDX = len(data) - 4
+    SPY_MARK_IDX = len(data) - 2
+
+    # Halving vertical shapes (by x in log-time)
+    def x_from_date(dt):
+        d = max(1, (pd.Timestamp(dt) - GENESIS).days)
+        return math.log10(d)
+    halvings = halving_dates()
+    halving_shapes = []
+    for d in halvings:
+        x = x_from_date(d)
+        halving_shapes.append(dict(
+            type="line", xref="x", x0=x, x1=x, yref="paper", y0=0, y1=1,
+            line=dict(color="rgba(255,255,255,0.25)", width=1, dash="dot")
         ))
 
-    fig = go.Figure()
-
-    # --- USD bands & BTC
-    usd_group = "USD"
-    # order: Top, Frothy, Mid, Bear, Support to match your desired legend order
-    for nm in ["Top", "Frothy", "PL Best Fit", "Bear", "Support"]:
-        add_line(
-            fig, arrays["usd"][nm],
-            f"{nm}", COLORS[nm], LINE_DASH[nm],
-            usd_group, True  # USD visible by default
-        )
-    # BTC USD history
-    hist_dt = pd.to_datetime(arrays["hist"]["dates"], utc=True)
-    hist_x = np.log10(((hist_dt - GENESIS).days.clip(lower=1)).astype(float))
-    fig.add_trace(go.Scatter(
-        x=hist_x, y=arrays["hist"]["usd"],
-        name="BTC", legendgroup=usd_group, showlegend=True, visible=True,
-        mode="lines", line=dict(color=COLORS["BTC"], width=3),
-        hoverinfo="skip",
-    ))
-    # yellow marker (USD)
-    usd_mark_idx = len(fig.data)
-    fig.add_trace(go.Scatter(
-        x=[hist_x[-1]], y=[arrays["hist"]["usd"][-1]],
-        name="", legendgroup=usd_group, showlegend=False, visible=True,
-        mode="markers", marker=dict(color="#facc15", size=8),
-        hoverinfo="skip",
-    ))
-
-    # --- GOLD bands & BTC (oz/BTC)
-    gld_group = "GLD"
-    for nm in ["Top", "Frothy", "PL Best Fit", "Bear", "Support"]:
-        add_line(
-            fig, arrays["gld"][nm],
-            f"{nm}", COLORS[nm], LINE_DASH[nm],
-            gld_group, False  # hidden by default; toggled via dropdown
-        )
-    # BTC in oz/BTC
-    fig.add_trace(go.Scatter(
-        x=hist_x, y=arrays["hist"]["gld"],
-        name="BTC", legendgroup=gld_group, showlegend=True, visible=False,
-        mode="lines", line=dict(color=COLORS["BTC"], width=3),
-        hoverinfo="skip",
-    ))
-    # yellow marker (GLD)
-    gld_mark_idx = len(fig.data)
-    fig.add_trace(go.Scatter(
-        x=[hist_x[-1]], y=[arrays["hist"]["gld"][-1]],
-        name="", legendgroup=gld_group, showlegend=False, visible=False,
-        mode="markers", marker=dict(color="#facc15", size=8),
-        hoverinfo="skip",
-    ))
-
-    # Axis & layout (log-time on x, log on y)
-    fig.update_layout(
+    layout = dict(
         template="plotly_dark",
         showlegend=True,
-        plot_bgcolor="#111", paper_bgcolor="#111",
-        margin=dict(l=40, r=20, t=10, b=40),
-        font=dict(family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif", size=12),
         xaxis=dict(
-            title="Year",
-            type="linear",  # our x is already log10(days)
-            showgrid=True, gridwidth=0.5, zeroline=False,
+            title="Year (log-time)",
+            type="linear",  # log of time already used in x values
+            showgrid=True, gridwidth=0.5,
         ),
         yaxis=dict(
             title="USD / BTC",
             type="log",
-            showgrid=True, gridwidth=0.5, zeroline=False,
-            tickformat="$,d",
+            showgrid=True, gridwidth=0.5,
+            tickformat="$,d"
         ),
-        # meta: indices of the two marker traces for JS access
-        meta=dict(USD_MARK_IDX=usd_mark_idx, GLD_MARK_IDX=gld_mark_idx)
+        paper_bgcolor="#0f1116",
+        plot_bgcolor="#151821",
+        margin=dict(l=60, r=30, t=40, b=50),
+        shapes=halving_shapes,
+        meta=dict(
+            USD_MARK_IDX=USD_MARK_IDX,
+            GLD_MARK_IDX=GLD_MARK_IDX,
+            SPY_MARK_IDX=SPY_MARK_IDX
+        )
     )
 
-    return fig
+    FIG = dict(data=data, layout=layout)
 
-
-def write_dist(arrays: dict, fig: go.Figure):
-    os.makedirs("dist", exist_ok=True)
-    with open("template.html", "r", encoding="utf-8") as f:
-        tpl = f.read()
-    figjson = fig.to_json()  # safe JSON for Plotly
-    arrays_json = json.dumps(arrays, separators=(",", ":"))  # compact
-    html = (
-        tpl.replace("__TITLE__", "BTC Purchase Indicator")
-           .replace("__FIGJSON__", figjson)
-           .replace("__ARRAYS__", arrays_json)
+    # -------------------- ARR payload for the client --------------------
+    ARR = dict(
+        dates=[d.strftime("%Y-%m-%d") for d in full["Date"]],
+        usd=bands_usd,
+        gld=bands_gld,
+        spy=bands_spy,
+        hist=dict(
+            dates=[d.strftime("%Y-%m-%d") for d in df["Date"]],
+            usd=hist_usd,
+            gld=hist_gld,
+            spy=hist_spy
+        )
     )
-    with open("dist/index.html", "w", encoding="utf-8") as f:
+
+    # -------------------- Emit template --------------------
+    with open(TEMPLATE, "r", encoding="utf-8") as f:
+        html = f.read()
+    html = html.replace("__TITLE__", "BTC Purchase Indicator")
+    html = html.replace("__FIGJSON__", json.dumps(FIG, separators=(",",":")))
+    html = html.replace("__ARRAYS__", json.dumps(ARR, separators=(",",":")))
+
+    os.makedirs(OUTDIR, exist_ok=True)
+    with open(os.path.join(OUTDIR, "index.html"), "w", encoding="utf-8") as f:
         f.write(html)
 
-
-def main():
-    arrays, fig = compute_series()
-    write_dist(arrays, fig)
-    print(f"[build] rows: {len(arrays['hist']['dates']):,}  (BTC & Gold)")
+    print(f"[build] rows: {len(df):,}  (BTC/Gold/SPY)")
     print("[build] wrote dist/index.html")
-
 
 if __name__ == "__main__":
     main()
