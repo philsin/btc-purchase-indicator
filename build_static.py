@@ -3,12 +3,13 @@
 
 """
 Static builder for BTC Purchase Indicator (Power-Law bands)
-- Robust column detection (no hard-coded 'Price')
+- Robust loaders with fallbacks & clear errors
 - BTC/USD and Gold oz/BTC denominations
-- Outputs a single dist/index.html file
+- Hover panel (fixed), weekly (Wed) slider, Today toggle, denomination toggle
+- Outputs a single dist/index.html suitable for GitHub Pages
 """
 
-import os, json
+import os, json, urllib.error
 from datetime import datetime
 import numpy as np
 import pandas as pd
@@ -20,26 +21,35 @@ PROJ_END  = pd.Timestamp("2040-12-31")
 # band levels (latest requirements)
 LEVELS = {
     "Support": -1.5,
-    "Bear":    -0.75,   # updated
+    "Bear":    -0.75,  # updated per your change
     "Mid":      0.0,
     "Frothy":   1.0,
-    "Top":      2.0,    # updated
+    "Top":      2.0,   # updated per your change
 }
 
 # colors
 COLORS = {
-    "Support": "#ef4444",         # red
+    "Support": "#ef4444",               # red
     "Bear":    "rgba(255,100,100,1)",
     "Mid":     "#ffffff",
     "Frothy":  "rgba(100,255,100,1)",
-    "Top":     "#22c55e",         # green
-    "BTC":     "#fbbf24",         # amber/yellow
+    "Top":     "#22c55e",               # green
+    "BTC":     "#fbbf24",               # amber/yellow
 }
 
 # candidate price column names to look for automatically
 PRICE_CANDIDATES = ["Price", "Close", "Adj Close", "AdjClose", "BTC", "USD", "Value"]
 
-# ----------------- robust helpers -----------------
+# ----------------- utility -----------------
+def safe_read_csv(url, **kwargs) -> pd.DataFrame:
+    """Read CSV with clear error message for HTTP failures."""
+    try:
+        return pd.read_csv(url, **kwargs)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"HTTP {e.code} for {url}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to read {url}: {e}")
+
 def detect_price_col(df, hint=None, label="series"):
     """
     Return a usable price column name from df.
@@ -70,7 +80,7 @@ def _days_since_genesis(dates_like) -> np.ndarray:
     Returns int numpy array of days >= 1.
     """
     td = pd.to_datetime(dates_like) - GENESIS
-    # Pandas doesn't support astype('timedelta64[D]'); divide by 1 day instead:
+    # Avoid unsupported casts: divide by 1-day timedelta
     days = (td.to_numpy() / np.timedelta64(1, "D")).astype(float)
     days = np.maximum(days, 1.0).astype(int)
     return days
@@ -78,7 +88,6 @@ def _days_since_genesis(dates_like) -> np.ndarray:
 def fit_power(df_price, price_col=None, label="series"):
     """
     Log-log linear fit on (days since GENESIS, price).
-    Works with any price column name.
     Returns (slope, intercept, sigma>=0.25).
     """
     if price_col is None:
@@ -113,23 +122,23 @@ def require_cols(df, cols, label):
     if missing:
         raise ValueError(f"{label} missing columns {missing}. Have: {list(df.columns)}")
 
-# ----------------- data loaders -----------------
+# ----------------- data loaders (robust with fallbacks) -----------------
 def _btc_stooq():
     url = "https://stooq.com/q/d/l/?s=btcusd&i=d"
-    df = pd.read_csv(url)
+    df = safe_read_csv(url)
     df.columns = [c.lower() for c in df.columns]
     # find date & close
     date_col  = next(c for c in df.columns if "date" in c)
     price_col = next(c for c in df.columns if c in ("close", "c"))
     out = pd.DataFrame({
         "Date":  pd.to_datetime(df[date_col], errors="coerce"),
-        "BTC":   pd.to_numeric(df[price_col].astype(str).str.replace(",",""), errors="coerce"),
+        "BTC":   pd.to_numeric(df[price_col].astype(str).str.replace(",", ""), errors="coerce"),
     })
     return out.dropna().sort_values("Date")
 
 def _btc_github():
     raw = "https://raw.githubusercontent.com/datasets/bitcoin-price/master/data/bitcoin_price.csv"
-    df  = pd.read_csv(raw)
+    df  = safe_read_csv(raw)
     out = pd.DataFrame({
         "Date": pd.to_datetime(df["Date"], errors="coerce"),
         "BTC":  pd.to_numeric(df["Closing Price (USD)"], errors="coerce"),
@@ -141,27 +150,29 @@ def load_btc():
         df = _btc_stooq()
         if len(df) > 1000:
             return df
-    except Exception:
-        pass
+        # fall through to mirror if too few rows
+    except Exception as e:
+        print(f"[warn] BTC Stooq failed → {e}")
     return _btc_github()
 
 def _gold_stooq():
     url = "https://stooq.com/q/d/l/?s=xauusd&i=d"  # USD/oz
-    df = pd.read_csv(url)
+    df = safe_read_csv(url)
     df.columns = [c.lower() for c in df.columns]
     date_col  = next(c for c in df.columns if "date" in c)
     price_col = next(c for c in df.columns if c in ("close", "c"))
     out = pd.DataFrame({
-        "Date":   pd.to_datetime(df[date_col], errors="coerce"),
-        "GoldUSD": pd.to_numeric(df[price_col].astype(str).str_replace(",",""), errors="coerce"),
+        "Date":    pd.to_datetime(df[date_col], errors="coerce"),
+        "GoldUSD": pd.to_numeric(df[price_col].astype(str).str.replace(",", ""), errors="coerce"),
     })
     return out.dropna().sort_values("Date")
 
 def _gold_lbma():
+    # mirror; not guaranteed forever, but fine as fallback
     url = "https://raw.githubusercontent.com/koindata/gold-prices/master/data/gold.csv"
-    df = pd.read_csv(url)
+    df  = safe_read_csv(url)
     out = pd.DataFrame({
-        "Date":   pd.to_datetime(df["Date"], errors="coerce"),
+        "Date":    pd.to_datetime(df["Date"], errors="coerce"),
         "GoldUSD": pd.to_numeric(df["USD (PM)"], errors="coerce"),
     })
     return out.dropna().sort_values("Date")
@@ -171,8 +182,9 @@ def load_gold():
         g = _gold_stooq()
         if len(g) >= 1000:
             return g
-        raise ValueError("Too few gold rows from Stooq")
-    except Exception:
+        raise RuntimeError("Too few gold rows from Stooq")
+    except Exception as e:
+        print(f"[warn] Gold Stooq failed → {e}")
         return _gold_lbma()
 
 # ----------------- compute helpers -----------------
@@ -183,7 +195,7 @@ def extend_monthly_dates(last_hist_date, end_date=PROJ_END):
 
 def build_bands_over(dates, slope, intercept, sigma):
     """Return dict of band arrays keyed by level name, same length as dates."""
-    days = _days_since_genesis(dates)  # FIXED: robust day computation (no .dt / no 'D' casting)
+    days = _days_since_genesis(dates)  # robust day computation
     mid_log = slope * np.log10(days) + intercept
     out = {}
     for name, k in LEVELS.items():
@@ -422,7 +434,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       const line = (denom==="USD") ? fmtUSD(priceUSD) : fmtOzBTC(priceGLD);
       dateRead.innerHTML = `<div style="font-weight:600">${dISO}</div><div>BTC: ${line}</div>`;
 
-      // Move marker
+      // Move marker on log-time x
       const genesis = Date.parse("2009-01-03T00:00:00Z");
       const dms = Date.parse(dISO+"T00:00:00Z");
       const days = Math.max(1, Math.round((dms - genesis)/86400000));
@@ -506,7 +518,7 @@ def make_power_data_arrays(dates, hist_usd, bands_usd, hist_gld, bands_gld):
     add_band("GLD", "Bear (Gold)",    bands_gld["Bear"],   COLORS["Bear"])
     add_band("GLD", "Support (Gold)", bands_gld["Support"],COLORS["Support"])
 
-    # GLD price
+    # GLD price (oz/BTC)
     data.append(go.Scatter(
         x=x, y=hist_gld, name="BTC (Gold)", legendgroup="GLD",
         line=dict(color=COLORS["BTC"], width=2),
