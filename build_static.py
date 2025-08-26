@@ -1,521 +1,434 @@
 #!/usr/bin/env python3
 """
-Builds a self-contained Plotly HTML with:
-- Log-scaled time (via numeric "days since start") + human-readable date ticks
-- Log-scaled y-axis
-- Quantile regression bands (10/30/50/70/90) around the 50% median curve
-- Legend + hover panel toggle
-- Compare Mode (rebased to 1.0) that hides bands
-- Denominator menu (auto-detects denominator_*.csv)
-- Short date formatting on ticks and hover (MM/DD/YY)
+BTC Purchase Indicator builder (Plotly HTML)
 
-Requirements:
-    pandas, numpy, plotly, statsmodels
+- Auto-fetches BTC daily history to data/btc_usd.csv if missing (CoinGecko).
+- Log-scaled time (numeric "days since start") with human-readable MM/DD/YY ticks.
+- Log-scaled y axis.
+- Quantile regressions (log-log) at 10/30/50/70/90 with filled bands.
+- Hover panel shows quantile lines in ascending order: q10, q30, q50, q70, q90.
+- Title annotation & main-line color reflect the CURRENT band position.
+- Compare Mode (rebased to 1.0) hides bands.
+- Denominator menu auto-detects data/denominator_*.csv (date,price).
+
+Requirements: pandas, numpy, plotly, statsmodels, requests
 """
 
-import os
-import glob
-import math
-from datetime import datetime, timedelta
+import os, glob, math, json
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 from statsmodels.regression.quantile_regression import QuantReg
 
-OUTPUT_HTML = "docs/index.html"  # adjust if your GH Pages serves from another path
+OUTPUT_HTML = "docs/index.html"
 DATA_DIR = "data"
-BTC_FILE = os.path.join(DATA_DIR, "btc_usd.csv")  # columns: date, price
+BTC_FILE = os.path.join(DATA_DIR, "btc_usd.csv")
 
-# ---------- Helpers
+# ------------------------------ Utilities
+
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+
+def fetch_btc_if_missing():
+    """Create data/btc_usd.csv using CoinGecko daily prices if file missing."""
+    if os.path.exists(BTC_FILE):
+        return
+    ensure_dir(DATA_DIR)
+    # CoinGecko market chart range: from 2010-07-17 to now, daily resolution
+    vs = "usd"
+    # 2010-07-17 epoch (approx BTC start)
+    start = int(datetime(2010, 7, 17, tzinfo=timezone.utc).timestamp())
+    end = int(datetime.now(timezone.utc).timestamp())
+    url = f"https://api.coingecko.com/api/v3/coins/bitcoin/market_chart/range?vs_currency={vs}&from={start}&to={end}"
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    # data["prices"] = [[ms, price], ...]
+    rows = []
+    for ms, price in data.get("prices", []):
+        d = datetime.utcfromtimestamp(ms/1000.0).date()
+        rows.append((d.isoformat(), float(price)))
+    df = pd.DataFrame(rows, columns=["date","price"]).dropna()
+    df = df.sort_values("date")
+    df.to_csv(BTC_FILE, index=False)
 
 def load_series_csv(path):
     df = pd.read_csv(path)
-    # Flexible column casing
     cols = {c.lower(): c for c in df.columns}
     date_col = cols.get("date")
     price_col = cols.get("price")
     if not date_col or not price_col:
         raise ValueError(f"{path} must have 'date' and 'price' columns")
-    df = df[[date_col, price_col]].rename(columns={date_col: "date", price_col: "price"})
+    df = df[[date_col, price_col]].rename(columns={date_col:"date", price_col:"price"})
     df["date"] = pd.to_datetime(df["date"], utc=True).dt.tz_localize(None)
     df = df.sort_values("date").dropna()
     df = df[df["price"] > 0]
     return df.reset_index(drop=True)
 
 def days_since_start(dates, start):
-    # +1 to avoid log(0)
-    return (dates - start).dt.days.astype(float) + 1.0
+    return (dates - start).dt.days.astype(float) + 1.0  # +1 to avoid log(0)
 
 def make_log_time_ticks(start_date, x_min, x_max):
-    """
-    Build nice log ticks on x (in 'days since start') and map them back to dates.
-    We use powers of 10 * {1,2,5}.
-    """
-    ticks = []
-    ticktexts = []
-
-    if x_min <= 0:
-        x_min = 1e-6
-
+    ticks, ticktexts = [], []
+    if x_min <= 0: x_min = 1e-6
     exp_min = math.floor(math.log10(x_min))
     exp_max = math.ceil(math.log10(x_max))
-
-    mantissas = [1, 2, 5]
-    for e in range(exp_min, exp_max + 1):
-        for m in mantissas:
-            val = m * (10 ** e)
-            if x_min <= val <= x_max:
-                d = start_date + timedelta(days=float(val))
-                ticks.append(val)
+    for e in range(exp_min, exp_max+1):
+        for m in (1,2,5):
+            v = m*(10**e)
+            if x_min <= v <= x_max:
+                d = start_date + timedelta(days=float(v))
+                ticks.append(v)
                 ticktexts.append(d.strftime("%m/%d/%y"))
-    # Ensure we always include first & last dates
-    if 1.0 >= x_min and 1.0 <= x_max:
-        ticks = sorted(set(ticks + [1.0]))
-        ticktexts = []
-        for v in ticks:
-            d = start_date + timedelta(days=float(v))
-            ticktexts.append(d.strftime("%m/%d/%y"))
-    return ticks, ticktexts
+    if 1.0 >= x_min and 1.0 <= x_max and 1.0 not in ticks:
+        ticks.append(1.0)
+        d = start_date + timedelta(days=1.0)
+        ticktexts.append(d.strftime("%m/%d/%y"))
+    # De-dup, keep order by sorting
+    idx = np.argsort(ticks)
+    return [ticks[i] for i in idx], [ticktexts[i] for i in idx]
 
-def fit_quantiles(x, y, quantiles=(0.1, 0.3, 0.5, 0.7, 0.9)):
-    """
-    Fit log-log quantile regressions:
-        log10(y) ~ a + b * log10(x)
-    Returns dict of q -> predicted y for sorted x.
-    """
-    # Use only positive x,y
-    m = (x > 0) & (y > 0)
-    x_use = x[m]
-    y_use = y[m]
+def fit_quantiles(x, y, quantiles=(0.1,0.3,0.5,0.7,0.9)):
+    m = (x>0) & (y>0)
+    x_use, y_use = x[m], y[m]
     if len(x_use) < 10:
         return {}
-
     X = pd.DataFrame({"logx": np.log10(x_use)})
     z = np.log10(y_use)
-
     preds = {}
     for q in quantiles:
         try:
             model = QuantReg(z, pd.concat([pd.Series(1.0, index=X.index, name="const"), X], axis=1))
             res = model.fit(q=q)
-            # Predict over the *full* x range (sorted)
-            x_sorted = np.sort(x.unique())
-            x_sorted = x_sorted[x_sorted > 0]
-            Xp = pd.DataFrame({"const": 1.0, "logx": np.log10(x_sorted)})
+            x_sorted = np.sort(np.unique(x_use))
+            Xp = pd.DataFrame({"const":1.0, "logx":np.log10(x_sorted)})
             zhat = res.predict(Xp)
-            yhat = (10 ** zhat)
+            yhat = (10**zhat)
             preds[q] = (x_sorted, yhat)
         except Exception:
-            # If a quantile fails (rare), skip it
-            continue
+            pass
     return preds
 
 def rebase_to_one(series):
-    """Rebase a positive series to 1.0 at the first valid point."""
-    s = series.copy().astype(float)
-    s = s.replace([np.inf, -np.inf], np.nan).dropna()
-    if s.empty:
-        return series * np.nan
-    base = s.iloc[0]
-    if base <= 0:
-        return series * np.nan
-    return series / base
+    s = pd.Series(series).astype(float).replace([np.inf,-np.inf], np.nan).dropna()
+    if s.empty or s.iloc[0] <= 0:
+        return pd.Series(series)*np.nan
+    return pd.Series(series)/s.iloc[0]
 
 def collect_denominators():
-    """Find files like data/denominator_*.csv."""
     paths = glob.glob(os.path.join(DATA_DIR, "denominator_*.csv"))
     opts = {}
     for p in sorted(paths):
-        key = os.path.splitext(os.path.basename(p))[0].replace("denominator_", "").upper()
+        key = os.path.splitext(os.path.basename(p))[0].replace("denominator_","").upper()
         try:
             opts[key] = load_series_csv(p)
         except Exception:
-            # skip invalid files
             pass
     return opts
 
-# ---------- Load data
+def rgba(hex_color, a):
+    h = hex_color.lstrip("#")
+    r,g,b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
+    return f"rgba({r},{g},{b},{a})"
 
-btc = load_series_csv(BTC_FILE).rename(columns={"price": "btc"})
-denoms = collect_denominators()  # e.g., {"SPX": df, "GOLD": df}
-has_denoms = len(denoms) > 0
+# ------------------------------ Load / Prepare
 
-# Merge denominators onto btc date index for clean ratios
+fetch_btc_if_missing()  # <-- new: auto-create BTC CSV if missing
+
+btc = load_series_csv(BTC_FILE).rename(columns={"price":"btc"})
+denoms = collect_denominators()
+
 base = btc.copy()
 for name, df in denoms.items():
     base = base.merge(df.rename(columns={"price": name.lower()}), on="date", how="left")
 
-# Compute “days since start” for log-time x
 start_date = base["date"].iloc[0]
 base["x_days"] = days_since_start(base["date"], start_date)
-
-# ---------- Core series & denominators
-
-def series_for_denominator(df, denom_key=None):
-    """Return (y_main, label) where y_main is either BTC/USD or BTC/denominator."""
-    if not denom_key or denom_key.lower() == "usd" or denom_key.lower() == "none":
-        return df["btc"], "BTC (USD)"
-    key = denom_key.lower()
-    if key in df.columns:
-        return (df["btc"] / df[key]), f"BTC / {denom_key.upper()}"
-    # Fallback if missing
-    return df["btc"], "BTC (USD)"
-
-# ---------- Quantile bands on log-log (time-log, price-log)
-
-y_main, y_label = series_for_denominator(base, denom_key=None)
-quantiles = (0.1, 0.3, 0.5, 0.7, 0.9)
-qpred = fit_quantiles(base["x_days"].values, y_main.values, quantiles=quantiles)
-
-# For hover with date formatting while x is numeric:
 base["date_str"] = base["date"].dt.strftime("%m/%d/%y")
 
-# ---------- Build traces
+def series_for_denom(df, denom_key=None):
+    if not denom_key or denom_key.lower() in ("usd","none"):
+        return df["btc"], "BTC (USD)"
+    k = denom_key.lower()
+    if k in df.columns:
+        return (df["btc"]/df[k]), f"BTC / {denom_key.upper()}"
+    return df["btc"], "BTC (USD)"
 
-traces_all = []
-visibility_bands = []   # bands visible in normal mode, hidden in compare
-visibility_normal = []  # base state
-visibility_compare = [] # compare state
+y_main, y_label = series_for_denom(base, None)
+quantiles = (0.1,0.3,0.5,0.7,0.9)
+qpred = fit_quantiles(base["x_days"].values, y_main.values, quantiles)
 
-# Main BTC (or BTC/USD) line
-trace_btc = go.Scatter(
-    x=base["x_days"],
-    y=y_main,
-    name=y_label,
-    mode="lines",
-    line=dict(width=1.5),
-    hovertemplate="Date: %{customdata}<br>Value: %{y:.6g}<extra>%{fullData.name}</extra>",
-    customdata=base["date_str"],
-)
-traces_all.append(trace_btc)
-
-# Quantile median curve + bands (fill between 10-30, 30-50, 50-70, 70-90)
-# Colors: red(10) → yellow(50) → green(90) via semi-transparent fills
-# We'll draw inner to outer for clean stacking.
-def rgba(hex_color, alpha):
-    # hex_color like "#FF0000"
-    h = hex_color.lstrip("#")
-    r = int(h[0:2], 16)
-    g = int(h[2:4], 16)
-    b = int(h[4:6], 16)
-    return f"rgba({r},{g},{b},{alpha})"
+# ------------------------------ Current band status
 
 colors = {
-    0.1: "#D32F2F", # red-ish
-    0.3: "#F57C00", # orange
-    0.5: "#FBC02D", # yellow
-    0.7: "#7CB342", # yellow-green
-    0.9: "#2E7D32", # green
+    0.1:"#D32F2F", 0.3:"#F57C00", 0.5:"#FBC02D", 0.7:"#7CB342", 0.9:"#2E7D32"
 }
 
-# Draw median line (thin)
-if 0.5 in qpred:
-    x50, y50 = qpred[0.5]
-    traces_all.append(go.Scatter(
-        x=x50, y=y50,
-        name="Median (50%)",
-        mode="lines",
-        line=dict(width=1.2, dash="dot", color=colors[0.5]),
-        hovertemplate="Date: %{customdata}<br>Median: %{y:.6g}<extra></extra>",
-        customdata=[(start_date + timedelta(days=float(d))).strftime("%m/%d/%y") for d in x50],
-    ))
-else:
-    x50, y50 = (None, None)
+def interpolate_quantile_at_x(qpred, q, xval):
+    if q not in qpred: return np.nan
+    xq, yq = qpred[q]
+    if xval < xq[0] or xval > xq[-1]:
+        return np.nan
+    return float(np.interp(xval, xq, yq))
 
-# Helper to plot filled band between q_low and q_high
+# Use the last valid point in y_main/x_days
+last_idx = int(np.where(np.isfinite(y_main.values))[0][-1])
+x_last = float(base["x_days"].iloc[last_idx])
+y_last = float(y_main.iloc[last_idx])
+
+q_vals = {q: interpolate_quantile_at_x(qpred, q, x_last) for q in quantiles}
+# Determine band + approx percentile (linear between nearest quantiles)
+band_label = "below 10%"
+band_color = colors[0.1]
+approx_p = 0.0
+
+if not any(np.isnan(list(q_vals.values()))):
+    if y_last < q_vals[0.1]:
+        band_label, approx_p, band_color = "<10%", 0.05, colors[0.1]
+    elif y_last < q_vals[0.3]:
+        # between 10 and 30
+        t = (y_last - q_vals[0.1]) / max(1e-12, (q_vals[0.3] - q_vals[0.1]))
+        approx_p = 0.10 + 0.20*t
+        band_label, band_color = "10–30%", colors[0.3]
+    elif y_last < q_vals[0.5]:
+        t = (y_last - q_vals[0.3]) / max(1e-12, (q_vals[0.5] - q_vals[0.3]))
+        approx_p = 0.30 + 0.20*t
+        band_label, band_color = "30–50%", colors[0.5]
+    elif y_last < q_vals[0.7]:
+        t = (y_last - q_vals[0.5]) / max(1e-12, (q_vals[0.7] - q_vals[0.5]))
+        approx_p = 0.50 + 0.20*t
+        band_label, band_color = "50–70%", colors[0.7]
+    elif y_last < q_vals[0.9]:
+        t = (y_last - q_vals[0.7]) / max(1e-12, (q_vals[0.9] - q_vals[0.7]))
+        approx_p = 0.70 + 0.20*t
+        band_label, band_color = "70–90%", colors[0.9]
+    else:
+        band_label, approx_p, band_color = ">90%", 0.95, colors[0.9]
+
+# ------------------------------ Traces
+
+traces = []
+visibility_normal, visibility_compare = [], []
+
+# Quantile LINES for hover (ascending order): q10, q30, q50, q70, q90
+q_lines_order = [0.1,0.3,0.5,0.7,0.9]
+for q in q_lines_order:
+    if q in qpred:
+        xq, yq = qpred[q]
+        traces.append(go.Scatter(
+            x=xq, y=yq, mode="lines",
+            name=f"q{int(q*100)}",
+            line=dict(width=0.8, dash="dot", color=colors[q]),
+            hovertemplate="Date: %{customdata}<br>%{fullData.name}: %{y:.6g}<extra></extra>",
+            customdata=[(start_date + timedelta(days=float(d))).strftime("%m/%d/%y") for d in xq],
+            showlegend=False
+        ))
+        visibility_normal.append(True)
+        visibility_compare.append(False)
+
+# Filled bands (hover suppressed; legend off)
 def add_band(q_low, q_high):
-    if q_low not in qpred or q_high not in qpred:
-        return
+    if q_low not in qpred or q_high not in qpred: return
     xl, yl = qpred[q_low]
     xh, yh = qpred[q_high]
-    # Ensure same x grid (both are sorted)
-    # We assume xl == xh; if not, align by intersection
     x_common = np.intersect1d(xl, xh)
-    if len(x_common) == 0:
-        return
+    if len(x_common)==0: return
     yl_i = np.interp(x_common, xl, yl)
     yh_i = np.interp(x_common, xh, yh)
-    # Upper boundary
-    traces_all.append(go.Scatter(
-        x=x_common, y=yh_i,
-        name=f"{int(q_low*100)}–{int(q_high*100)}% band",
-        mode="lines",
+    # Upper boundary (thin)
+    traces.append(go.Scatter(
+        x=x_common, y=yh_i, mode="lines",
         line=dict(width=0.5, color=colors[q_high]),
-        hoverinfo="skip",
-        showlegend=False,
+        hoverinfo="skip", showlegend=False
     ))
-    # Lower boundary (fill down to this)
-    traces_all.append(go.Scatter(
-        x=x_common, y=yl_i,
-        mode="lines",
+    visibility_normal.append(True); visibility_compare.append(False)
+    # Lower boundary (fill to previous)
+    traces.append(go.Scatter(
+        x=x_common, y=yl_i, mode="lines",
         line=dict(width=0.5, color=colors[q_low]),
-        hoverinfo="skip",
-        fill="tonexty",
-        fillcolor=rgba(colors[q_high], 0.18),
-        name=f"{int(q_low*100)}–{int(q_high*100)}% band",
-        showlegend=False,
+        hoverinfo="skip", showlegend=False,
+        fill="tonexty", fillcolor=rgba(colors[q_high], 0.18)
     ))
+    visibility_normal.append(True); visibility_compare.append(False)
 
-# Add bands outward (50±20, 50±40)
-add_band(0.3, 0.5)
-add_band(0.5, 0.7)
-add_band(0.1, 0.3)
-add_band(0.7, 0.9)
+# Add bands from inner to outer (so fill stacks nicely)
+add_band(0.3,0.5)
+add_band(0.5,0.7)
+add_band(0.1,0.3)
+add_band(0.7,0.9)
 
-# Track visibilities:
-# Index 0 → main line
-# Next traces are median + bands (variable count)
-band_start_index = 1
-band_end_index = len(traces_all) - 1
+# Main BTC (or BTC/USD) line — colored by current band
+traces.append(go.Scatter(
+    x=base["x_days"], y=y_main, mode="lines",
+    name=y_label,
+    line=dict(width=1.5, color=band_color),
+    hovertemplate="Date: %{customdata}<br>Value: %{y:.6g}<extra>%{fullData.name}</extra>",
+    customdata=base["date_str"]
+))
+visibility_normal.append(True); visibility_compare.append(True)  # visible in both modes
 
-for i, _ in enumerate(traces_all):
-    if i == 0:
-        visibility_normal.append(True)   # main line visible
-        visibility_compare.append(True)  # also visible (rebased version is different trace)
-    else:
-        visibility_normal.append(True)   # bands + median visible in normal mode
-        visibility_compare.append(False) # hidden in compare mode
-
-# ---------- Compare Mode traces (rebased BTC and rebased Denominator)
-
-# We will add:
-# - Rebased main (BTC or BTC/denom) line (thin solid)
-# - Optional rebased denominator line (if denominator selected), to compare directly
-# These are visible only in compare mode.
-
-# Placeholder traces (we update data via buttons)
-trace_compare_main = go.Scatter(
+# Compare mode traces (rebased main + (optional) rebased denominator)
+traces.append(go.Scatter(
     x=base["x_days"], y=rebase_to_one(y_main),
-    name="Main (rebased)",
-    mode="lines",
+    name="Main (rebased)", mode="lines",
     line=dict(width=1.5),
     hovertemplate="Date: %{customdata}<br>Rebased: %{y:.6g}<extra>%{fullData.name}</extra>",
-    customdata=base["date_str"],
-    visible=False,
-)
-traces_all.append(trace_compare_main)
-visibility_normal.append(False)
-visibility_compare.append(True)
+    customdata=base["date_str"], visible=False
+))
+visibility_normal.append(False); visibility_compare.append(True)
 
-# “Denominator (rebased)” starts as NaN (no denom in default 'USD/none' view)
-trace_compare_denom = go.Scatter(
-    x=base["x_days"],
-    y=[np.nan]*len(base),
-    name="Denominator (rebased)",
-    mode="lines",
+traces.append(go.Scatter(
+    x=base["x_days"], y=[np.nan]*len(base),
+    name="Denominator (rebased)", mode="lines",
     line=dict(width=1.5, dash="dash"),
     hovertemplate="Date: %{customdata}<br>Rebased: %{y:.6g}<extra>%{fullData.name}</extra>",
-    customdata=base["date_str"],
-    visible=False,
-)
-traces_all.append(trace_compare_denom)
-visibility_normal.append(False)
-visibility_compare.append(True)
+    customdata=base["date_str"], visible=False
+))
+visibility_normal.append(False); visibility_compare.append(True)
 
-# ---------- Figure
+fig = go.Figure(data=traces)
 
-fig = go.Figure(data=traces_all)
-
-# Axes: time log on x (numeric), log y
-x_min = float(base["x_days"].min())
-x_max = float(base["x_days"].max())
+# Axes + layout
+x_min, x_max = float(base["x_days"].min()), float(base["x_days"].max())
 xticks, xticktext = make_log_time_ticks(start_date, x_min, x_max)
 
+title_txt = f"BTC Purchase Indicator — {band_label} (p≈{approx_p:.2f})"
 fig.update_layout(
     template="plotly_white",
     showlegend=True,
-    hovermode="x unified",  # default; toggleable
+    hovermode="x unified",
+    title=title_txt,
     xaxis=dict(
         type="log",
         title="Time (log scale)",
-        tickvals=xticks,
-        ticktext=xticktext,
-        range=[math.log10(max(x_min, 1e-6)), math.log10(max(x_max, 1.0))],
+        tickvals=xticks, ticktext=xticktext,
+        range=[math.log10(max(x_min,1e-6)), math.log10(max(x_max,1.0))]
     ),
-    yaxis=dict(
-        type="log",
-        title=y_label + " (log scale)",
-    ),
-    margin=dict(l=60, r=20, t=50, b=50),
-    title="BTC Purchase Indicator (Log Time & Log Value)",
+    yaxis=dict(type="log", title=y_label + " (log scale)"),
+    margin=dict(l=60,r=20,t=70,b=50)
 )
 
-# ---------- Menus
-
-# 1) Hover panel toggle (unified vs. closest), and legend toggle
+# Menus
 hover_menu = dict(
     buttons=[
-        dict(
-            label="Hover: Unified",
-            method="relayout",
-            args=[{"hovermode": "x unified"}],
-        ),
-        dict(
-            label="Hover: Per Trace",
-            method="relayout",
-            args=[{"hovermode": "x"}],
-        ),
-        dict(
-            label="Toggle Legend",
-            method="relayout",
-            args=[{"showlegend": not fig.layout.showlegend}],
-        ),
+        dict(label="Hover: Unified", method="relayout", args=[{"hovermode":"x unified"}]),
+        dict(label="Hover: Per Trace", method="relayout", args=[{"hovermode":"x"}]),
+        dict(label="Toggle Legend", method="relayout", args=[{"showlegend": not fig.layout.showlegend}]),
     ],
-    direction="down",
-    showactive=False,
-    x=0.0, y=1.16,
-    xanchor="left", yanchor="top",
+    direction="down", showactive=False, x=0.0, y=1.16, xanchor="left", yanchor="top",
 )
 
-# 2) Mode toggle: Normal vs Compare (hide bands in Compare)
 mode_menu = dict(
     buttons=[
-        dict(
-            label="Normal",
-            method="update",
-            args=[
-                {"visible": visibility_normal},
-                {
-                    "yaxis.title.text": y_label + " (log scale)",
-                    "hovermode": "x unified",
-                },
-            ],
-        ),
-        dict(
-            label="Compare (Rebased)",
-            method="update",
-            args=[
-                {"visible": visibility_compare},
-                {
-                    "yaxis.title.text": "Rebased to 1.0 (log scale)",
-                    "hovermode": "x unified",
-                },
-            ],
-        ),
+        dict(label="Normal", method="update",
+             args=[{"visible": visibility_normal},
+                   {"yaxis.title.text": y_label + " (log scale)", "hovermode":"x unified"}]),
+        dict(label="Compare (Rebased)", method="update",
+             args=[{"visible": visibility_compare},
+                   {"yaxis.title.text": "Rebased to 1.0 (log scale)", "hovermode":"x unified"}]),
     ],
-    direction="down",
-    showactive=True,
-    x=0.22, y=1.16,
-    xanchor="left", yanchor="top",
+    direction="down", showactive=True, x=0.22, y=1.16, xanchor="left", yanchor="top",
 )
 
-# 3) Denominator menu (including NONE/USD)
-denom_labels = ["USD/None"]
-denom_values = ["USD"]
+denom_labels = ["USD/None"]; denom_values = ["USD"]
 for k in sorted(denoms.keys()):
-    denom_labels.append(k)
-    denom_values.append(k)
+    denom_labels.append(k); denom_values.append(k)
 
-def make_update_for_denom(denom_key):
-    # Update main series + label
-    y_main_d, label_d = series_for_denominator(base, denom_key=denom_key)
-    rebased_main = rebase_to_one(y_main_d)
+def make_denom_update(denom_key):
+    # Main series & label
+    y_d, label_d = series_for_denom(base, denom_key)
+    qpred_d = fit_quantiles(base["x_days"].values, y_d.values, quantiles)
 
-    # Recompute quantile preds for normal mode
-    qpred_d = fit_quantiles(base["x_days"].values, y_main_d.values, quantiles=quantiles)
+    # Re-evaluate current band & color
+    y_last_d = float(y_d.iloc[last_idx])
+    q_vals_d = {q: interpolate_quantile_at_x(qpred_d, q, x_last) for q in quantiles}
+    band_txt, band_col, p_est = "N/A", "#222", 0.0
+    if all(not np.isnan(v) for v in q_vals_d.values()):
+        if y_last_d < q_vals_d[0.1]:
+            band_txt, band_col, p_est = "<10%", colors[0.1], 0.05
+        elif y_last_d < q_vals_d[0.3]:
+            t = (y_last_d - q_vals_d[0.1]) / max(1e-12, (q_vals_d[0.3]-q_vals_d[0.1]))
+            band_txt, band_col, p_est = "10–30%", colors[0.3], 0.10+0.20*t
+        elif y_last_d < q_vals_d[0.5]:
+            t = (y_last_d - q_vals_d[0.3]) / max(1e-12, (q_vals_d[0.5]-q_vals_d[0.3]))
+            band_txt, band_col, p_est = "30–50%", colors[0.5], 0.30+0.20*t
+        elif y_last_d < q_vals_d[0.7]:
+            t = (y_last_d - q_vals_d[0.5]) / max(1e-12, (q_vals_d[0.7]-q_vals_d[0.5]))
+            band_txt, band_col, p_est = "50–70%", colors[0.7], 0.50+0.20*t
+        elif y_last_d < q_vals_d[0.9]:
+            t = (y_last_d - q_vals_d[0.7]) / max(1e-12, (q_vals_d[0.9]-q_vals_d[0.7]))
+            band_txt, band_col, p_est = "70–90%", colors[0.9], 0.70+0.20*t
+        else:
+            band_txt, band_col, p_est = ">90%", colors[0.9], 0.95
 
-    # Prepare new data arrays for:
-    # index 0: main line
-    new_traces = {
-        0: dict(y=y_main_d, name=label_d, hovertemplate="Date: %{customdata}<br>Value: %{y:.6g}<extra>%{fullData.name}</extra>"),
-    }
+    # Prepare per-trace updates IN ORDER:
+    updates = []
 
-    # Median + bands are between indices [1..band_end_index]
-    # We’ll rebuild them “in place” (if available). If missing, set to NaN to hide shape but keep visibility logic.
-    # Start by defaulting to NaNs:
-    for i in range(1, band_end_index + 1):
-        new_traces[i] = dict(y=[np.nan]*len(traces_all[i]["x"]))
+    # q-lines (q10, q30, q50, q70, q90) occupy indices 0..(nq-1)
+    nq = sum(1 for q in q_lines_order if q in qpred)  # original counts
+    # Rebuild lines for new denom
+    for q in q_lines_order:
+        if q in qpred_d:
+            xq, yq = qpred_d[q]
+            updates.append({"x": xq, "y": yq, "name": f"q{int(q*100)}"})
+        else:
+            updates.append({"y":[np.nan]})  # keep slot
 
-    if 0.5 in qpred_d:
-        x50_d, y50_d = qpred_d[0.5]
-        # Find the median trace index (first after main)
-        new_traces[1] = dict(x=x50_d, y=y50_d, name="Median (50%)")
-
-    # Rebuild each band pair in the same append order used earlier:
-    # Order added earlier:
-    #   median (1)
-    #   30–50 upper (2), 30–50 lower (3)
-    #   50–70 upper (4), 50–70 lower (5)
-    #   10–30 upper (6), 10–30 lower (7)
-    #   70–90 upper (8), 70–90 lower (9)
-    # We must align to match existing indices.
-    band_pairs = [(0.3,0.5),(0.5,0.7),(0.1,0.3),(0.7,0.9)]
-    idx = 2
-    for (ql, qh) in band_pairs:
-        if ql in qpred_d and qh in qpred_d:
-            xl, yl = qpred_d[ql]
-            xh, yh = qpred_d[qh]
+    # Band pairs (added next): keep geometry but values change
+    def band_pair(q_low,q_high):
+        if q_low in qpred_d and q_high in qpred_d:
+            xl, yl = qpred_d[q_low]; xh, yh = qpred_d[q_high]
             x_common = np.intersect1d(xl, xh)
-            if len(x_common) > 0:
+            if len(x_common):
                 yl_i = np.interp(x_common, xl, yl)
                 yh_i = np.interp(x_common, xh, yh)
-                # upper
-                new_traces[idx]   = dict(x=x_common, y=yh_i)
-                # lower
-                new_traces[idx+1] = dict(x=x_common, y=yl_i)
-        idx += 2
+                updates.append({"x": x_common, "y": yh_i})
+                updates.append({"x": x_common, "y": yl_i})
+                return
+        updates.append({"y":[np.nan]}); updates.append({"y":[np.nan]})
+    band_pair(0.3,0.5)
+    band_pair(0.5,0.7)
+    band_pair(0.1,0.3)
+    band_pair(0.7,0.9)
 
-    # Compare traces (last two) — main rebased + denominator rebased
-    # index: len(traces_all)-2 → main rebased
-    # index: len(traces_all)-1 → denom rebased (only if denom selected and exists)
-    i_main_cmp = len(traces_all) - 2
-    i_denom_cmp = len(traces_all) - 1
+    # Main line (colored by band)
+    updates.append({"y": y_d, "name": label_d, "line.color": band_col})
 
-    new_traces[i_main_cmp] = dict(y=rebased_main, name="Main (rebased)")
-
+    # Compare traces (rebased main + denom)
+    updates.append({"y": rebase_to_one(y_d), "name": "Main (rebased)"})
     if denom_key and denom_key.upper() in denoms:
-        denom_df = denoms[denom_key.upper()]
-        dfm = base.merge(denom_df.rename(columns={"price": "den"}), on="date", how="left")
-        rebased_den = rebase_to_one(dfm["den"])
-        new_traces[i_denom_cmp] = dict(y=rebased_den, name=f"{denom_key.upper()} (rebased)")
+        dfden = denoms[denom_key.upper()]
+        dfm = base.merge(dfden.rename(columns={"price":"den"}), on="date", how="left")
+        updates.append({"y": rebase_to_one(dfm["den"]), "name": f"{denom_key.upper()} (rebased)"})
     else:
-        new_traces[i_denom_cmp] = dict(y=[np.nan]*len(base), name="Denominator (rebased)")
+        updates.append({"y": [np.nan]*len(base), "name": "Denominator (rebased)"})
 
-    # Title update
-    new_layout = {"yaxis.title.text": (label_d + " (log scale)")}
-
-    # Build args for "restyle" with a list in trace order
-    restyle_args = []
-    for i in range(len(traces_all)):
-        restyle_args.append(new_traces.get(i, {}))
-
-    return [{"yaxis.type": "log"}, restyle_args, new_layout]
+    layout_updates = {
+        "yaxis.title.text": label_d + " (log scale)",
+        "title.text": f"BTC Purchase Indicator — {band_txt} (p≈{p_est:.2f})"
+    }
+    return updates, layout_updates
 
 denom_buttons = []
-for lab, val in zip(denom_labels, denom_values):
-    args = make_update_for_denom(val)
-    # Plotly "updatemenus" supports a combination of "relayout" + "restyle" + "update",
-    # but here we’ll use method='update' with args=[trace_updates, layout_updates]
-    # To pass multiple instruction types, we can wrap them with a custom key ordering by leveraging
-    # Plotly's 'args' semantics. Simpler approach: use method='update' and include {"yaxis.type":...} in layout.
+for lab, val in zip(["USD/None"]+[k for k in sorted(denoms.keys())],
+                    ["USD"]+[k for k in sorted(denoms.keys())]):
+    tr_updates, ly_updates = make_denom_update(val)
     denom_buttons.append(dict(
-        label=lab,
-        method="update",
-        args=[
-            # traces (in order)
-            [{"y": a.get("y", None), "x": a.get("x", None), "name": a.get("name", None), "hovertemplate": a.get("hovertemplate", None)} for a in args[1]],
-            args[2]  # layout
-        ],
+        label=lab, method="update",
+        args=[[tr_updates,], ly_updates]
     ))
 
 denom_menu = dict(
-    buttons=denom_buttons,
-    direction="down",
-    showactive=True,
-    x=0.48, y=1.16,
-    xanchor="left", yanchor="top",
+    buttons=denom_buttons, direction="down", showactive=True,
+    x=0.48, y=1.16, xanchor="left", yanchor="top"
 )
 
-fig.update_layout(
-    updatemenus=[hover_menu, mode_menu, denom_menu]
-)
+fig.update_layout(updatemenus=[hover_menu, mode_menu, denom_menu])
 
-# Ensure visibility states match initial "Normal" mode
-fig.update_traces(visible=None)  # keep as configured above
-
-# ---------- Write HTML
-
+# Final write
 os.makedirs(os.path.dirname(OUTPUT_HTML), exist_ok=True)
 fig.write_html(OUTPUT_HTML, include_plotlyjs="cdn", full_html=True)
 print(f"Wrote {OUTPUT_HTML}")
