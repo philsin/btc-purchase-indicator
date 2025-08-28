@@ -266,8 +266,9 @@ def build_payload(denom_key: Optional[str]):
 
     return {
         "label": y_label,                        # "BTC / <DENOM>"
-        "x_main": base["x_days"].tolist(),       # for interpolation in panel
-        "date_main": base["date_iso"].tolist(),  # for plotting X
+        "x_main": base["x_days"].tolist(),       # days since start (for panel math)
+        "y_main": y_main.tolist(),               # <-- MISSING BEFORE (needed by figure & panel)
+        "date_main": base["date_iso"].tolist(),  # for plotting X as dates
         "x_grid": x_grid_days.tolist(),
         "date_grid": date_grid_iso,
         "q_lines": {str(q): preds[q].tolist() if q in preds else [] for q in QUANTILES},
@@ -283,7 +284,9 @@ def build_payload(denom_key: Optional[str]):
         },
         "main_rebased": rebase_to_one(y_main).tolist(),
         "denom_rebased": rebase_to_one(denom_series).tolist() if denom_series is not None else [math.nan]*len(base),
-        "band_label": band_txt, "percentile": p_est, "line_color": color,
+        "band_label": band_txt,
+        "percentile": p_est,
+        "line_color": color,
     }
 
 PRECOMP = {"USD": build_payload(None)}
