@@ -158,8 +158,13 @@ def collect_denominators() -> Dict[str, pd.DataFrame]:
 
 # --------------------------- MATH -------------------------------
 
-def days_since_start(dates: pd.Series, start: datetime) -> pd.Series:
-    return (dates - start).dt.days.astype(float) + 1.0  # avoid log(0)
+def days_since_start(dates, start):
+    """Return days since `start` as a float Series (handles Series, arrays, DatetimeIndex)."""
+    d = pd.to_datetime(dates)
+    s = pd.Series(d)  # normalize to Series so we can vectorize reliably
+    delta = s - pd.Timestamp(start)
+    return (delta / np.timedelta64(1, "D")).astype(float) + 1.0  # +1 to avoid log(0)
+
 
 def fit_quantile_params(x_days: np.ndarray, y: np.ndarray, qs=QUANTILES) -> Dict[float, Tuple[float,float]]:
     """Power-law in time: log10(y) = a + b * log10(days_since_start)."""
