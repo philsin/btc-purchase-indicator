@@ -1,30 +1,20 @@
 #!/usr/bin/env python3
 """
-BTC Purchase Indicator — Bitbo-style (power-law bands, linear date X axis)
+BTC Purchase Indicator — Porkopolis-style power-law view (log-log)
 
-Features
---------
-- Model: log10(price) ~ a + b * log10(days_since_start)  (power-law)
-- X axis: calendar dates (linear), year-only ticks angled to match Bitbo's visual
-- Y axis: log, faux "0" label then 1, 10, 100, ... with comma separators
-- Y title: "BTC / <DENOMINATOR>"
-- Bands: q10,q30,q50,q70,q90; non-crossing with soft spacing to avoid touching
-- Start at 2011-01-01; extend predictions to 2040-12-31
-- Right-side: fixed legend at top; static hover panel beneath (bold date, colored values)
-- Denominator dropdown (`data/denominator_*.csv`; date,price)
-- Compare mode toggle (rebased main + denom) hides bands
-- Copy Snapshot (chart + right panel). iOS/Safari fallback opens PNG tab
-- Mobile-friendly layout via CSS media query
-
-Notes
------
-- If no API key: pulls BTC from Blockchain.com Charts; else CoinGecko Pro (COINGECKO_API_KEY / X_CG_PRO_API_KEY)
-- If CI/network blocks: add your own data/btc_usd.csv (columns: date,price)
+- Model: power-law in time  log10(price) = a + b * log10(days_since_genesis)
+- X axis: log scale of DAYS since Genesis (2009-01-03)
+- Y axis: log scale; faux "0" label then 1, 10, 100… with comma separators
+- Bands: percentiles (q10, q30, q50, q70, q90) enforced non-crossing with soft gap
+- UI: right-side static panel (bold short date), legend fixed to top-right, denominator dropdown
+- Compare mode (rebased lines) hides bands
+- Copy Snapshot (chart + side panel); Safari fallback opens PNG
+- Mobile-friendly CSS
 """
 
 import os, io, glob, time, math, json
 from typing import Optional, Dict, Tuple
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from string import Template
 
 import numpy as np
@@ -35,22 +25,23 @@ from statsmodels.regression.quantile_regression import QuantReg
 
 # ---------------------------- CONFIG ----------------------------
 
-OUTPUT_HTML = "docs/index.html"
-DATA_DIR    = "data"
-BTC_FILE    = os.path.join(DATA_DIR, "btc_usd.csv")
+OUTPUT_HTML   = "docs/index.html"
+DATA_DIR      = "data"
+BTC_FILE      = os.path.join(DATA_DIR, "btc_usd.csv")
 
-START_DATE  = datetime(2011, 1, 1)
-END_PROJ    = datetime(2040, 12, 31)
+GENESIS_DATE  = datetime(2009, 1, 3)  # Porkopolis uses days since 2009-01-03 (Genesis) [power-law x]. 
+START_CUTOFF  = datetime(2011, 1, 1)  # filter for cleaner early data, but x still counts from Genesis
+END_PROJ      = datetime(2040, 12, 31)
 
-QUANTILES   = (0.1, 0.3, 0.5, 0.7, 0.9)
-Q_ORDER     = [0.1, 0.3, 0.5, 0.7, 0.9]
+QUANTILES     = (0.1, 0.3, 0.5, 0.7, 0.9)
+Q_ORDER       = [0.1, 0.3, 0.5, 0.7, 0.9]
 
 BAND_COLORS = {
-    0.1: "#D32F2F",  # red-ish
-    0.3: "#F57C00",  # orange
-    0.5: "#FBC02D",  # yellow
-    0.7: "#7CB342",  # yellow-green
-    0.9: "#2E7D32",  # green
+    0.1: "#D32F2F",  # Bottom
+    0.3: "#F57C00",
+    0.5: "#FBC02D",
+    0.7: "#7CB342",
+    0.9: "#2E7D32",  # Top
 }
 
 BAND_NAMES = {
@@ -62,7 +53,7 @@ BAND_NAMES = {
     1.0: "Top 10%",
 }
 
-# minimum *log-space* separation between adjacent quantile curves to avoid touching (~0.23%)
+# Soft log-space gap between adjacent quantiles so fills don't touch visually (~0.23%)
 MIN_GAP_LOG10 = 1e-3
 
 # ---------------------------- UTILS -----------------------------
@@ -81,6 +72,13 @@ def _retry(fn, tries=3, base_delay=1.0, factor=2.0):
             last=e
             if i<tries-1: time.sleep(base_delay*(factor**i))
     raise last
+
+# Robust: works for Series, arrays, DatetimeIndex
+def days_since_genesis(dates, genesis):
+    d = pd.to_datetime(dates)
+    s = pd.Series(d)
+    delta = s - pd.Timestamp(genesis)
+    return (delta / np.timedelta64(1, "D")).astype(float) + 1.0  # +1 => no log(0)
 
 # ------------------------- DATA LOADERS -------------------------
 
@@ -156,18 +154,10 @@ def collect_denominators() -> Dict[str, pd.DataFrame]:
         except Exception as e: print(f"[warn] bad denom {p}: {e}")
     return opts
 
-# --------------------------- MATH -------------------------------
-
-def days_since_start(dates, start):
-    """Return days since `start` as a float Series (handles Series, arrays, DatetimeIndex)."""
-    d = pd.to_datetime(dates)
-    s = pd.Series(d)  # normalize to Series so we can vectorize reliably
-    delta = s - pd.Timestamp(start)
-    return (delta / np.timedelta64(1, "D")).astype(float) + 1.0  # +1 to avoid log(0)
-
+# --------------------------- MODEL ------------------------------
 
 def fit_quantile_params(x_days: np.ndarray, y: np.ndarray, qs=QUANTILES) -> Dict[float, Tuple[float,float]]:
-    """Power-law in time: log10(y) = a + b * log10(days_since_start)."""
+    """Power-law in time: log10(y) = a + b * log10(days_since_genesis)."""
     m=(x_days>0)&(y>0)&np.isfinite(x_days)&np.isfinite(y)
     x=x_days[m]; z=np.log10(y[m]); X=pd.DataFrame({"logx":np.log10(x)})
     if len(x)<10: return {}
@@ -177,7 +167,7 @@ def fit_quantile_params(x_days: np.ndarray, y: np.ndarray, qs=QUANTILES) -> Dict
             model=QuantReg(z, pd.concat([pd.Series(1.0,index=X.index,name="const"), X],axis=1))
             res=model.fit(q=q)
             params[q]=(float(res.params["const"]), float(res.params["logx"]))
-        except Exception as e:
+        except Exception:
             pass
     return params
 
@@ -186,15 +176,14 @@ def predict_from_params(params: Dict[float,Tuple[float,float]], x_days_grid: np.
     preds={}
     lx=np.log10(x_days_grid)
     for q,(a,b) in params.items():
-        z=a+b*lx
-        preds[q]=10**z
+        preds[q] = 10**(a + b*lx)
     if not enforce: return preds
     qs=sorted(preds.keys())
     if not qs: return preds
     mat=np.vstack([np.log10(preds[q]) for q in qs])  # (nq, n)
     for j in range(mat.shape[1]):
         for i in range(1, mat.shape[0]):
-            mat[i,j]=max(mat[i,j], mat[i-1,j] + min_gap_log10)
+            mat[i,j] = max(mat[i,j], mat[i-1,j] + min_gap_log10)
     for i,q in enumerate(qs):
         preds[q]=10**mat[i,:]
     return preds
@@ -228,24 +217,22 @@ def classify_band(y_last: float, x_last_days: float, params: Dict[float,Tuple[fl
 btc = get_btc_df().rename(columns={"price":"btc"})
 denoms = collect_denominators()
 
-# merge denominators
+# align & enrich
 base = btc.copy()
 for name, df in denoms.items():
     base = base.merge(df.rename(columns={"price": name.lower()}), on="date", how="left")
 
-# trim to start
-base = base[base["date"] >= START_DATE].reset_index(drop=True)
+# Trim visible history for cleanliness, but compute x (days) from Genesis
+base = base[base["date"] >= START_CUTOFF].reset_index(drop=True)
 if base.empty: raise RuntimeError("No BTC data on/after 2011-01-01")
 
-start_date = base["date"].iloc[0]
-base["x_days"] = days_since_start(base["date"], start_date)
+base["x_days"]   = days_since_genesis(base["date"], GENESIS_DATE)
 base["date_iso"] = base["date"].dt.strftime("%Y-%m-%d")
 base["date_str"] = base["date"].dt.strftime("%m/%d/%y")
 
-# --- Build date grid to END_PROJ (for plotting); keep days grid for modeling ---
-date_grid = pd.date_range(start_date, END_PROJ, freq="D")
-x_grid_days = days_since_start(date_grid, start_date).astype(float).values
-date_grid_iso = [d.strftime("%Y-%m-%d") for d in date_grid]
+# X grid in DAYS (log space) through END_PROJ
+x_end = float(days_since_genesis(pd.Series([END_PROJ]), GENESIS_DATE).iloc[0])
+x_grid = np.logspace(np.log10(1.0), np.log10(x_end), 600)
 
 # -------------------- PRECOMPUTE PER DENOM ---------------------
 
@@ -253,11 +240,10 @@ def build_payload(denom_key: Optional[str]):
     y_main, y_label, denom_series = series_for_denom(base, denom_key)
     x_vals = base["x_days"].values.astype(float)
 
-    # fit power-law quantiles on days
     params = fit_quantile_params(x_vals, y_main.values, QUANTILES)
-    preds  = predict_from_params(params, x_grid_days, enforce=True, min_gap_log10=MIN_GAP_LOG10)
+    preds  = predict_from_params(params, x_grid, enforce=True, min_gap_log10=MIN_GAP_LOG10)
 
-    # classify latest point
+    # classify latest
     valid_idx = np.where(np.isfinite(y_main.values))[0]
     last_idx  = int(valid_idx[-1])
     x_last    = float(base["x_days"].iloc[last_idx])
@@ -265,12 +251,10 @@ def build_payload(denom_key: Optional[str]):
     band_txt, p_est, color = classify_band(y_last, x_last, params)
 
     return {
-        "label": y_label,                        # "BTC / <DENOM>"
-        "x_main": base["x_days"].tolist(),       # days since start (for panel math)
-        "y_main": y_main.tolist(),               # <-- MISSING BEFORE (needed by figure & panel)
-        "date_main": base["date_iso"].tolist(),  # for plotting X as dates
-        "x_grid": x_grid_days.tolist(),
-        "date_grid": date_grid_iso,
+        "label": y_label,                # "BTC / <DENOM>"
+        "x_main": base["x_days"].tolist(),
+        "y_main": y_main.tolist(),
+        "x_grid": x_grid.tolist(),
         "q_lines": {str(q): preds[q].tolist() if q in preds else [] for q in QUANTILES},
         "bands": {
             "0.3-0.5": {"upper": preds.get(0.5, []).tolist() if 0.5 in preds else [],
@@ -284,9 +268,7 @@ def build_payload(denom_key: Optional[str]):
         },
         "main_rebased": rebase_to_one(y_main).tolist(),
         "denom_rebased": rebase_to_one(denom_series).tolist() if denom_series is not None else [math.nan]*len(base),
-        "band_label": band_txt,
-        "percentile": p_est,
-        "line_color": color,
+        "band_label": band_txt, "percentile": p_est, "line_color": color,
     }
 
 PRECOMP = {"USD": build_payload(None)}
@@ -299,41 +281,39 @@ init = PRECOMP["USD"]
 
 traces=[]; vis_norm=[]; vis_cmp=[]
 
-# 0..4 quantile lines (use date_grid for X)
+# 0..4 quantile lines (x = DAYS since Genesis; log axis)
 for q in Q_ORDER:
     traces.append(go.Scatter(
-        x=init["date_grid"], y=init["q_lines"][str(q)], mode="lines",
+        x=init["x_grid"], y=init["q_lines"][str(q)], mode="lines",
         name=f"q{int(q*100)}", line=dict(width=0.8, dash="dot", color=BAND_COLORS[q]),
         hoverinfo="skip", showlegend=False
     ))
     vis_norm.append(True); vis_cmp.append(False)
 
-# 5..12 filled bands (inner→outer) (use date_grid)
+# 5..12 filled bands
 def add_band(pair_key, ql, qh):
     U = init["bands"][pair_key]["upper"]; L = init["bands"][pair_key]["lower"]
-    traces.append(go.Scatter(x=init["date_grid"], y=U, mode="lines",
+    traces.append(go.Scatter(x=init["x_grid"], y=U, mode="lines",
                              line=dict(width=0.5, color=BAND_COLORS[qh]),
                              hoverinfo="skip", showlegend=False))
-    traces.append(go.Scatter(x=init["date_grid"], y=L, mode="lines",
+    traces.append(go.Scatter(x=init["x_grid"], y=L, mode="lines",
                              line=dict(width=0.5, color=BAND_COLORS[ql]),
                              hoverinfo="skip", showlegend=False,
                              fill="tonexty", fillcolor=rgba(BAND_COLORS[qh], 0.18)))
-    # mutate outer visibility lists (no rebinding)
-    vis_norm.extend([True, True])
-    vis_cmp.extend([False, False])
+    vis_norm.extend([True, True]); vis_cmp.extend([False, False])
 
 add_band("0.3-0.5",0.3,0.5); add_band("0.5-0.7",0.5,0.7); add_band("0.1-0.3",0.1,0.3); add_band("0.7-0.9",0.7,0.9)
 
-# 13 main series
-traces.append(go.Scatter(x=init["date_main"], y=init["y_main"], mode="lines",
+# 13 main
+traces.append(go.Scatter(x=init["x_main"], y=init["y_main"], mode="lines",
                          name=init["label"], line=dict(width=1.6, color=init["line_color"]),
                          hoverinfo="skip"))
 vis_norm.append(True); vis_cmp.append(False)
 
-# 14 main rebased; 15 denom rebased (shown only in Compare mode)
-traces.append(go.Scatter(x=init["date_main"], y=init["main_rebased"], name="Main (rebased)",
+# 14 main rebased; 15 denom rebased (Compare mode only)
+traces.append(go.Scatter(x=init["x_main"], y=init["main_rebased"], name="Main (rebased)",
                          mode="lines", hoverinfo="skip", visible=False))
-traces.append(go.Scatter(x=init["date_main"], y=init["denom_rebased"], name="Denominator (rebased)",
+traces.append(go.Scatter(x=init["x_main"], y=init["denom_rebased"], name="Denominator (rebased)",
                          mode="lines", line=dict(dash="dash"), hoverinfo="skip", visible=False))
 vis_norm.extend([False, False]); vis_cmp.extend([True, True])
 
@@ -353,33 +333,36 @@ for q in Q_ORDER:
 y_max = max(y_candidates)
 ytickvals, yticktext = make_y_ticks(y_max)
 
-# Layout: date axis (linear) with year-only ticks angled
+# X ticks: powers of 10 days (1, 10, 100, 1,000, 10,000)
+def make_x_ticks(xmax: float):
+    exp_max = int(math.ceil(math.log10(max(1.0, xmax))))
+    vals=[10**e for e in range(0, exp_max+1)]
+    texts=[("1" if v<10 else f"{int(v):,}") for v in vals]
+    return vals, texts
+
+xtickvals, xticktext = make_x_ticks(max(init["x_grid"]))
+
 fig.update_layout(
     template="plotly_white",
     showlegend=True,
     hovermode=False,
     title=f"BTC Purchase Indicator — {init['band_label']} (p≈{init['percentile']:.2f})",
     xaxis=dict(
-        type="date",
-        title="Year",
-        tickformat="%Y",
-        dtick="M12",
-        tickangle=-30,
-        range=[init["date_main"][0], date_grid_iso[-1]],
+        type="log",
+        title="Days since Genesis (log scale)",
+        tickmode="array", tickvals=xtickvals, ticktext=xticktext
     ),
     yaxis=dict(
         type="log",
-        title=init["label"],  # "BTC / <DENOM>"
+        title=init["label"],  # "BTC / <DENOMINATOR>"
         tickmode="array", tickvals=ytickvals, ticktext=yticktext
     ),
     legend=dict(x=1.02, xanchor="left", y=1.0, yanchor="top", bgcolor="rgba(255,255,255,0.0)"),
     margin=dict(l=70, r=360, t=70, b=70),
 )
 
-# Mode buttons (hide bands in Compare mode)
-vis_cmp_mask=[False]*len(traces)
-vis_cmp_mask[14]=True; vis_cmp_mask[15]=True
-
+# Mode buttons
+vis_cmp_mask=[False]*len(traces); vis_cmp_mask[14]=True; vis_cmp_mask[15]=True
 mode_menu=dict(
     buttons=[
         dict(label="Normal", method="update",
@@ -400,7 +383,7 @@ plot_html = fig.to_html(full_html=False, include_plotlyjs="cdn",
 precomp_json   = json.dumps(PRECOMP)
 band_colors_js = json.dumps({str(k): v for k,v in BAND_COLORS.items()})
 band_names_js  = json.dumps(BAND_NAMES)
-start_iso      = start_date.strftime("%Y-%m-%d")
+genesis_iso    = GENESIS_DATE.strftime("%Y-%m-%d")
 
 html_tpl = Template(r"""<!DOCTYPE html>
 <html lang="en">
@@ -426,10 +409,8 @@ html_tpl = Template(r"""<!DOCTYPE html>
     font-size:14px; padding:8px 10px; border-radius:8px; border:1px solid #d1d5db; background:white;
   }
   #copyBtn { cursor:pointer; }
-  /* Hide Plotly hover popups */
-  .hoverlayer { display:none !important; }
+  .hoverlayer { display:none !important; } /* we use side panel instead */
 
-  /* Mobile (Safari-friendly) */
   @media (max-width: 900px) {
     .layout { grid-template-columns: 1fr; height: auto; }
     .right { border-left:none; border-top:1px solid #e5e7eb; }
@@ -469,7 +450,7 @@ html_tpl = Template(r"""<!DOCTYPE html>
 const PRECOMP      = $PRECOMP_JSON;
 const BAND_COLORS  = $BAND_COLORS_JS;
 const BAND_NAMES   = $BAND_NAMES_JS;
-const START_ISO    = "$START_ISO";
+const GENESIS_ISO  = "$GENESIS_ISO";
 
 // Build denominator selector
 const denomSel = document.getElementById('denomSel');
@@ -489,13 +470,8 @@ function numFmt(v){
   if (v >= 1)    return Number(v).toLocaleString(undefined, {maximumFractionDigits: 6});
   return Number(v).toExponential(2);
 }
-function xToDays(xDate){
-  const d0 = new Date(START_ISO + 'T00:00:00Z');
-  const d  = new Date(xDate);
-  return ((d.getTime() - d0.getTime()) / 86400000) + 1.0;
-}
 function dateFromDays(x){
-  const d0=new Date(START_ISO+'T00:00:00Z');
+  const d0=new Date(GENESIS_ISO+'T00:00:00Z');
   const d=new Date(d0.getTime() + (x-1)*86400000);
   return (String(d.getUTCMonth()+1).padStart(2,'0')) + '/' + (String(d.getUTCDate()).padStart(2,'0')) + '/' + (String(d.getUTCFullYear()).slice(-2));
 }
@@ -513,7 +489,7 @@ const elQ10=document.getElementById('q10'), elQ30=document.getElementById('q30')
       elQ50=document.getElementById('q50'), elQ70=document.getElementById('q70'), elQ90=document.getElementById('q90');
 const elMain=document.getElementById('mainVal'), elBand=document.getElementById('bandLbl');
 
-function updatePanelDays(den,xDays){
+function updatePanel(den,xDays){
   const P=PRECOMP[den];
   elDate.textContent = dateFromDays(xDays);
   const q10=P.q_lines["0.1"].length?interp(P.x_grid,P.q_lines["0.1"],xDays):NaN;
@@ -532,40 +508,35 @@ function updatePanelDays(den,xDays){
 
 document.addEventListener('DOMContentLoaded', function(){
   const plotDiv=document.querySelector('.left .js-plotly-plot');
-  // hover → panel
   plotDiv.on('plotly_hover', function(ev){
     if(!ev.points||!ev.points.length) return;
-    const xDays = xToDays(ev.points[0].x);
-    updatePanelDays(denomSel.value, xDays);
+    updatePanel(denomSel.value, ev.points[0].x); // x is DAYS (log axis)
   });
 });
 
-// denom change → restyle traces (date X), update titles, panel
+// denom change → restyle traces
 denomSel.addEventListener('change', function(){
   const key=denomSel.value, P=PRECOMP[key];
   const plotDiv=document.querySelector('.left .js-plotly-plot');
-  // 0..4 q-lines (use date_grid)
   const qs=['0.1','0.3','0.5','0.7','0.9'];
   for(let i=0;i<qs.length;i++){
-    Plotly.restyle(plotDiv, { x:[P.date_grid], y:[P.q_lines[qs[i]]] }, [i]);
+    Plotly.restyle(plotDiv, { x:[P.x_grid], y:[P.q_lines[qs[i]]] }, [i]);
   }
-  // 5..12 bands
   function setBand(slot,keyBand){ const U=P.bands[keyBand]?.upper||[], L=P.bands[keyBand]?.lower||[];
-    Plotly.restyle(plotDiv, { x:[P.date_grid], y:[U] }, [slot]);
-    Plotly.restyle(plotDiv, { x:[P.date_grid], y:[L] }, [slot+1]);
+    Plotly.restyle(plotDiv, { x:[P.x_grid], y:[U] }, [slot]);
+    Plotly.restyle(plotDiv, { x:[P.x_grid], y:[L] }, [slot+1]);
   }
   setBand(5,"0.3-0.5"); setBand(7,"0.5-0.7"); setBand(9,"0.1-0.3"); setBand(11,"0.7-0.9");
-  // 13 main; 14 rebased main; 15 rebased denom (use date_main)
-  Plotly.restyle(plotDiv, { x:[P.date_main], y:[P.y_main], name:[P.label], "line.color":[P.line_color] }, [13]);
-  Plotly.restyle(plotDiv, { x:[P.date_main], y:[P.main_rebased] }, [14]);
-  Plotly.restyle(plotDiv, { x:[P.date_main], y:[P.denom_rebased] }, [15]);
+  Plotly.restyle(plotDiv, { x:[P.x_main], y:[P.y_main], name:[P.label], "line.color":[P.line_color] }, [13]);
+  Plotly.restyle(plotDiv, { x:[P.x_main], y:[P.main_rebased] }, [14]);
+  Plotly.restyle(plotDiv, { x:[P.x_main], y:[P.denom_rebased] }, [15]);
   Plotly.relayout(plotDiv, { "yaxis.title.text": P.label,
                              "title.text": "BTC Purchase Indicator — " + P.band_label + " (p≈" + P.percentile.toFixed(2) + ")" });
-  updatePanelDays(key, P.x_main[P.x_main.length-1]);
+  updatePanel(key, P.x_main[P.x_main.length-1]);
 });
 
 // initial panel at latest point
-updatePanelDays('USD', PRECOMP['USD'].x_main[PRECOMP['USD'].x_main.length-1]);
+updatePanel('USD', PRECOMP['USD'].x_main[PRECOMP['USD'].x_main.length-1]);
 
 // copy snapshot (chart + panel). iOS Safari fallback opens image.
 document.getElementById('copyBtn').addEventListener('click', async function(){
@@ -590,7 +561,7 @@ html = html_tpl.safe_substitute(
     PRECOMP_JSON=precomp_json,
     BAND_COLORS_JS=band_colors_js,
     BAND_NAMES_JS=band_names_js,
-    START_ISO=start_iso,
+    GENESIS_ISO=genesis_iso,
     COL_10=BAND_COLORS[0.1],
     COL_30=BAND_COLORS[0.3],
     COL_50=BAND_COLORS[0.5],
