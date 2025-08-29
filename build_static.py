@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-BTC Purchase Indicator — power-law (log–log) with constant log-offset bands
-
-- Trend: log10(price) = a + b*log10(days since Genesis)
-- Bands: parallel lines via residual quantiles c_p so P_p(t) = 10^c_p * A * t^b
-- Non-crossing by construction + tiny log-gap so fills don't touch
-- BTC line = black
-- Live hover (panel follows cursor); lockable date picker
-- Panel: $ currency, right aligned (monospace), "BTC Price" label, Band label colored, p as %
-- X-axis title removed; hide odd years after 2026
+BTC Purchase Indicator — Envelope Mode (Floor/Ceiling + 10%/50%/90% midlines)
+- Trend: log10(price) = a + b*log10(days since Genesis)  [robust median regression]
+- Residuals: e = log10(price) - (a + b log10(days))
+- Envelopes on residuals (log space):
+    Floor_t   = min(e_t, λ*Floor_{t-1}   + (1-λ)*e_t)
+    Ceiling_t = max(e_t, λ*Ceiling_{t-1} + (1-λ)*e_t)
+  with λ = exp(-ln(2)/half_life_days)  (default half-life = 2 years)
+- Lines on grid (price space):
+    Floor, Ceiling, and log-midlines at 10%, 50% (bold), 90% between them
+- X: log(days since Genesis); ticks show whole years (odd years hidden after 2026)
+- Y: log, axis title updates to denominator (e.g., BTC / USD)
+- Right panel: shows $ values for Floor / 10% / 50% / 90% / Ceiling and BTC Price
+- p% = position of BTC between Floor and Ceiling in log space at the selected date
+- Live hover: panel follows cursor; can lock a date with the picker
 """
 
 import os, io, glob, time, math, json
@@ -31,26 +36,16 @@ BTC_FILE      = os.path.join(DATA_DIR, "btc_usd.csv")
 GENESIS_DATE  = datetime(2009, 1, 3)
 END_PROJ      = datetime(2040, 12, 31)
 
-QUANTILES     = (0.1, 0.3, 0.5, 0.7, 0.9)
-Q_ORDER       = [0.1, 0.3, 0.5, 0.7, 0.9]
+# Envelope smoothing half-life (days) — tweak to taste (2y is a good start)
+ENVELOPE_HALFLIFE_DAYS = 365 * 2
 
-BAND_COLORS = {
-    0.1: "#D32F2F",  # Bottom
-    0.3: "#F57C00",
-    0.5: "#FBC02D",
-    0.7: "#7CB342",
-    0.9: "#2E7D32",  # Top- band color used below q90, Top 10% uses same family
-}
-BAND_NAMES = {
-    0.1: "Bottom 10%",
-    0.3: "10–30%",
-    0.5: "30–50%",
-    0.7: "50–70%",
-    0.9: "70–90%",
-    1.0: "Top 10%",
-}
-
-MIN_GAP_LOG10 = 1e-3   # ~0.23% in linear; keeps bands from visually touching
+# Colors
+COL_FLOOR   = "#D32F2F"   # red
+COL_CEIL    = "#6A1B9A"   # purple
+COL_10      = "#F9A825"   # amber
+COL_50      = "#2E7D32"   # bold green (mid)
+COL_90      = "#388E3C"   # green
+COL_PRICE   = "#000000"   # black
 
 # ---------------------------- UTILS -----------------------------
 
@@ -70,7 +65,6 @@ def _retry(fn, tries=3, base_delay=1.0, factor=2.0):
     raise last
 
 def days_since_genesis(dates, genesis):
-    """Vectorized: works for Series/arrays/DatetimeIndex."""
     d = pd.to_datetime(dates)
     s = pd.Series(d)
     delta = s - pd.Timestamp(genesis)
@@ -153,10 +147,7 @@ def collect_denominators() -> Dict[str, pd.DataFrame]:
 # --------------------------- MODEL ------------------------------
 
 def fit_trend_median(x_days: np.ndarray, y_price: np.ndarray) -> Tuple[float,float,pd.Series]:
-    """
-    Robust central trend via median (q=0.5) quantile regression in log–log space.
-    Returns (a,b,residuals), where residuals are y - (a+b*x) in log10 space.
-    """
+    """Median quantile regression in log–log space. Returns (a,b,residuals) with residuals in log10."""
     m=(x_days>0)&(y_price>0)&np.isfinite(x_days)&np.isfinite(y_price)
     x=x_days[m]; y=np.log10(y_price[m]); X=pd.DataFrame({"logx":np.log10(x)})
     if len(x)<10: raise RuntimeError("Not enough data to fit trend")
@@ -164,27 +155,45 @@ def fit_trend_median(x_days: np.ndarray, y_price: np.ndarray) -> Tuple[float,flo
     res=model.fit(q=0.5)
     a=float(res.params["const"]); b=float(res.params["logx"])
     resid = y - (a + b*np.log10(x))
-    return a,b,resid
+    # Re-expand residuals to original index (align by mask)
+    full_resid = pd.Series(np.nan, index=np.arange(len(x_days), dtype=int))
+    full_resid[m] = resid
+    return a,b,full_resid
 
-def residual_quantiles(resid: pd.Series, qs: Tuple[float,...]) -> Dict[float,float]:
-    """Quantiles in log space; enforce strict monotonicity with tiny gap."""
-    cq = {float(q): float(np.nanquantile(resid, q)) for q in qs}
-    order = sorted(cq.keys())
-    for i in range(1,len(order)):
-        prev,cur = cq[order[i-1]], cq[order[i]]
-        if cur <= prev + MIN_GAP_LOG10:
-            cq[order[i]] = prev + MIN_GAP_LOG10
-    return cq
+def compute_envelopes(resid: pd.Series, x_days: np.ndarray,
+                      half_life_days: float = ENVELOPE_HALFLIFE_DAYS) -> Tuple[np.ndarray,np.ndarray]:
+    """
+    Exponentially-smoothed running min/max on residuals (log space).
+    Returns arrays Floor_t, Ceiling_t aligned to x_days (NaNs before first valid residual).
+    For periods after the last data point, we keep the last envelope value (flat).
+    """
+    lam = float(math.exp(-math.log(2.0) / max(1.0, half_life_days)))
+    e = resid.to_numpy(copy=False)
+    n = len(e)
+    L = np.full(n, np.nan, dtype=float)
+    U = np.full(n, np.nan, dtype=float)
 
-def predict_parallel_bands(a: float, b: float, cq: Dict[float,float], x_days_grid: np.ndarray) -> Dict[str, list]:
-    """Return dict of q-lines (price) for xgrid using constant log-offset bands, as plain Python lists."""
-    lx = np.log10(x_days_grid)
-    trend_log = a + b*lx
-    out={}
-    for q,val in cq.items():
-        ylog = trend_log + val
-        out[str(q)] = (10**ylog).tolist()
-    return out
+    # find first non-nan
+    idxs = np.where(np.isfinite(e))[0]
+    if len(idxs)==0:
+        return L, U
+    i0 = idxs[0]
+    L[i0] = e[i0]
+    U[i0] = e[i0]
+    for i in range(i0+1, n):
+        if not np.isfinite(e[i]):
+            # carry forward with decay but no new info (keeps values steady)
+            L[i] = L[i-1]
+            U[i] = U[i-1]
+            continue
+        # EW decayed proposal
+        Lp = lam*L[i-1] + (1.0-lam)*e[i]
+        Up = lam*U[i-1] + (1.0-lam)*e[i]
+        # Hard min/max to keep envelopes hugging extremes
+        L[i] = min(e[i], Lp)
+        U[i] = max(e[i], Up)
+
+    return L, U
 
 def rebase_to_one(s: pd.Series) -> pd.Series:
     s=pd.Series(s).astype(float).replace([np.inf,-np.inf],np.nan).dropna()
@@ -203,7 +212,6 @@ for name, df in denoms.items():
 
 base["x_days"]   = days_since_genesis(base["date"], GENESIS_DATE)
 base["date_iso"] = base["date"].dt.strftime("%Y-%m-%d")
-base["date_str"] = base["date"].dt.strftime("%m/%d/%y")
 
 # X grid (log-spaced) from first data point to END_PROJ
 x_start = float(base["x_days"].iloc[0])
@@ -240,56 +248,56 @@ def build_payload(denom_key: Optional[str]):
     y_main, y_label, denom_series = series_for_denom(base, denom_key)
     x_vals = base["x_days"].values.astype(float)
 
-    # 1) trend (median)
-    a,b,resid = fit_trend_median(x_vals, y_main.values)
-    # 2) residual quantiles for constant parallel bands
-    cq = residual_quantiles(resid, QUANTILES)
-    # 3) predictions on x_grid -> lists
-    q_lines = predict_parallel_bands(a,b,cq,x_grid)
+    # 1) Trend fit (median)
+    a,b,resid_full = fit_trend_median(x_vals, y_main.values)
 
-    # classify latest
-    valid_idx = np.where(np.isfinite(y_main.values))[0]
-    last_idx  = int(valid_idx[-1])
-    x_last    = float(base["x_days"].iloc[last_idx])
-    y_last    = float(y_main.iloc[last_idx])
+    # 2) Envelopes on residuals (aligned to x_main)
+    L_series, U_series = compute_envelopes(resid_full, x_vals, ENVELOPE_HALFLIFE_DAYS)
 
-    r_last = math.log10(y_last) - (a + b*math.log10(x_last))
-    edges=[0.1,0.3,0.5,0.7,0.9]
-    band_lbl="Top 10%"; band_col=BAND_COLORS[0.9]; p=95.0
-    if r_last < cq[0.1]:
-        band_lbl="Bottom 10%"; band_col=BAND_COLORS[0.1]; p=5.0
-    else:
-        for i in range(len(edges)-1):
-            ql, qh = edges[i], edges[i+1]
-            el, eh = cq[ql], cq[qh]
-            if r_last < eh:
-                t = (r_last - el) / max(1e-12, (eh - el))
-                p = (ql + (qh-ql)*float(np.clip(t,0,1))) * 100.0
-                if   ql==0.1: band_lbl="10–30%"; band_col=BAND_COLORS[0.3]
-                elif ql==0.3: band_lbl="30–50%"; band_col=BAND_COLORS[0.5]
-                elif ql==0.5: band_lbl="50–70%"; band_col=BAND_COLORS[0.7]
-                elif ql==0.7: band_lbl="70–90%"; band_col=BAND_COLORS[0.9]
-                break
+    # 3) Interpolate envelopes to x_grid (constant beyond last point)
+    x_main = base["x_days"].to_numpy()
+    def interp_const(xm, ys, xg):
+        # linear interp inside, clamp edges
+        y = np.interp(xg, xm, ys, left=ys[0], right=ys[-1])
+        return y
+    L_grid = interp_const(x_main, L_series, x_grid)
+    U_grid = interp_const(x_main, U_series, x_grid)
 
-    # build bands dict using lists (no .tolist())
-    bands = {
-        "0.1-0.3": {"lower": q_lines["0.1"], "upper": q_lines["0.3"]},
-        "0.3-0.5": {"lower": q_lines["0.3"], "upper": q_lines["0.5"]},
-        "0.5-0.7": {"lower": q_lines["0.5"], "upper": q_lines["0.7"]},
-        "0.7-0.9": {"lower": q_lines["0.7"], "upper": q_lines["0.9"]},
-    }
+    # 4) Map envelopes + midlines to PRICE space on grid
+    lx = np.log10(x_grid)
+    trend_log_grid = a + b*lx
+    def price_from_log_resid(resid_log):
+        return 10**(trend_log_grid + resid_log)
+
+    floor_grid = price_from_log_resid(L_grid)
+    ceil_grid  = price_from_log_resid(U_grid)
+    # midlines in log space: L + α*(U-L)
+    def mid(alpha): return price_from_log_resid(L_grid + alpha*(U_grid - L_grid))
+    line10_grid = mid(0.10)
+    line50_grid = mid(0.50)
+    line90_grid = mid(0.90)
+
+    # For panel p%: compute position for observed dates, interpolate later
+    trend_log_main = a + b*np.log10(x_main)
+    resid_obs = np.log10(y_main.values) - trend_log_main
+    # ensure no divide-by-zero
+    span = np.maximum(1e-12, (U_series - L_series))
+    p_main = 100.0 * np.clip((resid_obs - L_series) / span, 0.0, 1.0)
 
     return {
         "label": y_label,
-        "x_main": base["x_days"].tolist(),
+        "x_main": x_main.tolist(),
         "y_main": y_main.tolist(),
         "x_grid": x_grid.tolist(),
-        "q_lines": q_lines,              # lists
-        "bands": bands,                  # lists
+        "floor":  floor_grid.tolist(),
+        "ceil":   ceil_grid .tolist(),
+        "line10": line10_grid.tolist(),
+        "line50": line50_grid.tolist(),
+        "line90": line90_grid.tolist(),
+        "p_main": p_main.tolist(),                   # % per observed date
         "main_rebased": rebase_to_one(y_main).tolist(),
         "denom_rebased": rebase_to_one(denom_series).tolist() if denom_series is not None else [math.nan]*len(base),
-        "band_label": band_lbl, "percentile": p, "band_color": band_col,
-        "trend_params": {"a":a, "b":b, "cq": cq},
+        "env_params": {"a":a, "b":b, "lambda": float(math.exp(-math.log(2.0)/ENVELOPE_HALFLIFE_DAYS))},
     }
 
 PRECOMP = {"USD": build_payload(None)}
@@ -301,38 +309,36 @@ init = PRECOMP["USD"]
 
 traces=[]; vis_norm=[]; vis_cmp=[]
 
-# Quantile guide lines (dotted)
-for q in Q_ORDER:
+# Envelope and midlines on grid
+def add_line(y, name, color, width=1.2, dash=None, legend=True):
     traces.append(go.Scatter(
-        x=init["x_grid"], y=init["q_lines"][str(q)], mode="lines",
-        name=f"q{int(q*100)}", line=dict(width=0.8, dash="dot", color=BAND_COLORS[q]),
-        hoverinfo="skip", showlegend=False
+        x=init["x_grid"], y=y, mode="lines", name=name,
+        line=dict(width=width, color=color, dash=(dash or "solid")),
+        hoverinfo="skip", showlegend=legend
     ))
     vis_norm.append(True); vis_cmp.append(False)
 
-# Filled bands — draw LOWER first, then UPPER with fill='tonexty'
-def add_band(pair_key, ql, qh):
-    L = init["bands"][pair_key]["lower"]; U = init["bands"][pair_key]["upper"]
-    traces.append(go.Scatter(x=init["x_grid"], y=L, mode="lines",
-                             line=dict(width=0.6, color=BAND_COLORS[ql]),
-                             hoverinfo="skip", showlegend=False))
-    traces.append(go.Scatter(x=init["x_grid"], y=U, mode="lines",
-                             line=dict(width=0.6, color=BAND_COLORS[qh]),
-                             hoverinfo="skip", showlegend=False,
-                             fill="tonexty", fillcolor=rgba(BAND_COLORS[qh], 0.18)))
-    vis_norm.extend([True, True]); vis_cmp.extend([False, False])
-
-add_band("0.1-0.3",0.1,0.3); add_band("0.3-0.5",0.3,0.5); add_band("0.5-0.7",0.5,0.7); add_band("0.7-0.9",0.7,0.9)
+add_line(init["floor"],  "Floor",     COL_FLOOR, width=1.5)
+add_line(init["line10"], "10%",       COL_10,   width=1.2, dash="dot")
+add_line(init["line50"], "50%",       COL_50,   width=2.2)          # bold
+add_line(init["line90"], "90%",       COL_90,   width=1.2, dash="dot")
+add_line(init["ceil"],   "Ceiling",   COL_CEIL, width=1.5)
 
 # BTC price (black)
 traces.append(go.Scatter(x=init["x_main"], y=init["y_main"], mode="lines",
-                         name="BTC / USD", line=dict(width=1.9, color="#000000"),
+                         name="BTC / USD", line=dict(width=1.9, color=COL_PRICE),
                          hoverinfo="skip"))
 vis_norm.append(True); vis_cmp.append(False)
 
-# Compare-mode lines
+# Transparent cursor line to guarantee hover events
+traces.append(go.Scatter(x=init["x_main"], y=init["y_main"], mode="lines",
+                         name="_cursor", line=dict(width=0), opacity=0.003,
+                         hoverinfo="x", showlegend=False))
+vis_norm.append(True); vis_cmp.append(False)
+
+# Compare-mode (kept for future; hidden by default)
 traces.append(go.Scatter(x=init["x_main"], y=init["main_rebased"], name="Main (rebased)",
-                         mode="lines", hoverinfo="skip", visible=False, line=dict(color="#000000")))
+                         mode="lines", hoverinfo="skip", visible=False, line=dict(color=COL_PRICE)))
 traces.append(go.Scatter(x=init["x_main"], y=init["denom_rebased"], name="Denominator (rebased)",
                          mode="lines", line=dict(dash="dash"), hoverinfo="skip", visible=False))
 vis_norm.extend([False, False]); vis_cmp.extend([True, True])
@@ -346,57 +352,24 @@ def make_y_ticks(max_y: float):
     texts=["0"] + [f"{int(10**e):,}" for e in range(0, exp_max+1)]
     return vals, texts
 
-y_candidates = [np.nanmax(init["y_main"])] + [np.nanmax(init["q_lines"][str(q)]) for q in Q_ORDER if len(init["q_lines"][str(q)])]
-y_max = max(y_candidates)
+y_max = max(
+    np.nanmax(init["y_main"]),
+    np.nanmax(init["floor"]),
+    np.nanmax(init["ceil"])
+)
 ytickvals, yticktext = make_y_ticks(y_max)
 
 fig.update_layout(
     template="plotly_white",
     showlegend=True,
-    hovermode="x",  # keep events for live hover
+    hovermode="x",
     hoverdistance=30, spikedistance=30,
-    title=f"BTC Purchase Indicator — {init['band_label']} (p≈{init['percentile']:.1f}%)",
+    title=f"BTC Purchase Indicator",
     xaxis=dict(type="log", title=None, tickmode="array", tickvals=xtickvals, ticktext=xticktext),
-    yaxis=dict(type="log", title="BTC / <DENOMINATOR>", tickmode="array", tickvals=ytickvals, ticktext=yticktext),
+    yaxis=dict(type="log", title=init["label"], tickmode="array", tickvals=ytickvals, ticktext=yticktext),
     legend=dict(x=1.02, xanchor="left", y=1.0, yanchor="top", bgcolor="rgba(255,255,255,0.0)"),
-    margin=dict(l=70, r=400, t=70, b=70),
+    margin=dict(l=70, r=420, t=70, b=70),
 )
-
-# Band annotations (Normal mode)
-def band_annotations_for(q_lines: Dict[str, List[float]], xs: List[float]):
-    if not xs: return []
-    idx = max(0, int(0.82*(len(xs)-1)))
-    def gm(a,b): return math.sqrt(a*b)
-    q10=q_lines["0.1"]; q30=q_lines["0.3"]; q50=q_lines["0.5"]; q70=q_lines["0.7"]; q90=q_lines["0.9"]
-    if not all(len(v)>idx for v in [q10,q30,q50,q70,q90]): return []
-    x=xs[idx]
-    pts=[
-        (x, q10[idx]*0.80, "Bottom 10%"),
-        (x, gm(q10[idx],q30[idx]), "10–30%"),
-        (x, gm(q30[idx],q50[idx]), "30–50%"),
-        (x, gm(q50[idx],q70[idx]), "50–70%"),
-        (x, gm(q70[idx],q90[idx]), "70–90%"),
-        (x, q90[idx]*1.25, "Top 10%"),
-    ]
-    return [dict(x=xx,y=yy,xref="x",yref="y",text=txt,showarrow=False,
-                 font=dict(size=12,color="#111"), bgcolor="rgba(255,255,255,0.6)",
-                 bordercolor="rgba(0,0,0,0.1)", borderwidth=1, borderpad=3) for (xx,yy,txt) in pts]
-
-initial_annotations = band_annotations_for(init["q_lines"], init["x_grid"])
-fig.update_layout(annotations=initial_annotations)
-
-# Mode buttons
-vis_cmp_mask=[False]*len(traces); vis_cmp_mask[-2]=True; vis_cmp_mask[-1]=True
-mode_menu=dict(
-    buttons=[
-        dict(label="Normal", method="update",
-             args=[{"visible": vis_norm}, {"yaxis.title.text": "BTC / <DENOMINATOR>", "annotations": initial_annotations}]),
-        dict(label="Compare (Rebased)", method="update",
-             args=[{"visible": vis_cmp_mask}, {"yaxis.title.text": "Rebased to 1.0 (log scale)", "annotations": []}]),
-    ],
-    direction="down", showactive=True, x=0.0, y=1.18, xanchor="left", yanchor="top"
-)
-fig.update_layout(updatemenus=[mode_menu])
 
 # ---------------------- HTML (panel + copy + date lock) ----------------------
 
@@ -404,8 +377,7 @@ ensure_dir(os.path.dirname(OUTPUT_HTML))
 plot_html = fig.to_html(full_html=False, include_plotlyjs="cdn",
                         config={"displayModeBar": True, "modeBarButtonsToRemove": ["toImage"]})
 
-precomp_json   = json.dumps(PRECOMP)  # all lists now JSON-safe
-band_colors_js = json.dumps({str(k): v for k,v in BAND_COLORS.items()})
+precomp_json   = json.dumps(PRECOMP)  # all lists -> JSON-safe
 genesis_iso    = GENESIS_DATE.strftime("%Y-%m-%d")
 
 html_tpl = Template(r"""<!DOCTYPE html>
@@ -415,7 +387,7 @@ html_tpl = Template(r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>BTC Purchase Indicator</title>
 <style>
-  :root { --panelW: 400px; }
+  :root { --panelW: 420px; }
   body { font-family: Inter, Roboto, -apple-system, Segoe UI, Arial, sans-serif; margin: 0; }
   .layout { display: grid; grid-template-columns: 1fr var(--panelW); height: 100vh; }
   .left { padding: 8px 0 8px 8px; }
@@ -432,15 +404,14 @@ html_tpl = Template(r"""<!DOCTYPE html>
   #readout .date { font-weight:700; margin-bottom:6px; }
   #readout .row { display:grid; grid-template-columns: auto 1fr auto; column-gap:8px; align-items:baseline; }
   #readout .num { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-                  font-variant-numeric: tabular-nums; text-align:right; min-width: 12ch; white-space:pre; }
+                  font-variant-numeric: tabular-nums; text-align:right; min-width: 14ch; white-space:pre; }
 
-  /* Hide Plotly tooltip; keep events alive for hover */
-  .hoverlayer { display:none !important; }
+  /* Hide Plotly tooltip visually but keep events */
+  .hoverlayer { opacity: 0 !important; pointer-events: none; }
 
   @media (max-width: 900px) {
     .layout { grid-template-columns: 1fr; height: auto; }
     .right { border-left:none; border-top:1px solid #e5e7eb; }
-    .left .js-plotly-plot { max-width: 100vw; }
   }
 </style>
 </head>
@@ -465,14 +436,14 @@ html_tpl = Template(r"""<!DOCTYPE html>
 
     <div id="readout">
       <div class="date">—</div>
-      <div class="row"><div><span style="color:$COL_10;">q10</span></div><div class="num" id="q10">$0.00</div><div><em>(Bottom 10%)</em></div></div>
-      <div class="row"><div><span style="color:$COL_30;">q30</span></div><div class="num" id="q30">$0.00</div><div><em>(10–30%)</em></div></div>
-      <div class="row"><div><span style="color:$COL_50;">q50</span></div><div class="num" id="q50">$0.00</div><div><em>(30–50%)</em></div></div>
-      <div class="row"><div><span style="color:$COL_70;">q70</span></div><div class="num" id="q70">$0.00</div><div><em>(50–70%)</em></div></div>
-      <div class="row"><div><span style="color:$COL_90;">q90</span></div><div class="num" id="q90">$0.00</div><div><em>(70–90%)</em></div></div>
+      <div class="row"><div><span style="color:$COL_F;">Floor</span></div><div class="num" id="floor">$0.00</div><div></div></div>
+      <div class="row"><div><span style="color:$COL_10;">10%</span></div><div class="num" id="p10">$0.00</div><div></div></div>
+      <div class="row"><div><span style="color:$COL_50;"><b>50%</b></span></div><div class="num" id="p50">$0.00</div><div></div></div>
+      <div class="row"><div><span style="color:$COL_90;">90%</span></div><div class="num" id="p90">$0.00</div><div></div></div>
+      <div class="row"><div><span style="color:$COL_C;">Ceiling</span></div><div class="num" id="ceil">$0.00</div><div></div></div>
       <div style="margin-top:10px;"><b>BTC Price:</b> <span class="num" id="mainVal">$0.00</span></div>
-      <div><b>Band:</b> <span id="bandLbl" style="font-weight:600;">$INIT_BAND</span>
-           <span style="color:#6b7280;">(p≈$INIT_PCT%)</span></div>
+      <div><b>Position:</b> <span id="bandLbl" style="font-weight:600;color:$COL_50;">—</span>
+           <span id="pPct" style="color:#6b7280;">(p≈—%)</span></div>
     </div>
   </div>
 </div>
@@ -480,8 +451,12 @@ html_tpl = Template(r"""<!DOCTYPE html>
 <script src="https://unpkg.com/html-to-image@1.11.11/dist/html-to-image.umd.js"></script>
 <script>
 const PRECOMP      = $PRECOMP_JSON;
-const BAND_COLORS  = $BAND_COLORS_JS;
 const GENESIS_ISO  = "$GENESIS_ISO";
+
+const COLORS = {
+  floor: "$COL_F", ceil: "$COL_C",
+  p10: "$COL_10", p50: "$COL_50", p90: "$COL_90"
+};
 
 const denomSel = document.getElementById('denomSel');
 const detected = Object.keys(PRECOMP).filter(k => k !== 'USD');
@@ -510,64 +485,58 @@ function interp(xArr,yArr,x){
   while(hi-lo>1){ const m=(hi+lo)>>1; if(xArr[m]<=x) lo=m; else hi=m; }
   const t=(x-xArr[lo])/(xArr[hi]-xArr[lo]); return yArr[lo]+t*(yArr[hi]-yArr[lo]);
 }
-function percFromY(y, q10,q30,q50,q70,q90){
-  const ly=Math.log10(y), l10=Math.log10(q10), l30=Math.log10(q30), l50=Math.log10(q50), l70=Math.log10(q70), l90=Math.log10(q90);
-  if (ly < l10) return 5;
-  if (ly < l30) return 10 + 20*( (ly-l10)/Math.max(1e-12, (l30-l10)) );
-  if (ly < l50) return 30 + 20*( (ly-l30)/Math.max(1e-12, (l50-l30)) );
-  if (ly < l70) return 50 + 20*( (ly-l50)/Math.max(1e-12, (l70-l50)) );
-  if (ly < l90) return 70 + 20*( (ly-l70)/Math.max(1e-12, (l90-l70)) );
-  return 95;
-}
-function bandNameAndColor(y,q10,q30,q50,q70,q90){
-  if (y < q10) return ["Bottom 10%", BAND_COLORS["0.1"]];
-  if (y < q30) return ["10–30%",    BAND_COLORS["0.3"]];
-  if (y < q50) return ["30–50%",    BAND_COLORS["0.5"]];
-  if (y < q70) return ["50–70%",    BAND_COLORS["0.7"]];
-  if (y < q90) return ["70–90%",    BAND_COLORS["0.9"]];
-  return ["Top 10%", BAND_COLORS["0.9"]];
-}
-
-// Panel elements
-const elDate=document.querySelector('#readout .date');
-const elQ10=document.getElementById('q10'), elQ30=document.getElementById('q30'),
-      elQ50=document.getElementById('q50'), elQ70=document.getElementById('q70'), elQ90=document.getElementById('q90');
-const elMain=document.getElementById('mainVal'), elBand=document.getElementById('bandLbl');
-
-let locked=false, lockedX=null;
 
 function updatePanel(den,xDays){
   const P=PRECOMP[den];
-  elDate.textContent = dateFromDaysShort(xDays);
-  const q10=P.q_lines["0.1"].length?interp(P.x_grid,P.q_lines["0.1"],xDays):NaN;
-  const q30=P.q_lines["0.3"].length?interp(P.x_grid,P.q_lines["0.3"],xDays):NaN;
-  const q50=P.q_lines["0.5"].length?interp(P.x_grid,P.q_lines["0.5"],xDays):NaN;
-  const q70=P.q_lines["0.7"].length?interp(P.x_grid,P.q_lines["0.7"],xDays):NaN;
-  const q90=P.q_lines["0.9"].length?interp(P.x_grid,P.q_lines["0.9"],xDays):NaN;
-  elQ10.textContent=fmtUSD(q10); elQ30.textContent=fmtUSD(q30);
-  elQ50.textContent=fmtUSD(q50); elQ70.textContent=fmtUSD(q70); elQ90.textContent=fmtUSD(q90);
+  const label=P.label || "BTC / USD";
+  const plotDiv=document.querySelector('.left .js-plotly-plot');
+  Plotly.relayout(plotDiv, {"yaxis.title.text": label});
 
-  // nearest observed price
+  document.querySelector('#readout .date').textContent = dateFromDaysShort(xDays);
+
+  const fl=interp(P.x_grid,P.floor,xDays);
+  const ce=interp(P.x_grid,P.ceil,xDays);
+  const v10=interp(P.x_grid,P.line10,xDays);
+  const v50=interp(P.x_grid,P.line50,xDays);
+  const v90=interp(P.x_grid,P.line90,xDays);
+
+  document.getElementById('floor').textContent=fmtUSD(fl);
+  document.getElementById('p10').textContent  =fmtUSD(v10);
+  document.getElementById('p50').textContent  =fmtUSD(v50);
+  document.getElementById('p90').textContent  =fmtUSD(v90);
+  document.getElementById('ceil').textContent =fmtUSD(ce);
+
+  // nearest observed price for BTC Price
   const xa=P.x_main, ya=P.y_main; let idx=0,best=1e99;
   for(let i=0;i<xa.length;i++){ const d=Math.abs(xa[i]-xDays); if(d<best){best=d; idx=i;} }
-  const y=ya[idx]; elMain.textContent = fmtUSD(y);
+  const y=ya[idx]; document.getElementById('mainVal').textContent = fmtUSD(y);
 
-  const [name,color] = bandNameAndColor(y,q10,q30,q50,q70,q90);
-  elBand.textContent = name; elBand.style.color = color;
+  // Position p% in log space between floor and ceiling
+  const ly=Math.log10(y), lF=Math.log10(fl), lC=Math.log10(ce);
+  const p = Math.max(0, Math.min(1, (ly - lF)/Math.max(1e-12, lC - lF))) * 100.0;
+  document.getElementById('pPct').textContent = `(p≈${p.toFixed(1)}%)`;
+  // Text label around nearest midline
+  let name="~50%"; let color=COLORS.p50;
+  const d10=Math.abs(ly - Math.log10(v10));
+  const d50=Math.abs(ly - Math.log10(v50));
+  const d90=Math.abs(ly - Math.log10(v90));
+  if (d10 <= d50 && d10 <= d90) { name="~10%"; color=COLORS.p10; }
+  else if (d90 <= d10 && d90 <= d50) { name="~90%"; color=COLORS.p90; }
+  document.getElementById('bandLbl').textContent = name;
+  document.getElementById('bandLbl').style.color = color;
 
-  const p = percFromY(y,q10,q30,q50,q70,q90);
-  const plotDiv=document.querySelector('.left .js-plotly-plot');
+  // Title reflect current position
   Plotly.relayout(plotDiv, {"title.text": `BTC Purchase Indicator — ${name} (p≈${p.toFixed(1)}%)`});
 }
 
 document.addEventListener('DOMContentLoaded', function(){
   const plotDiv=document.querySelector('.left .js-plotly-plot');
 
-  // Live hover ON
+  // Live hover
   plotDiv.on('plotly_hover', function(ev){
     if(!ev.points||!ev.points.length) return;
-    if(locked) return;
-    updatePanel(denomSel.value, ev.points[0].x); // x is days (log axis)
+    if(window._locked) return;
+    updatePanel(denomSel.value, ev.points[0].x);
   });
 
   document.getElementById('setDateBtn').addEventListener('click', function(){
@@ -576,12 +545,12 @@ document.addEventListener('DOMContentLoaded', function(){
     const d=new Date(val+'T00:00:00Z');
     const d0=new Date(GENESIS_ISO+'T00:00:00Z');
     const xDays=((d.getTime()-d0.getTime())/86400000)+1.0;
-    locked=true; lockedX=xDays;
+    window._locked=true; window._lockedX=xDays;
     updatePanel(denomSel.value, xDays);
   });
 
   document.getElementById('liveBtn').addEventListener('click', function(){
-    locked=false; lockedX=null;
+    window._locked=false; window._lockedX=null;
   });
 
   // Copy Chart: try clipboard; otherwise download silently
@@ -601,69 +570,26 @@ document.addEventListener('DOMContentLoaded', function(){
     }catch(e){ console.error(e); }
   });
 
-  // Denominator change: restyle + recompute annotations and panel
+  // Denominator change: restyle lines + axis title + panel
   denomSel.addEventListener('change', function(){
     const key=denomSel.value, P=PRECOMP[key];
-    const qs=['0.1','0.3','0.5','0.7','0.9'];
-    for(let i=0;i<qs.length;i++){
-      Plotly.restyle(plotDiv, { x:[P.x_grid], y:[P.q_lines[qs[i]]] }, [i]);
-    }
-    function setBand(slot,keyBand){ const L=P.bands[keyBand]?.lower||[], U=P.bands[keyBand]?.upper||[];
-      Plotly.restyle(plotDiv, { x:[P.x_grid], y:[L] }, [slot]);
-      Plotly.restyle(plotDiv, { x:[P.x_grid], y:[U] }, [slot+1]);
-    }
-    setBand(5,"0.1-0.3"); setBand(7,"0.3-0.5"); setBand(9,"0.5-0.7"); setBand(11,"0.7-0.9");
 
-    Plotly.restyle(plotDiv, { x:[P.x_main], y:[P.y_main], name:[P.label] }, [13]);
-    Plotly.restyle(plotDiv, { x:[P.x_main], y:[P.main_rebased] }, [14]);
-    Plotly.restyle(plotDiv, { x:[P.x_main], y:[P.denom_rebased] }, [15]);
+    // Lines on grid
+    const updates = [
+      [{x:[P.x_grid], y:[P.floor]}, 0],
+      [{x:[P.x_grid], y:[P.line10]}, 1],
+      [{x:[P.x_grid], y:[P.line50]}, 2],
+      [{x:[P.x_grid], y:[P.line90]}, 3],
+      [{x:[P.x_grid], y:[P.ceil]}, 4],
+      [{x:[P.x_main], y:[P.y_main], name:[P.label]}, 5],
+      [{x:[P.x_main], y:[P.y_main]}, 6],  // cursor
+      [{x:[P.x_main], y:[P.main_rebased]}, 7],
+      [{x:[P.x_main], y:[P.denom_rebased]}, 8],
+    ];
+    updates.forEach(u => Plotly.restyle(plotDiv, u[0], [u[1]]));
 
-    function bandAnnotations(P){
-      const xs=P.x_grid; const idx=Math.max(0, Math.floor(0.82*(xs.length-1)));
-      const q10=P.q_lines["0.1"], q30=P.q_lines["0.3"], q50=P.q_lines["0.5"], q70=P.q_lines["0.7"], q90=P.q_lines["0.9"];
-      if(!q10.length||!q30.length||!q50.length||!q70.length||!q90.length) return [];
-      const gm=(a,b)=>Math.sqrt(a*b), x=xs[idx];
-      const pts=[
-        {x, y:q10[idx]*0.80, text:"Bottom 10%"},
-        {x, y:gm(q10[idx],q30[idx]), text:"10–30%"},
-        {x, y:gm(q30[idx],q50[idx]), text:"30–50%"},
-        {x, y:gm(q50[idx],q70[idx]), text:"50–70%"},
-        {x, y:gm(q70[idx],q90[idx]), text:"70–90%"},
-        {x, y:q90[idx]*1.25, text:"Top 10%"},
-      ];
-      return pts.map(p => ({...p, xref:"x", yref:"y", showarrow:false,
-                            font:{size:12,color:"#111"}, bgcolor:"rgba(255,255,255,0.6)",
-                            bordercolor:"rgba(0,0,0,0.1)", borderwidth:1, borderpad:3}));
-    }
-    Plotly.relayout(plotDiv, {"yaxis.title.text": P.label, "annotations": bandAnnotations(P)});
+    // Update axis title
+    Plotly.relayout(plotDiv, {"yaxis.title.text": P.label});
 
-    const xTarget = locked ? lockedX : P.x_main[P.x_main.length-1];
-    updatePanel(key, xTarget);
-  });
-
-  // Initialize panel at latest point
-  updatePanel('USD', PRECOMP['USD'].x_main[PRECOMP['USD'].x_main.length-1]);
-});
-</script>
-</body>
-</html>
-""")
-
-html = html_tpl.safe_substitute(
-    PLOT_HTML=plot_html,
-    PRECOMP_JSON=precomp_json,
-    BAND_COLORS_JS=band_colors_js,
-    GENESIS_ISO=genesis_iso,
-    COL_10=BAND_COLORS[0.1],
-    COL_30=BAND_COLORS[0.3],
-    COL_50=BAND_COLORS[0.5],
-    COL_70=BAND_COLORS[0.7],
-    COL_90=BAND_COLORS[0.9],
-    INIT_BAND=init["band_label"],
-    INIT_PCT=f"{init['percentile']:.1f}",
-)
-
-with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
-    f.write(html)
-
-print(f"Wrote {OUTPUT_HTML}")
+    // Update panel (use locked or latest)
+    const xTarget = (window._locked && window._lockedX) ?
