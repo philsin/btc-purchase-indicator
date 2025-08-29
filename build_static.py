@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """
-BTC Purchase Indicator — Envelope Mode (Floor/Ceiling + log-midlines 10%, 50% (bold), 90%)
+BTC Purchase Indicator — Parallel Best-Fit Rails (Floor / 10% / 50% / 90% / Ceiling)
 
 Model:
-- Trend: log10(price) = a + b * log10(days since Genesis)
+- Trend: log10(price) = a + b * log10(days since Genesis)  (median QuantReg)
 - Residuals: e(t) = log10(price) - (a + b*log10(days))
-- Floor/Ceiling: exponentially weighted lower/upper envelopes of e(t)
-- Midlines at log-space fractions between Floor and Ceiling: 10%, 50% (bold), 90%
+- Rails = constant log-offsets from trend using residual quantiles:
+    Floor   = q_F  (default 0.08)
+    10%     = q10
+    50%     = q50 (median, ~0)  -- drawn **bold**
+    90%     = q90
+    Ceiling = q_C  (default 0.92)
+
+All rails are straight, parallel lines in log–log space (Bitbo-style).
 
 UI:
-- One view (Envelope Mode). Compare toggle retained (rebased lines; envelopes hidden in Compare).
-- Right panel tracks cursor unless a date is locked. Values show $ with two decimals, right-aligned.
-- p% is the log-space position between Floor and Ceiling at the chosen date.
-- Y-axis title updates with denominator; x-axis title removed. Odd years hidden after 2026.
-
-Requires: pandas, numpy, plotly, statsmodels, requests
+- Right panel tracks cursor unless a date is locked.
+- p% = position of BTC (log-space) between Floor and Ceiling at chosen date.
+- Denominator dropdown; y-axis title updates; odd years hidden after 2026; no x-axis title.
+- Copy Chart button: clipboard if allowed, else downloads PNG.
 """
 
 import os, io, glob, time, math, json
@@ -37,8 +41,10 @@ BTC_FILE      = os.path.join(DATA_DIR, "btc_usd.csv")
 GENESIS_DATE  = datetime(2009, 1, 3)
 END_PROJ      = datetime(2040, 12, 31)
 
-# Envelope smoothing
-ENVELOPE_HALFLIFE_YEARS = 2.0  # adjust if you want faster/slower adaptation
+# Choose how "tight" the outer rails are (residual quantiles)
+FLOOR_Q   = 0.08
+CEIL_Q    = 0.92
+LINE_QS   = (0.10, 0.50, 0.90)   # the labeled interior rails
 
 # Colors
 LINE_FLOOR   = "#D32F2F"
@@ -51,10 +57,6 @@ BTC_COLOR    = "#000000"
 # ---------------------------- UTILS -----------------------------
 
 def ensure_dir(path: str): os.makedirs(path, exist_ok=True)
-
-def rgba(hex_color: str, a: float) -> str:
-    h = hex_color.lstrip("#"); r,g,b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
-    return f"rgba({r},{g},{b},{a})"
 
 def _retry(fn, tries=3, base_delay=1.0, factor=2.0):
     last=None
@@ -162,51 +164,17 @@ def fit_trend_median(x_days: np.ndarray, y_price: np.ndarray) -> Tuple[float,flo
     resid = y - (a + b*np.log10(x))
     return a,b,np.asarray(resid)
 
-def ew_envelopes(resid: np.ndarray, dates: pd.Series, halflife_years: float) -> Tuple[np.ndarray,np.ndarray]:
-    """
-    Exponentially weighted floor (lower envelope) and ceiling (upper envelope) on log residuals.
-    The smoothing uses time deltas (days) so unequal spacing is ok.
-    """
-    d = pd.to_datetime(dates).to_numpy()
-    d_days = np.r_[0.0, (d[1:] - d[:-1]) / np.timedelta64(1, "D")]
-    hl_days = halflife_years * 365.25
-    lambdas = np.power(0.5, d_days/hl_days)
-    L = np.empty_like(resid); U = np.empty_like(resid)
-    L[0] = resid[0]; U[0] = resid[0]
-    for i in range(1, len(resid)):
-        lam = float(lambdas[i])
-        emaL = lam*L[i-1] + (1.0-lam)*resid[i]
-        emaU = lam*U[i-1] + (1.0-lam)*resid[i]
-        L[i] = min(resid[i], emaL)  # lower envelope
-        U[i] = max(resid[i], emaU)  # upper envelope
-    return L, U
+def residual_quantiles(resid: np.ndarray, qs: List[float]) -> Dict[float,float]:
+    return {float(q): float(np.nanquantile(resid, q)) for q in qs}
 
-def interp_env_to_grid(x_src: np.ndarray, v_src: np.ndarray, x_grid: np.ndarray) -> np.ndarray:
-    """Linear interpolation in x (days)."""
-    return np.interp(x_grid, x_src, v_src, left=v_src[0], right=v_src[-1])
-
-def predict_env_lines(a: float, b: float,
-                      x_main: np.ndarray, L_resid: np.ndarray, U_resid: np.ndarray,
-                      x_grid: np.ndarray) -> Dict[str, list]:
-    """
-    Build Floor/Ceiling and midlines (10%,50%,90%) in price space on x_grid.
-    All interpolation in log residual space; convert back with trend.
-    """
-    Lg = interp_env_to_grid(x_main, L_resid, x_grid)
-    Ug = interp_env_to_grid(x_main, U_resid, x_grid)
+def predict_parallel_lines(a: float, b: float, c_map: Dict[float,float], x_grid: np.ndarray) -> Dict[str, list]:
+    """Straight, parallel rails as lists on x_grid for given residual offsets c_map (by quantile)."""
     lx = np.log10(x_grid)
-    trend = a + b*lx  # log10(price)
-    def to_price(log_offset): return (10**(trend + log_offset)).tolist()
-    frac10 = Lg + 0.10*(Ug - Lg)
-    frac50 = Lg + 0.50*(Ug - Lg)
-    frac90 = Lg + 0.90*(Ug - Lg)
-    return {
-        "FLOOR":   to_price(Lg),
-        "P10":     to_price(frac10),
-        "P50":     to_price(frac50),
-        "P90":     to_price(frac90),
-        "CEILING": to_price(Ug),
-    }
+    trend = a + b*lx
+    out={}
+    for q,c in c_map.items():
+        out[str(q)] = (10**(trend + c)).tolist()
+    return out
 
 def rebase_to_one(s: pd.Series) -> pd.Series:
     s=pd.Series(s).astype(float).replace([np.inf,-np.inf],np.nan).dropna()
@@ -262,31 +230,33 @@ def build_payload(denom_key: Optional[str]):
     y_main, y_label, denom_series = series_for_denom(base, denom_key)
     x_vals = base["x_days"].values.astype(float)
 
-    # 1) central trend (median regression)
+    # Trend + residuals
     a,b,resid = fit_trend_median(x_vals, y_main.values)
 
-    # 2) envelopes in log-residual space on main dates
-    L_resid, U_resid = ew_envelopes(resid, base["date"], ENVELOPE_HALFLIFE_YEARS)
+    # Quantile offsets (constant, parallel rails)
+    qs_needed = [FLOOR_Q, 0.10, 0.50, 0.90, CEIL_Q]
+    c_map = residual_quantiles(resid, qs_needed)
 
-    # 3) build Floor/Ceiling + midlines on x_grid
-    env_lines = predict_env_lines(a,b,x_vals,L_resid,U_resid,x_grid)
+    rails = predict_parallel_lines(a,b,c_map,x_grid)
 
-    # p% at the latest data point (used only as initial title; panel recomputes dynamically)
+    # p% at latest point vs Floor/Ceiling (log-space)
     r_last = resid[-1]
-    lo, hi = L_resid[-1], U_resid[-1]
-    p_init = float(np.clip((r_last - lo) / max(1e-12, (hi - lo)), 0, 1)) * 100.0
+    p_init = float(np.clip(
+        (r_last - c_map[FLOOR_Q]) / max(1e-12, (c_map[CEIL_Q] - c_map[FLOOR_Q])),
+        0, 1
+    )) * 100.0
 
+    # Pack
     return {
         "label": y_label,
         "x_main": base["x_days"].tolist(),
         "y_main": y_main.tolist(),
         "x_grid": x_grid.tolist(),
-        "env": env_lines,                 # dict of lists: FLOOR, P10, P50, P90, CEILING
+        "rails": {k: v for k,v in rails.items()},   # dict of lists keyed by quantile as string
         "main_rebased": rebase_to_one(y_main).tolist(),
         "denom_rebased": rebase_to_one(denom_series).tolist() if denom_series is not None else [math.nan]*len(base),
         "p_init": p_init,
-        "trend_params": {"a":a, "b":b},
-        "envelope_resid": {"L": L_resid.tolist(), "U": U_resid.tolist()},
+        "trend_params": {"a":a, "b":b, "c_map": {str(k): float(v) for k,v in c_map.items()}},
     }
 
 PRECOMP = {"USD": build_payload(None)}
@@ -298,22 +268,21 @@ init = PRECOMP["USD"]
 
 traces=[]; vis_norm=[]; vis_cmp=[]
 
-def add_line(y_list, name, color, width=1.2, dash=None, bold=False, showlegend=True):
-    line=dict(width=width, color=color)
+def add_line_on_grid(y_list, name, color, width=1.2, dash=None, bold=False):
+    line=dict(width=2.2 if bold else width, color=color)
     if dash: line["dash"]=dash
-    if bold: line["width"]=2.2
     traces.append(go.Scatter(
         x=init["x_grid"], y=y_list, mode="lines", name=name,
-        line=line, hoverinfo="skip", showlegend=showlegend
+        line=line, hoverinfo="skip", showlegend=True
     ))
     vis_norm.append(True); vis_cmp.append(False)
 
-# Envelopes/midlines on x_grid
-add_line(init["env"]["FLOOR"],   "Floor",   LINE_FLOOR,   width=1.2)
-add_line(init["env"]["P10"],     "10%",     LINE_10,      width=1.2, dash="dot")
-add_line(init["env"]["P50"],     "50%",     LINE_50,      bold=True)
-add_line(init["env"]["P90"],     "90%",     LINE_90,      width=1.2, dash="dot")
-add_line(init["env"]["CEILING"], "Ceiling", LINE_CEILING, width=1.2)
+# Draw rails in order: Floor, 10%, 50% (bold), 90%, Ceiling
+add_line_on_grid(init["rails"][str(FLOOR_Q)], "Floor",   LINE_FLOOR,   width=1.2)
+add_line_on_grid(init["rails"]["0.1"],        "10%",     LINE_10,      width=1.2, dash="dot")
+add_line_on_grid(init["rails"]["0.5"],        "50%",     LINE_50,      bold=True)
+add_line_on_grid(init["rails"]["0.9"],        "90%",     LINE_90,      width=1.2, dash="dot")
+add_line_on_grid(init["rails"][str(CEIL_Q)],  "Ceiling", LINE_CEILING, width=1.2)
 
 # BTC price (black)
 traces.append(go.Scatter(x=init["x_main"], y=init["y_main"], mode="lines",
@@ -345,7 +314,7 @@ def make_y_ticks(max_y: float):
     return vals, texts
 
 y_candidates = [np.nanmax(init["y_main"])] + [
-    np.nanmax(init["env"][k]) for k in ["FLOOR","P10","P50","P90","CEILING"]
+    np.nanmax(init["rails"][k]) for k in [str(FLOOR_Q),"0.1","0.5","0.9",str(CEIL_Q)]
 ]
 y_max = max(y_candidates)
 ytickvals, yticktext = make_y_ticks(y_max)
@@ -355,7 +324,7 @@ fig.update_layout(
     showlegend=True,
     hovermode="x",  # keep events for live hover
     hoverdistance=30, spikedistance=30,
-    title=f"BTC Purchase Indicator — Envelope Mode (p≈{init['p_init']:.1f}%)",
+    title=f"BTC Purchase Indicator — Parallel Rails (p≈{init['p_init']:.1f}%)",
     xaxis=dict(type="log", title=None, tickmode="array", tickvals=xtickvals, ticktext=xticktext),
     yaxis=dict(type="log", title=init["label"], tickmode="array", tickvals=ytickvals, ticktext=yticktext),
     legend=dict(x=1.02, xanchor="left", y=1.0, yanchor="top", bgcolor="rgba(255,255,255,0.0)"),
@@ -368,7 +337,7 @@ ensure_dir(os.path.dirname(OUTPUT_HTML))
 plot_html = fig.to_html(full_html=False, include_plotlyjs="cdn",
                         config={"displayModeBar": True, "modeBarButtonsToRemove": ["toImage"]})
 
-precomp_json   = json.dumps(PRECOMP)  # all lists now JSON-safe
+precomp_json   = json.dumps(PRECOMP)  # JSON-safe (lists only)
 genesis_iso    = GENESIS_DATE.strftime("%Y-%m-%d")
 
 html_tpl = Template(r"""<!DOCTYPE html>
@@ -444,6 +413,8 @@ html_tpl = Template(r"""<!DOCTYPE html>
 <script>
 const PRECOMP      = $PRECOMP_JSON;
 const GENESIS_ISO  = "$GENESIS_ISO";
+const FLOOR_Q      = $FLOOR_Q;
+const CEIL_Q       = $CEIL_Q;
 
 const denomSel = document.getElementById('denomSel');
 const detected = Object.keys(PRECOMP).filter(k => k !== 'USD');
@@ -489,11 +460,11 @@ function updatePanel(den,xDays){
   const P=PRECOMP[den];
   elDate.textContent = dateFromDaysShort(xDays);
 
-  const F=interp(P.x_grid,P.env.FLOOR,xDays);
-  const v10=interp(P.x_grid,P.env.P10,xDays);
-  const v50=interp(P.x_grid,P.env.P50,xDays);
-  const v90=interp(P.x_grid,P.env.P90,xDays);
-  const C=interp(P.x_grid,P.env.CEILING,xDays);
+  const F=interp(P.x_grid,P.rails[String(FLOOR_Q)],xDays);
+  const v10=interp(P.x_grid,P.rails["0.1"],xDays);
+  const v50=interp(P.x_grid,P.rails["0.5"],xDays);
+  const v90=interp(P.x_grid,P.rails["0.9"],xDays);
+  const C=interp(P.x_grid,P.rails[String(CEIL_Q)],xDays);
 
   elF.textContent=fmtUSD(F); el10.textContent=fmtUSD(v10); el50.textContent=fmtUSD(v50);
   el90.textContent=fmtUSD(v90); elC.textContent=fmtUSD(C);
@@ -507,7 +478,7 @@ function updatePanel(den,xDays){
   elPPct.textContent = `(p≈${p.toFixed(1)}%)`;
 
   const plotDiv=document.querySelector('.left .js-plotly-plot');
-  Plotly.relayout(plotDiv, {"title.text": `BTC Purchase Indicator — Envelope Mode (p≈${p.toFixed(1)}%)`});
+  Plotly.relayout(plotDiv, {"title.text": `BTC Purchase Indicator — Parallel Rails (p≈${p.toFixed(1)}%)`});
 }
 
 document.addEventListener('DOMContentLoaded', function(){
@@ -559,11 +530,11 @@ document.addEventListener('DOMContentLoaded', function(){
       Plotly.restyle(plotDiv, { x:[P.x_grid], y:[arr] }, [traceIdx]);
     }
     // Order: Floor(0), 10%(1), 50%(2), 90%(3), Ceiling(4), BTC(5), cursor(6), rebased(7,8)
-    restyleLine(0, P.env.FLOOR);
-    restyleLine(1, P.env.P10);
-    restyleLine(2, P.env.P50);
-    restyleLine(3, P.env.P90);
-    restyleLine(4, P.env.CEILING);
+    restyleLine(0, P.rails[String(FLOOR_Q)]);
+    restyleLine(1, P.rails["0.1"]);
+    restyleLine(2, P.rails["0.5"]);
+    restyleLine(3, P.rails["0.9"]);
+    restyleLine(4, P.rails[String(CEIL_Q)]);
 
     Plotly.restyle(plotDiv, { x:[P.x_main], y:[P.y_main], name:[P.label] }, [5]);
     Plotly.restyle(plotDiv, { x:[P.x_main], y:[P.y_main] }, [6]); // cursor
@@ -590,6 +561,8 @@ html = html_tpl.safe_substitute(
     GENESIS_ISO=genesis_iso,
     COL_F=LINE_FLOOR, COL_10=LINE_10, COL_50=LINE_50, COL_90=LINE_90, COL_C=LINE_CEILING,
     P_INIT=f"{init['p_init']:.1f}",
+    FLOOR_Q=f"{FLOOR_Q}",
+    CEIL_Q=f"{CEIL_Q}",
 )
 
 with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
