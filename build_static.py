@@ -176,15 +176,16 @@ def residual_quantiles(resid: pd.Series, qs: Tuple[float,...]) -> Dict[float,flo
             cq[order[i]] = prev + MIN_GAP_LOG10
     return cq
 
-def predict_parallel_bands(a: float, b: float, cq: Dict[float,float], x_days_grid: np.ndarray) -> Dict[str, np.ndarray]:
-    """Return dict of q-lines (in price space) for xgrid using constant log-offset bands."""
+def predict_parallel_bands(a: float, b: float, cq: Dict[float,float], x_days_grid: np.ndarray) -> Dict[str, list]:
+    """Return dict of q-lines (price) for xgrid using constant log-offset bands, as plain Python lists."""
     lx = np.log10(x_days_grid)
     trend_log = a + b*lx
     out={}
     for q,val in cq.items():
         ylog = trend_log + val
-        out[str(q)] = 10**ylog
+        out[str(q)] = (10**ylog).tolist()
     return out
+
 
 def rebase_to_one(s: pd.Series) -> pd.Series:
     s=pd.Series(s).astype(float).replace([np.inf,-np.inf],np.nan).dropna()
@@ -219,12 +220,10 @@ def year_ticks_log(first_date: datetime, last_date: datetime):
         if d < first_date or d > last_date: continue
         dv = float(days_since_genesis(pd.Series([d]), GENESIS_DATE).iloc[0])
         if dv <= 0: continue
-        if y > 2030 and (y % 2 == 1):  # hide odd years after 2030
+        if y > 2026 and (y % 2 == 1):  # hide odd years after 2026
             continue
         vals.append(dv); labs.append(str(y))
     return vals, labs
-first_date = base["date"].iloc[0].to_pydatetime()
-xtickvals, xticktext = year_ticks_log(first_date, END_PROJ)
 
 # -------------------- PRECOMPUTE PER DENOM ---------------------
 
@@ -245,6 +244,7 @@ def build_payload(denom_key: Optional[str]):
     cq = residual_quantiles(resid, QUANTILES)
     # 3) predictions on x_grid
     q_lines = predict_parallel_bands(a,b,cq,x_grid)
+    q_lines = {k: (v.tolist() if hasattr(v, "tolist") else list(v)) for k, v in q_lines.items()}
     # classify latest
     valid_idx = np.where(np.isfinite(y_main.values))[0]
     last_idx  = int(valid_idx[-1])
