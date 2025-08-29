@@ -270,23 +270,26 @@ def build_payload(denom_key: Optional[str]):
                 elif ql==0.7: band_lbl="70–90%"; band_col=BAND_COLORS[0.9]
                 break
     # pack
-    return {
-        "label": y_label,
-        "x_main": base["x_days"].tolist(),
-        "y_main": y_main.tolist(),
-        "x_grid": x_grid.tolist(),
-        "q_lines": q_lines,  # keys: "0.1"..."0.9"
-        "bands": {
-            "0.1-0.3": {"lower": q_lines["0.1"].tolist(), "upper": q_lines["0.3"].tolist()},
-            "0.3-0.5": {"lower": q_lines["0.3"].tolist(), "upper": q_lines["0.5"].tolist()},
-            "0.5-0.7": {"lower": q_lines["0.5"].tolist(), "upper": q_lines["0.7"].tolist()},
-            "0.7-0.9": {"lower": q_lines["0.7"].tolist(), "upper": q_lines["0.9"].tolist()},
-        },
-        "main_rebased": rebase_to_one(y_main).tolist(),
-        "denom_rebased": rebase_to_one(denom_series).tolist() if denom_series is not None else [math.nan]*len(base),
-        "band_label": band_lbl, "percentile": p, "band_color": band_col,
-        "trend_params": {"a":a, "b":b, "cq": cq},  # for debugging/future use
-    }
+bands = {
+    "0.1-0.3": {"lower": q_lines["0.1"], "upper": q_lines["0.3"]},
+    "0.3-0.5": {"lower": q_lines["0.3"], "upper": q_lines["0.5"]},
+    "0.5-0.7": {"lower": q_lines["0.5"], "upper": q_lines["0.7"]},
+    "0.7-0.9": {"lower": q_lines["0.7"], "upper": q_lines["0.9"]},
+}
+
+return {
+    "label": y_label,
+    "x_main": base["x_days"].tolist(),
+    "y_main": y_main.tolist(),
+    "x_grid": x_grid.tolist(),
+    "q_lines": q_lines,          # already plain lists
+    "bands": bands,              # <-- uses lists
+    "main_rebased": rebase_to_one(y_main).tolist(),
+    "denom_rebased": rebase_to_one(denom_series).tolist() if denom_series is not None else [math.nan]*len(base),
+    "band_label": band_lbl, "percentile": p, "band_color": band_col,
+    "trend_params": {"a":a, "b":b, "cq": cq},
+}
+
 
 PRECOMP = {"USD": build_payload(None)}
 for k in sorted(denoms.keys()):
