@@ -1,33 +1,25 @@
 #!/usr/bin/env python3
 """
-BTC Purchase Indicator — Per-Denom Defaults + Anchor Chooser (client-side rails)
+BTC Purchase Indicator — Years-on-X, Quantile Defaults, Date-Range Anchors
+Midlines at 20%, 50%, 80% (log-space between floor & ceiling)
 
-Defaults (per denominator):
-- Fit robust central slope (q50 QuantReg) in log–log.
-- Compute residuals; set CEILING = Q97.5% + eps, FLOOR = Q2.5% - eps (eps ≈ 0.015).
-- Rails: straight & parallel in log space (Bitbo-style).
-- Midlines: 25%, 50% (bold), 75% between floor & ceiling in log-space.
+Key features
+- X-axis: log10(years since Genesis).
+- Defaults per denominator: robust q50 slope; residual rails: CEILING=Q97.5%+eps, FLOOR=Q2.5%-eps.
+- Midlines at 20%, 50% (bold), 80% (parallel & straight in log–log).
+- Anchors override via DATE RANGES (two ceiling ranges → max in each; one floor range → min),
+  with floor kept PARALLEL to ceiling.
+- Right panel follows cursor; lock by date; copy chart (clipboard or PNG fallback).
+- BTC line black; y-axis title updates with denominator; odd years after 2026 hidden;
+  x-axis has no title.
 
-Anchors UI (override defaults without rebuild):
-- Ceiling (Highs): choose two years.
-- Floor modes:
-  (A) Earliest 2013 + specific date
-  (B) Two years (lows)
-  (C) Two dates
-- Plus an "Auto (Quantiles)" mode that uses the per-denominator defaults.
-
-Other behavior:
-- Right panel follows cursor unless locked by date; p% in log space.
-- Denominator dropdown; y-axis title updates; odd years after 2026 hidden; no x-axis title.
-- Copy Chart: clipboard if allowed, otherwise downloads PNG.
-
-Data:
-- BTC from data/btc_usd.csv if present; else attempts fetch (CoinGecko Pro API or Blockchain.com CSV).
-- Denominators: any CSV named data/denominator_*.csv with columns date,price.
+Data
+- BTC from data/btc_usd.csv if present; else tries CoinGecko Pro (API key) then Blockchain.com CSV.
+- Denominators as data/denominator_*.csv (columns: date, price).
 """
 
-import os, io, glob, time, math, json
-from typing import Optional, Dict, Tuple, List
+import os, io, glob, time, json
+from typing import Optional, Dict
 from datetime import datetime, timezone
 from string import Template
 
@@ -46,16 +38,16 @@ BTC_FILE      = os.path.join(DATA_DIR, "btc_usd.csv")
 GENESIS_DATE  = datetime(2009, 1, 3)
 END_PROJ      = datetime(2040, 12, 31)
 
-# Default residual quantiles for rails (per denom)
+# Default residual quantiles for Auto rails (per denom)
 CEIL_Q  = 0.975
 FLOOR_Q = 0.025
-EPS_LOG = 0.015  # small pad in log10 units (~3-4%); tune 0.01-0.03
+EPS_LOG = 0.015  # small pad in log10 units (~3–4%); tune 0.01–0.03
 
 # Colors
 LINE_FLOOR   = "#D32F2F"
-LINE_25      = "#F57C00"
-LINE_50      = "#111111"  # bold/black
-LINE_75      = "#2E7D32"
+LINE_20      = "#1E88E5"   # 20%
+LINE_50      = "#111111"   # 50% (bold)
+LINE_80      = "#43A047"   # 80%
 LINE_CEILING = "#6A1B9A"
 BTC_COLOR    = "#000000"
 
@@ -72,11 +64,12 @@ def _retry(fn, tries=3, base_delay=1.0, factor=2.0):
             if i<tries-1: time.sleep(base_delay*(factor**i))
     raise last
 
-def days_since_genesis(dates, genesis):
+def years_since_genesis(dates, genesis):
     d = pd.to_datetime(dates)
     s = pd.Series(d)
-    delta = s - pd.Timestamp(genesis)
-    return (delta / np.timedelta64(1, "D")).astype(float) + 1.0  # +1 avoids log(0)
+    delta_days = (s - pd.Timestamp(genesis)) / np.timedelta64(1, "D")
+    years = (delta_days.astype(float) / 365.25) + (1.0/365.25)  # keep >0 to avoid log(0)
+    return years
 
 # ------------------------- DATA LOADERS -------------------------
 
@@ -154,9 +147,9 @@ def collect_denominators() -> Dict[str, pd.DataFrame]:
 
 # ---------------------- ROBUST DEFAULTS (per denom) ------------
 
-def robust_slope_q50(x_days: np.ndarray, y_series: np.ndarray):
-    m = (x_days > 0) & (y_series > 0) & np.isfinite(x_days) & np.isfinite(y_series)
-    x = np.log10(x_days[m]); y = np.log10(y_series[m])
+def robust_slope_q50(x_years: np.ndarray, y_series: np.ndarray):
+    m = (x_years > 0) & (y_series > 0) & np.isfinite(x_years) & np.isfinite(y_series)
+    x = np.log10(x_years[m]); y = np.log10(y_series[m])
     X = pd.DataFrame({"const": 1.0, "logx": x})
     model = QuantReg(y, X)
     res = model.fit(q=0.5)
@@ -165,49 +158,47 @@ def robust_slope_q50(x_days: np.ndarray, y_series: np.ndarray):
     return a0, b, resid, m
 
 def suggest_defaults_for_series(
-    dates: pd.Series, x_days: pd.Series, y_series: pd.Series,
-    ceil_q=CEIL_Q, floor_q=FLOOR_Q, eps=EPS_LOG
+    dates: pd.Series, x_years: pd.Series, y_series: pd.Series,
+    ceil_q=CEIL_Q, floor_q=FLOOR_Q, eps=EPS_LOG, half_window_days=90
 ):
-    a0, b, resid, mask = robust_slope_q50(x_days.values, y_series.values)
+    a0, b, resid, mask = robust_slope_q50(x_years.values, y_series.values)
     cC = float(np.nanquantile(resid, ceil_q)) + eps
     cF = float(np.nanquantile(resid, floor_q)) - eps
 
     idx_all = np.where(mask)[0]
     if len(idx_all) < 4:
-        # too little data to split early/late; just pick first/last for display
-        iC1 = idx_all[0]; iC2 = idx_all[-1]; iF1 = idx_all[0]; iF2 = idx_all[-1]
-    else:
-        half = len(idx_all)//2
-        early = idx_all[:max(1, half)]
-        late  = idx_all[max(1, half):]
+        d0 = dates.iloc[idx_all[0]].date()
+        d1 = dates.iloc[idx_all[-1]].date()
+        return {
+            "a0": a0, "b": b, "cF": cF, "cC": cC,
+            "ranges": {"ceil1":[str(d0),str(d1)], "ceil2":[str(d0),str(d1)], "floor":[str(d0),str(d1)]}
+        }
 
-        def closest_idx(subidx, target):
-            # residuals corresponding to subidx
-            # map mask indices back to compact resid order
-            # Build map from compact indices to original indices
-            comp = np.where(mask)[0]
-            comp_to_resid = {orig:i for i,orig in enumerate(comp)}
-            r = np.array([resid[comp_to_resid[i]] for i in subidx])
-            j = int(np.argmin(np.abs(r - target)))
-            return int(subidx[j])
+    compact = np.where(mask)[0]
+    comp_to_resid = {orig:i for i,orig in enumerate(compact)}
 
-        iC1 = closest_idx(early, cC)
-        iC2 = closest_idx(late,  cC)
-        iF1 = closest_idx(early, cF)
-        iF2 = closest_idx(late,  cF)
+    half = len(idx_all)//2
+    early = idx_all[:max(1, half)]
+    late  = idx_all[max(1, half):]
 
-    # For UI defaults, expose suggested anchor years/dates
-    ceil_dates = [str(dates.iloc[iC1].date()), str(dates.iloc[iC2].date())]
-    floor_dates = [str(dates.iloc[iF1].date()), str(dates.iloc[iF2].date())]
-    ceil_years = [int(ceil_dates[0][:4]), int(ceil_dates[1][:4])]
+    def closest_idx(subidx, target):
+        r = np.array([resid[comp_to_resid[i]] for i in subidx])
+        j = int(np.argmin(np.abs(r - target)))
+        return int(subidx[j])
+
+    iC1 = closest_idx(early, cC)
+    iC2 = closest_idx(late,  cC)
+    iF  = closest_idx(idx_all, cF)
+
+    def mk_range(i):
+        d = dates.iloc[i]
+        lo = (d - pd.Timedelta(days=half_window_days)).date()
+        hi = (d + pd.Timedelta(days=half_window_days)).date()
+        return [str(lo), str(hi)]
 
     return {
         "a0": a0, "b": b, "cF": cF, "cC": cC,
-        "anchors": {
-            "ceiling_dates": ceil_dates,
-            "floor_dates": floor_dates,
-            "ceiling_years": ceil_years,
-        }
+        "ranges": { "ceil1": mk_range(iC1), "ceil2": mk_range(iC2), "floor": mk_range(iF) }
     }
 
 # -------------------------- LOAD DATA ---------------------------
@@ -220,27 +211,26 @@ if base.empty: raise RuntimeError("No BTC data found")
 for name, df in denoms.items():
     base = base.merge(df.rename(columns={"price": name.lower()}), on="date", how="left")
 
-base["x_days"]   = days_since_genesis(base["date"], GENESIS_DATE)
+base["x_years"]  = years_since_genesis(base["date"], GENESIS_DATE)
 base["date_iso"] = base["date"].dt.strftime("%Y-%m-%d")
-base["date_str"] = base["date"].dt.strftime("%m/%d/%y")
 
 # X grid (log-spaced) from first data point to END_PROJ
-x_start = float(base["x_days"].iloc[0])
-x_end   = float(days_since_genesis(pd.Series([END_PROJ]), GENESIS_DATE).iloc[0])
-x_grid  = np.logspace(np.log10(max(1.0, x_start)), np.log10(x_end), 600)
+x_start = float(base["x_years"].iloc[0])
+x_end   = float(years_since_genesis(pd.Series([END_PROJ]), GENESIS_DATE).iloc[0])
+x_grid  = np.logspace(np.log10(max(1e-6, x_start)), np.log10(x_end), 600)
 
-# Year ticks mapped to log(days); hide odd years > 2026
+# Year ticks → value is years since genesis of Jan 1 of that year; hide odd years > 2026
 def year_ticks_log(first_date: datetime, last_date: datetime):
     y0, y1 = first_date.year, last_date.year
     vals, labs = [], []
     for y in range(y0, y1+1):
         d = datetime(y, 1, 1)
         if d < first_date or d > last_date: continue
-        dv = float(days_since_genesis(pd.Series([d]), GENESIS_DATE).iloc[0])
-        if dv <= 0: continue
-        if y > 2026 and (y % 2 == 1):  # hide odd years after 2026
+        vy = float(years_since_genesis(pd.Series([d]), GENESIS_DATE).iloc[0])
+        if vy <= 0: continue
+        if y > 2026 and (y % 2 == 1):
             continue
-        vals.append(dv); labs.append(str(y))
+        vals.append(vy); labs.append(str(y))
     return vals, labs
 first_date = base["date"].iloc[0].to_pydatetime()
 xtickvals, xticktext = year_ticks_log(first_date, END_PROJ)
@@ -257,17 +247,16 @@ def series_for_denom(df: pd.DataFrame, denom_key: Optional[str]):
 
 def build_payload(denom_key: Optional[str]):
     y_main, y_label, denom_series = series_for_denom(base, denom_key)
-    defaults = suggest_defaults_for_series(base["date"], base["x_days"], y_main)
-
+    defaults = suggest_defaults_for_series(base["date"], base["x_years"], y_main)
     return {
         "label": y_label,
-        "x_main": base["x_days"].tolist(),
+        "x_main": base["x_years"].tolist(),
         "y_main": y_main.tolist(),
         "date_iso_main": base["date_iso"].tolist(),
         "x_grid": x_grid.tolist(),
         "main_rebased": (y_main / y_main.iloc[0]).tolist(),
         "denom_rebased": (denom_series/denom_series.iloc[0]).tolist() if denom_series is not None else [float("nan")]*len(base),
-        "defaults": defaults,  # per-denom robust params and suggested anchors
+        "defaults": defaults,
     }
 
 PRECOMP = {"USD": build_payload(None)}
@@ -277,7 +266,7 @@ init = PRECOMP["USD"]
 
 # -------------------------- FIGURE (rails drawn via JS) ----------
 
-traces=[]; vis_norm=[]; vis_cmp=[]
+traces=[]
 
 def add_line_on_grid(name, color, width=1.2, dash=None, bold=False):
     line=dict(width=2.2 if bold else width, color=color)
@@ -286,60 +275,52 @@ def add_line_on_grid(name, color, width=1.2, dash=None, bold=False):
         x=init["x_grid"], y=[None]*len(init["x_grid"]), mode="lines", name=name,
         line=line, hoverinfo="skip", showlegend=True
     ))
-    vis_norm.append(True); vis_cmp.append(False)
 
-# Order: Floor, 25%, 50%(bold), 75%, Ceiling
+# Order: Floor, 20%, 50%(bold), 80%, Ceiling
 add_line_on_grid("Floor",   LINE_FLOOR)
-add_line_on_grid("25%",     LINE_25, dash="dot")
+add_line_on_grid("20%",     LINE_20, dash="dot")
 add_line_on_grid("50%",     LINE_50, bold=True)
-add_line_on_grid("75%",     LINE_75, dash="dot")
+add_line_on_grid("80%",     LINE_80, dash="dot")
 add_line_on_grid("Ceiling", LINE_CEILING)
 
 # BTC price (black)
 traces.append(go.Scatter(x=init["x_main"], y=init["y_main"], mode="lines",
                          name="BTC / USD", line=dict(width=1.9, color=BTC_COLOR),
                          hoverinfo="skip"))
-vis_norm.append(True); vis_cmp.append(False)
 
-# Transparent cursor trace to guarantee hover events
+# Transparent cursor trace
 traces.append(go.Scatter(
     x=init["x_main"], y=init["y_main"], mode="lines",
     line=dict(width=0), opacity=0.003, hoverinfo="x", showlegend=False, name="_cursor"
 ))
-vis_norm.append(True); vis_cmp.append(False)
 
-# (Optional) Compare/rebased placeholders
+# Compare placeholders (hidden)
 traces.append(go.Scatter(x=init["x_main"], y=init["main_rebased"], name="Main (rebased)",
                          mode="lines", hoverinfo="skip", visible=False, line=dict(color=BTC_COLOR)))
 traces.append(go.Scatter(x=init["x_main"], y=init["denom_rebased"], name="Denominator (rebased)",
                          mode="lines", line=dict(dash="dash"), hoverinfo="skip", visible=False))
-vis_norm.extend([False, False]); vis_cmp.extend([True, True])
 
-fig = go.Figure(data=traces)
-
-# Y ticks: faux "0" then powers of 10 with commas (panel shows precise values)
+# y ticks: 0 then powers of 10 with commas
 def make_y_ticks():
-    exp_max = 8
-    vals=["1e-8"]  # placeholder as string to avoid float repr issues in proto HTML; relayout later if needed
-    texts=["0"] + [f"{int(10**e):,}" for e in range(0, exp_max+1)]
-    vals=[1e-8] + [10**e for e in range(0, exp_max+1)]
+    vals=[1e-8] + [10**e for e in range(0, 9)]
+    texts=["0"] + [f"{int(10**e):,}" for e in range(0, 9)]
     return vals, texts
-
 ytickvals, yticktext = make_y_ticks()
 
+fig = go.Figure(data=traces)
 fig.update_layout(
     template="plotly_white",
     showlegend=True,
     hovermode="x",
     hoverdistance=30, spikedistance=30,
-    title=f"BTC Purchase Indicator — Rails",
+    title=f"BTC Purchase Indicator — Rails (Years on X)",
     xaxis=dict(type="log", title=None, tickmode="array", tickvals=xtickvals, ticktext=xticktext),
     yaxis=dict(type="log", title=init["label"], tickmode="array", tickvals=ytickvals, ticktext=yticktext),
     legend=dict(x=1.02, xanchor="left", y=1.0, yanchor="top", bgcolor="rgba(255,255,255,0.0)"),
-    margin=dict(l=70, r=460, t=70, b=70),
+    margin=dict(l=70, r=520, t=70, b=70),
 )
 
-# ---------------------- HTML + JS (defaults + anchors UI) -------
+# ---------------------- HTML + JS (Auto + Date Ranges) ----------
 
 ensure_dir(os.path.dirname(OUTPUT_HTML))
 plot_html = fig.to_html(full_html=False, include_plotlyjs="cdn",
@@ -355,15 +336,14 @@ html_tpl = Template(r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>BTC Purchase Indicator</title>
 <style>
-  :root { --panelW: 460px; }
+  :root { --panelW: 520px; }
   body { font-family: Inter, Roboto, -apple-system, Segoe UI, Arial, sans-serif; margin: 0; }
   .layout { display: grid; grid-template-columns: 1fr var(--panelW); height: 100vh; }
   .left { padding: 8px 0 8px 8px; }
   .right { border-left: 1px solid #e5e7eb; padding: 12px; display: flex; flex-direction: column; gap: 12px; overflow:auto; }
 
   #controls, #anchors { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-  #controls label, #anchors label { white-space: nowrap; }
-  select, button, input[type="date"], input[type="number"] {
+  select, button, input[type="date"] {
     font-size:14px; padding:8px 10px; border-radius:8px; border:1px solid #d1d5db; background:white;
   }
   fieldset { border:1px solid #e5e7eb; border-radius:10px; padding:10px; }
@@ -374,8 +354,7 @@ html_tpl = Template(r"""<!DOCTYPE html>
   #readout .row { display:grid; grid-template-columns: auto 1fr auto; column-gap:8px; align-items:baseline; }
   #readout .num { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
                   font-variant-numeric: tabular-nums; text-align:right; min-width: 12ch; white-space:pre; }
-
-  .hoverlayer { opacity: 0 !important; pointer-events: none; } /* keep live hover but hide tooltip */
+  .hoverlayer { opacity: 0 !important; pointer-events: none; } /* hide default tooltip */
 
   @media (max-width: 900px) {
     .layout { grid-template-columns: 1fr; height: auto; }
@@ -399,56 +378,40 @@ html_tpl = Template(r"""<!DOCTYPE html>
     </div>
 
     <fieldset id="anchors">
-      <legend>Rails Mode & Anchors</legend>
-      <div style="display:flex; flex-direction:column; gap:10px; width:100%;">
+      <legend>Rails Mode</legend>
+      <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+        <label><input type="radio" name="railsMode" value="AUTO" checked/> Auto (Percentiles)</label>
+        <label><input type="radio" name="railsMode" value="RANGES"/> Date Ranges</label>
+      </div>
 
-        <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
-          <label><input type="radio" name="railsMode" value="AUTO" checked/> Auto (Quantiles)</label>
-          <label><input type="radio" name="railsMode" value="A"/> Anchors: 2013-start + Date</label>
-          <label><input type="radio" name="railsMode" value="B"/> Anchors: Year Lows</label>
-          <label><input type="radio" name="railsMode" value="C"/> Anchors: Two Dates</label>
+      <div id="rangeUI" style="margin-top:10px; display:none;">
+        <div style="font-weight:700; margin-bottom:4px;">Ceiling (TWO ranges; uses HIGH within each):</div>
+        <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+          <label>Range 1: <input type="date" id="c1s"/> — <input type="date" id="c1e"/></label>
+          <label>Range 2: <input type="date" id="c2s"/> — <input type="date" id="c2e"/></label>
         </div>
 
-        <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
-          <b>Ceiling (Highs):</b>
-          <label>Year 1 <input type="number" id="ceilY1" value="2011" min="2010" max="2100" style="width:90px"/></label>
-          <label>Year 2 <input type="number" id="ceilY2" value="2017" min="2010" max="2100" style="width:90px"/></label>
-          <span style="font-size:12px;color:#6b7280;">(used for A/B/C; ignored in Auto)</span>
+        <div style="font-weight:700; margin:10px 0 4px;">Floor (ONE range; uses LOW):</div>
+        <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+          <label>Range: <input type="date" id="fs"/> — <input type="date" id="fe"/></label>
+          <span style="font-size:12px;color:#6b7280;">Floor is parallel to ceiling.</span>
         </div>
 
-        <div id="floorA" style="display:none; gap:12px; align-items:center; flex-wrap:wrap;">
-          <span>Floor: earliest 2013 + </span>
-          <label>Date <input type="date" id="floorA_date" value="2015-10-01"/></label>
-        </div>
-
-        <div id="floorB" style="display:none; gap:12px; align-items:center; flex-wrap:wrap;">
-          <label>Year 1 <input type="number" id="floorB_y1" value="2015" min="2010" max="2100" style="width:90px"/></label>
-          <label>Year 2 <input type="number" id="floorB_y2" value="2022" min="2010" max="2100" style="width:90px"/></label>
-          <span style="font-size:12px;color:#6b7280;">(use lows)</span>
-        </div>
-
-        <div id="floorC" style="display:none; gap:12px; align-items:center; flex-wrap:wrap;">
-          <label>Date 1 <input type="date" id="floorC_d1" value="2013-01-01"/></label>
-          <label>Date 2 <input type="date" id="floorC_d2" value="2015-10-01"/></label>
-        </div>
-
-        <div style="display:flex; gap:10px; flex-wrap:wrap;">
-          <button id="applyAnchors">Apply Anchors</button>
-          <span style="font-size:12px;color:#6b7280;">Rails are straight & parallel; midlines at 25/50/75.</span>
+        <div style="display:flex; gap:10px; margin-top:10px;">
+          <button id="applyRanges">Apply Date Ranges</button>
+          <span style="font-size:12px;color:#6b7280;">All rails straight & parallel. Midlines: 20% / 50% / 80%.</span>
         </div>
       </div>
     </fieldset>
 
-    <div style="font-size:12px;color:#6b7280;">
-      Detected denominators: <span id="denomsDetected"></span>
-    </div>
+    <div style="font-size:12px;color:#6b7280;">Detected denominators: <span id="denomsDetected"></span></div>
 
     <div id="readout">
       <div class="date">—</div>
       <div class="row"><div><span style="color:$COL_F;">Floor</span></div><div class="num" id="vF">$0.00</div><div></div></div>
-      <div class="row"><div><span style="color:$COL_25;">25%</span></div><div class="num" id="v25">$0.00</div><div></div></div>
+      <div class="row"><div><span style="color:$COL_20;">20%</span></div><div class="num" id="v20">$0.00</div><div></div></div>
       <div class="row"><div><span style="color:$COL_50;font-weight:700;">50%</span></div><div class="num" id="v50" style="font-weight:700;">$0.00</div><div></div></div>
-      <div class="row"><div><span style="color:$COL_75;">75%</span></div><div class="num" id="v75">$0.00</div><div></div></div>
+      <div class="row"><div><span style="color:$COL_80;">80%</span></div><div class="num" id="v80">$0.00</div><div></div></div>
       <div class="row"><div><span style="color:$COL_C;">Ceiling</span></div><div class="num" id="vC">$0.00</div><div></div></div>
 
       <div style="margin-top:10px;"><b>BTC Price:</b> <span class="num" id="mainVal">$0.00</span></div>
@@ -464,16 +427,17 @@ const GENESIS_ISO  = "$GENESIS_ISO";
 
 function fmtUSD(v){ if(!isFinite(v)) return '$—'; return '$' + Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}); }
 function shortMonthName(m){ return ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][m]; }
-function dateFromDaysShort(x){
+function dateFromYearsShort(y){
   const d0=new Date(GENESIS_ISO+'T00:00:00Z');
-  const d=new Date(d0.getTime() + (x-1)*86400000);
+  const ms = (y - (1.0/365.25)) * 365.25 * 86400000;
+  const d=new Date(d0.getTime() + ms);
   return `${shortMonthName(d.getUTCMonth())}-${String(d.getUTCDate()).padStart(2,'0')}-${String(d.getUTCFullYear()).slice(-2)}`;
 }
 function parseISO(s){ return new Date(s+'T00:00:00Z'); }
-function daysFromISO(s){
+function yearsFromISO(s){
   const d0=new Date(GENESIS_ISO+'T00:00:00Z');
   const d=parseISO(s);
-  return ((d.getTime()-d0.getTime())/86400000)+1.0;
+  return ( (d.getTime()-d0.getTime())/86400000 ) / 365.25 + (1.0/365.25);
 }
 function interp(xa, ya, x){
   let lo=0,hi=xa.length-1;
@@ -498,43 +462,39 @@ document.getElementById('denomsDetected').textContent = denoms.length ? denoms.j
 });
 
 const railsModeRadios = [...document.querySelectorAll('input[name="railsMode"]')];
-const ceilY1 = document.getElementById('ceilY1');
-const ceilY2 = document.getElementById('ceilY2');
-const floorA = document.getElementById('floorA'), floorA_date=document.getElementById('floorA_date');
-const floorB = document.getElementById('floorB'), floorB_y1=document.getElementById('floorB_y1'), floorB_y2=document.getElementById('floorB_y2');
-const floorC = document.getElementById('floorC'), floorC_d1=document.getElementById('floorC_d1'), floorC_d2=document.getElementById('floorC_d2');
-const applyBtn = document.getElementById('applyAnchors');
-
+const rangeUI = document.getElementById('rangeUI');
 function currentRailsMode(){ return railsModeRadios.find(r=>r.checked).value; }
-function showFloorUI(){
-  const m=currentRailsMode();
-  floorA.style.display = (m==='A')?'flex':'none';
-  floorB.style.display = (m==='B')?'flex':'none';
-  floorC.style.display = (m==='C')?'flex':'none';
-}
-railsModeRadios.forEach(r => r.addEventListener('change', showFloorUI));
-showFloorUI();
+railsModeRadios.forEach(r => r.addEventListener('change', () => {
+  rangeUI.style.display = currentRailsMode()==='RANGES' ? 'block' : 'none';
+  computeAndApplyRails(denomSel.value);
+}));
+
+// Date range inputs
+const c1s=document.getElementById('c1s'), c1e=document.getElementById('c1e');
+const c2s=document.getElementById('c2s'), c2e=document.getElementById('c2e');
+const fs =document.getElementById('fs'),  fe =document.getElementById('fe');
+document.getElementById('applyRanges').addEventListener('click', () => computeAndApplyRails(denomSel.value));
 
 const elDate=document.querySelector('#readout .date');
-const elF=document.getElementById('vF'), el25=document.getElementById('v25'),
-      el50=document.getElementById('v50'), el75=document.getElementById('v75'), elC=document.getElementById('vC');
+const elF=document.getElementById('vF'), el20=document.getElementById('v20'),
+      el50=document.getElementById('v50'), el80=document.getElementById('v80'), elC=document.getElementById('vC');
 const elMain=document.getElementById('mainVal'), elPPct=document.getElementById('pPct');
 
 let CURRENT_RAILS = null;
 let locked=false, lockedX=null;
 
-function updatePanel(P, xDays){
-  elDate.textContent = dateFromDaysShort(xDays);
-  const F = interp(P.x_grid, CURRENT_RAILS.FLOOR,   xDays);
-  const v25=interp(P.x_grid, CURRENT_RAILS.P25,     xDays);
-  const v50=interp(P.x_grid, CURRENT_RAILS.P50,     xDays);
-  const v75=interp(P.x_grid, CURRENT_RAILS.P75,     xDays);
-  const C = interp(P.x_grid, CURRENT_RAILS.CEILING, xDays);
-  elF.textContent=fmtUSD(F); el25.textContent=fmtUSD(v25); el50.textContent=fmtUSD(v50); el75.textContent=fmtUSD(v75); elC.textContent=fmtUSD(C);
+function updatePanel(P, xYears){
+  elDate.textContent = dateFromYearsShort(xYears);
+  const F = interp(P.x_grid, CURRENT_RAILS.FLOOR,   xYears);
+  const v20=interp(P.x_grid, CURRENT_RAILS.P20,     xYears);
+  const v50=interp(P.x_grid, CURRENT_RAILS.P50,     xYears);
+  const v80=interp(P.x_grid, CURRENT_RAILS.P80,     xYears);
+  const C = interp(P.x_grid, CURRENT_RAILS.CEILING, xYears);
+  elF.textContent=fmtUSD(F); el20.textContent=fmtUSD(v20); el50.textContent=fmtUSD(v50); el80.textContent=fmtUSD(v80); elC.textContent=fmtUSD(C);
 
   // nearest observed price
   let idx=0,best=1e99;
-  for(let i=0;i<P.x_main.length;i++){ const d=Math.abs(P.x_main[i]-xDays); if(d<best){best=d; idx=i;} }
+  for(let i=0;i<P.x_main.length;i++){ const d=Math.abs(P.x_main[i]-xYears); if(d<best){best=d; idx=i;} }
   const y=P.y_main[idx]; elMain.textContent = fmtUSD(y);
   const p = positionPctLog(y,F,C);
   elPPct.textContent = `(p≈${p.toFixed(1)}%)`;
@@ -545,11 +505,11 @@ function updatePanel(P, xDays){
 
 function restyleRails(P){
   const plotDiv=document.querySelector('.left .js-plotly-plot');
-  // traces: Floor(0),25(1),50(2),75(3),Ceil(4)
+  // traces: Floor(0),20(1),50(2),80(3),Ceil(4)
   Plotly.restyle(plotDiv, {x:[P.x_grid], y:[CURRENT_RAILS.FLOOR]},   [0]);
-  Plotly.restyle(plotDiv, {x:[P.x_grid], y:[CURRENT_RAILS.P25]},     [1]);
+  Plotly.restyle(plotDiv, {x:[P.x_grid], y:[CURRENT_RAILS.P20]},     [1]);
   Plotly.restyle(plotDiv, {x:[P.x_grid], y:[CURRENT_RAILS.P50]},     [2]);
-  Plotly.restyle(plotDiv, {x:[P.x_grid], y:[CURRENT_RAILS.P75]},     [3]);
+  Plotly.restyle(plotDiv, {x:[P.x_grid], y:[CURRENT_RAILS.P80]},     [3]);
   Plotly.restyle(plotDiv, {x:[P.x_grid], y:[CURRENT_RAILS.CEILING]}, [4]);
 }
 
@@ -562,33 +522,35 @@ function railsFromQuantiles(P){
   function exp10(arr){ return arr.map(v => Math.pow(10, v)); }
   const FLOOR   = exp10(logF);
   const CEILING = exp10(logC);
-  const P25     = logF.map((lf,i)=> Math.pow(10, lf + 0.25*(logC[i]-lf)));
+  const P20     = logF.map((lf,i)=> Math.pow(10, lf + 0.20*(logC[i]-lf)));
   const P50     = logF.map((lf,i)=> Math.pow(10, lf + 0.50*(logC[i]-lf)));
-  const P75     = logF.map((lf,i)=> Math.pow(10, lf + 0.75*(logC[i]-lf)));
-  return {FLOOR, P25, P50, P75, CEILING};
+  const P80     = logF.map((lf,i)=> Math.pow(10, lf + 0.80*(logC[i]-lf)));
+  return {FLOOR, P20, P50, P80, CEILING};
 }
 
-function nearestIndexByDate(isoArr, targetISO){
-  const t=parseISO(targetISO).getTime();
-  let bestI=0, best=1e99;
-  for(let i=0;i<isoArr.length;i++){
-    const di=Math.abs(parseISO(isoArr[i]).getTime()-t);
-    if(di<best){ best=di; bestI=i; }
-  }
-  return bestI;
+function capToRange(iso, startISO, endISO){
+  const t=new Date(iso+'T00:00:00Z').getTime();
+  return (t >= new Date(startISO+'T00:00:00Z').getTime() && t <= new Date(endISO+'T00:00:00Z').getTime());
 }
-function extremeInYear(isoArr, yArr, xArr, year, mode){
-  let idxs=[];
+function maxInRange(isoArr,yArr,xArr,startISO,endISO){
+  let bestI=-1, best=-Infinity;
   for(let i=0;i<isoArr.length;i++){
-    if(isoArr[i].slice(0,4)==String(year)) idxs.push(i);
+    if(capToRange(isoArr[i], startISO, endISO) && yArr[i]>0){
+      if(yArr[i]>best){ best=yArr[i]; bestI=i; }
+    }
   }
-  if(!idxs.length) throw new Error("No data for year "+year);
-  let bestI=idxs[0];
-  for(const i of idxs){
-    if(mode==='max'){ if(yArr[i]>yArr[bestI]) bestI=i; }
-    else { if(yArr[i]<yArr[bestI]) bestI=i; }
+  if(bestI<0) throw new Error(`No data in ceiling range ${startISO}..${endISO}`);
+  return {x:xArr[bestI], y:yArr[bestI], iso: isoArr[bestI]};
+}
+function minInRange(isoArr,yArr,xArr,startISO,endISO){
+  let bestI=-1, best= Infinity;
+  for(let i=0;i<isoArr.length;i++){
+    if(capToRange(isoArr[i], startISO, endISO) && yArr[i]>0){
+      if(yArr[i]<best){ best=yArr[i]; bestI=i; }
+    }
   }
-  return {x:xArr[bestI], y:yArr[bestI], dateISO: isoArr[bestI]};
+  if(bestI<0) throw new Error(`No data in floor range ${startISO}..${endISO}`);
+  return {x:xArr[bestI], y:yArr[bestI], iso: isoArr[bestI]};
 }
 function lineFromTwoPointsLog(x1,y1,x2,y2){
   const lx1=Math.log10(x1), ly1=Math.log10(y1);
@@ -597,36 +559,15 @@ function lineFromTwoPointsLog(x1,y1,x2,y2){
   const a=ly1 - b*lx1;
   return {a,b};
 }
-function railsFromAnchors(P, ceilY1, ceilY2, floorMode, floorArgs){
-  // Ceiling from highs by year
-  const c1 = extremeInYear(P.date_iso_main, P.y_main, P.x_main, ceilY1, 'max');
-  const c2 = extremeInYear(P.date_iso_main, P.y_main, P.x_main, ceilY2, 'max');
-  const {a:aC, b} = lineFromTwoPointsLog(c1.x, c1.y, c2.x, c2.y);
+function railsFromRanges(P, c1s, c1e, c2s, c2e, fs, fe){
+  // Ceiling from two ranges -> max in each
+  const C1 = maxInRange(P.date_iso_main, P.y_main, P.x_main, c1s, c1e);
+  const C2 = maxInRange(P.date_iso_main, P.y_main, P.x_main, c2s, c2e);
+  const {a:aC, b} = lineFromTwoPointsLog(C1.x, C1.y, C2.x, C2.y);
 
-  // Floor
-  let f1x,f1y, f2x,f2y;
-  if(floorMode==='A'){ // earliest 2013 + date
-    let first2013 = -1;
-    for(let i=0;i<P.date_iso_main.length;i++){ if(P.date_iso_main[i].slice(0,4)==='2013'){ first2013=i; break; } }
-    if(first2013<0) throw new Error("No 2013 data to anchor floor");
-    f1x=P.x_main[first2013]; f1y=P.y_main[first2013];
-    const idx=nearestIndexByDate(P.date_iso_main, floorArgs.dateISO);
-    f2x=P.x_main[idx]; f2y=P.y_main[idx];
-  } else if(floorMode==='B'){ // two years (lows)
-    const f1=extremeInYear(P.date_iso_main, P.y_main, P.x_main, floorArgs.y1, 'min');
-    const f2=extremeInYear(P.date_iso_main, P.y_main, P.x_main, floorArgs.y2, 'min');
-    f1x=f1.x; f1y=f1.y; f2x=f2.x; f2y=f2.y;
-  } else { // 'C' two dates
-    const i1=nearestIndexByDate(P.date_iso_main, floorArgs.d1ISO);
-    const i2=nearestIndexByDate(P.date_iso_main, floorArgs.d2ISO);
-    f1x=P.x_main[i1]; f1y=P.y_main[i1];
-    f2x=P.x_main[i2]; f2y=P.y_main[i2];
-  }
-
-  // Intercept aF with same slope b (average across the two floor anchors in log space)
-  const aF1 = Math.log10(f1y) - b*Math.log10(f1x);
-  const aF2 = Math.log10(f2y) - b*Math.log10(f2x);
-  const aF  = (aF1 + aF2)/2;
+  // Floor from one range -> min; floor parallel to ceiling
+  const F0 = minInRange(P.date_iso_main, P.y_main, P.x_main, fs, fe);
+  const aF = Math.log10(F0.y) - b*Math.log10(F0.x);
 
   const lx = P.x_grid.map(v => Math.log10(v));
   const logF = lx.map(v => aF + b*v);
@@ -634,63 +575,48 @@ function railsFromAnchors(P, ceilY1, ceilY2, floorMode, floorArgs){
   function exp10(arr){ return arr.map(v => Math.pow(10, v)); }
   const FLOOR   = exp10(logF);
   const CEILING = exp10(logC);
-  const P25     = logF.map((lf,i)=> Math.pow(10, lf + 0.25*(logC[i]-lf)));
+  const P20     = logF.map((lf,i)=> Math.pow(10, lf + 0.20*(logC[i]-lf)));
   const P50     = logF.map((lf,i)=> Math.pow(10, lf + 0.50*(logC[i]-lf)));
-  const P75     = logF.map((lf,i)=> Math.pow(10, lf + 0.75*(logC[i]-lf)));
-  return {FLOOR, P25, P50, P75, CEILING};
+  const P80     = logF.map((lf,i)=> Math.pow(10, lf + 0.80*(logC[i]-lf)));
+  return {FLOOR, P20, P50, P80, CEILING};
 }
 
-function prefillAnchorsForDenom(P){
-  // Prefill UI with per-denom defaults (nice starting points)
-  const years = P.defaults.anchors.ceiling_years || [2011,2017];
-  ceilY1.value = years[0];
-  ceilY2.value = years[1];
-
-  // For floor preset dates, use defaults floor_dates if present
-  const fd = P.defaults.anchors.floor_dates || [];
-  if(fd.length>=1) { floorC_d1.value = fd[0]; }
-  if(fd.length>=2) { floorC_d2.value = fd[1]; floorA_date.value = fd[1]; }
-
-  // For floor year lows, derive years from those dates if available
-  if(fd.length>=2){
-    floorB_y1.value = parseInt(fd[0].slice(0,4));
-    floorB_y2.value = parseInt(fd[1].slice(0,4));
-  }
+function prefillRangesForDenom(P){
+  const R = P.defaults.ranges;
+  const [d1s,d1e] = R.ceil1;  const [d2s,d2e] = R.ceil2;  const [dfs,dfe] = R.floor;
+  document.getElementById('c1s').value=d1s; document.getElementById('c1e').value=d1e;
+  document.getElementById('c2s').value=d2s; document.getElementById('c2e').value=d2e;
+  document.getElementById('fs').value=dfs;  document.getElementById('fe').value=dfe;
 }
 
 function computeAndApplyRails(denKey){
   const P = PRECOMP[denKey];
-  const mode = currentRailsMode();
   let rails=null;
   try{
-    if(mode==='AUTO'){
+    if(document.querySelector('input[name="railsMode"]:checked').value==='AUTO'){
       rails = railsFromQuantiles(P);
     }else{
-      const y1 = parseInt(ceilY1.value,10);
-      const y2 = parseInt(ceilY2.value,10);
-      if(mode==='A'){
-        rails = railsFromAnchors(P, y1, y2, 'A', {dateISO: floorA_date.value || '2015-10-01'});
-      }else if(mode==='B'){
-        rails = railsFromAnchors(P, y1, y2, 'B', {y1: parseInt(floorB_y1.value,10), y2: parseInt(floorB_y2.value,10)});
-      }else{
-        rails = railsFromAnchors(P, y1, y2, 'C', {d1ISO: floorC_d1.value, d2ISO: floorC_d2.value});
-      }
+      rails = railsFromRanges(P,
+        document.getElementById('c1s').value, document.getElementById('c1e').value,
+        document.getElementById('c2s').value, document.getElementById('c2e').value,
+        document.getElementById('fs').value,  document.getElementById('fe').value
+      );
     }
   }catch(e){
     console.error(e);
-    alert("Anchor computation error: "+e.message);
+    alert("Rails error: "+e.message);
     return;
   }
   CURRENT_RAILS = rails;
   restyleRails(P);
-  const xTarget = locked ? lockedX : P.x_main[P.x_main.length-1];
+  const xTarget = (typeof lockedX==='number') ? lockedX : P.x_main[P.x_main.length-1];
   updatePanel(P, xTarget);
 }
 
 document.addEventListener('DOMContentLoaded', function(){
   const plotDiv=document.querySelector('.left .js-plotly-plot');
 
-  // Live hover
+  // Live hover (follow cursor unless locked)
   plotDiv.on('plotly_hover', function(ev){
     if(!ev.points||!ev.points.length) return;
     if(locked) return;
@@ -701,9 +627,9 @@ document.addEventListener('DOMContentLoaded', function(){
   document.getElementById('setDateBtn').addEventListener('click', function(){
     const val=document.getElementById('datePick').value;
     if(!val) return;
-    const xDays=daysFromISO(val);
-    locked=true; lockedX=xDays;
-    updatePanel(PRECOMP[denomSel.value], xDays);
+    const xYears=yearsFromISO(val);
+    locked=true; lockedX=xYears;
+    updatePanel(PRECOMP[denomSel.value], xYears);
   });
   document.getElementById('liveBtn').addEventListener('click', function(){ locked=false; lockedX=null; });
 
@@ -723,10 +649,10 @@ document.addEventListener('DOMContentLoaded', function(){
     }catch(e){ console.error(e); }
   });
 
-  // Denominator change → prefill defaults → recompute rails → relabel axis
+  // Denominator change → prefill ranges & relabel axis → compute rails
   denomSel.addEventListener('change', function(){
     const key=denomSel.value, P=PRECOMP[key];
-    prefillAnchorsForDenom(P);
+    prefillRangesForDenom(P);
     Plotly.restyle(plotDiv, { x:[P.x_main], y:[P.y_main], name:[P.label] }, [5]);
     Plotly.restyle(plotDiv, { x:[P.x_main], y:[P.y_main] }, [6]); // cursor
     Plotly.restyle(plotDiv, { x:[P.x_main], y:[P.main_rebased] }, [7]);
@@ -735,20 +661,14 @@ document.addEventListener('DOMContentLoaded', function(){
     computeAndApplyRails(key);
   });
 
-  // Apply Anchors button
-  applyBtn.addEventListener('click', function(){ computeAndApplyRails(denomSel.value); });
-
   // Initialize with USD defaults
-  prefillAnchorsForDenom(PRECOMP['USD']);
+  prefillRangesForDenom(PRECOMP['USD']);
   computeAndApplyRails('USD');
-});
 
-// util used above
-function daysFromISO(s){
-  const d0=new Date(GENESIS_ISO+'T00:00:00Z');
-  const d=parseISO(s);
-  return ((d.getTime()-d0.getTime())/86400000)+1.0;
-}
+  // show/hide ranges UI based on mode
+  document.getElementById('rangeUI').style.display =
+    document.querySelector('input[name="railsMode"]:checked').value==='RANGES' ? 'block' : 'none';
+});
 </script>
 </body>
 </html>
@@ -757,8 +677,8 @@ function daysFromISO(s){
 html = html_tpl.safe_substitute(
     PLOT_HTML=plot_html,
     PRECOMP_JSON=precomp_json,
-    GENESIS_ISO=genesis_iso,
-    COL_F=LINE_FLOOR, COL_25=LINE_25, COL_50=LINE_50, COL_75=LINE_75, COL_C=LINE_CEILING,
+    GENESIS_ISO=GENESIS_DATE.strftime("%Y-%m-%d"),
+    COL_F=LINE_FLOOR, COL_20=LINE_20, COL_50=LINE_50, COL_80=LINE_80, COL_C=LINE_CEILING,
 )
 
 with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
