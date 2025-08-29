@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
 """
-BTC Purchase Indicator — Anchor Chooser (client-side rails)
+BTC Purchase Indicator — Per-Denom Defaults + Anchor Chooser (client-side rails)
 
-Default rails:
-- Ceiling: auto highs in 2011 & 2017 (log–log).
-- Floor: earliest 2013 price & 2015-10-01 price, parallel to ceiling (log–log).
-Midlines: 25%, 50% (bold), 75% between floor & ceiling in log-space.
+Defaults (per denominator):
+- Fit robust central slope (q50 QuantReg) in log–log.
+- Compute residuals; set CEILING = Q97.5% + eps, FLOOR = Q2.5% - eps (eps ≈ 0.015).
+- Rails: straight & parallel in log space (Bitbo-style).
+- Midlines: 25%, 50% (bold), 75% between floor & ceiling in log-space.
 
-New:
-- Right-panel "Anchors" UI to pick ceiling & floor anchors interactively:
-  * Ceiling: two YEARS (Highs).
-  * Floor: choose one of:
-      (A) 2013-start + specific date (default 2015-10-01),
-      (B) Two YEARS (Lows),
-      (C) Two custom DATES.
-  * Apply Anchors recomputes rails instantly in JS (no rebuild).
-- Denominator changes reapply current anchor settings to that series.
+Anchors UI (override defaults without rebuild):
+- Ceiling (Highs): choose two years.
+- Floor modes:
+  (A) Earliest 2013 + specific date
+  (B) Two years (lows)
+  (C) Two dates
+- Plus an "Auto (Quantiles)" mode that uses the per-denominator defaults.
 
 Other behavior:
-- p% = BTC’s log-space position between floor & ceiling at cursor (or locked date).
-- BTC line black; y-axis title updates with denominator; odd years after 2026 hidden; no x-axis title.
-- Copy Chart: tries clipboard, else downloads PNG.
+- Right panel follows cursor unless locked by date; p% in log space.
+- Denominator dropdown; y-axis title updates; odd years after 2026 hidden; no x-axis title.
+- Copy Chart: clipboard if allowed, otherwise downloads PNG.
+
+Data:
+- BTC from data/btc_usd.csv if present; else attempts fetch (CoinGecko Pro API or Blockchain.com CSV).
+- Denominators: any CSV named data/denominator_*.csv with columns date,price.
 """
 
 import os, io, glob, time, math, json
@@ -32,6 +35,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
+from statsmodels.regression.quantile_regression import QuantReg
 
 # ---------------------------- CONFIG ----------------------------
 
@@ -42,8 +46,10 @@ BTC_FILE      = os.path.join(DATA_DIR, "btc_usd.csv")
 GENESIS_DATE  = datetime(2009, 1, 3)
 END_PROJ      = datetime(2040, 12, 31)
 
-# Default ceiling years (you can change in UI later)
-CEIL_YEARS_DEFAULT = (2011, 2017)
+# Default residual quantiles for rails (per denom)
+CEIL_Q  = 0.975
+FLOOR_Q = 0.025
+EPS_LOG = 0.015  # small pad in log10 units (~3-4%); tune 0.01-0.03
 
 # Colors
 LINE_FLOOR   = "#D32F2F"
@@ -146,7 +152,65 @@ def collect_denominators() -> Dict[str, pd.DataFrame]:
         except Exception as e: print(f"[warn] bad denom {p}: {e}")
     return opts
 
-# -------------------------- BUILD BASE --------------------------
+# ---------------------- ROBUST DEFAULTS (per denom) ------------
+
+def robust_slope_q50(x_days: np.ndarray, y_series: np.ndarray):
+    m = (x_days > 0) & (y_series > 0) & np.isfinite(x_days) & np.isfinite(y_series)
+    x = np.log10(x_days[m]); y = np.log10(y_series[m])
+    X = pd.DataFrame({"const": 1.0, "logx": x})
+    model = QuantReg(y, X)
+    res = model.fit(q=0.5)
+    a0 = float(res.params["const"]); b = float(res.params["logx"])
+    resid = y - (a0 + b * x)
+    return a0, b, resid, m
+
+def suggest_defaults_for_series(
+    dates: pd.Series, x_days: pd.Series, y_series: pd.Series,
+    ceil_q=CEIL_Q, floor_q=FLOOR_Q, eps=EPS_LOG
+):
+    a0, b, resid, mask = robust_slope_q50(x_days.values, y_series.values)
+    cC = float(np.nanquantile(resid, ceil_q)) + eps
+    cF = float(np.nanquantile(resid, floor_q)) - eps
+
+    idx_all = np.where(mask)[0]
+    if len(idx_all) < 4:
+        # too little data to split early/late; just pick first/last for display
+        iC1 = idx_all[0]; iC2 = idx_all[-1]; iF1 = idx_all[0]; iF2 = idx_all[-1]
+    else:
+        half = len(idx_all)//2
+        early = idx_all[:max(1, half)]
+        late  = idx_all[max(1, half):]
+
+        def closest_idx(subidx, target):
+            # residuals corresponding to subidx
+            # map mask indices back to compact resid order
+            # Build map from compact indices to original indices
+            comp = np.where(mask)[0]
+            comp_to_resid = {orig:i for i,orig in enumerate(comp)}
+            r = np.array([resid[comp_to_resid[i]] for i in subidx])
+            j = int(np.argmin(np.abs(r - target)))
+            return int(subidx[j])
+
+        iC1 = closest_idx(early, cC)
+        iC2 = closest_idx(late,  cC)
+        iF1 = closest_idx(early, cF)
+        iF2 = closest_idx(late,  cF)
+
+    # For UI defaults, expose suggested anchor years/dates
+    ceil_dates = [str(dates.iloc[iC1].date()), str(dates.iloc[iC2].date())]
+    floor_dates = [str(dates.iloc[iF1].date()), str(dates.iloc[iF2].date())]
+    ceil_years = [int(ceil_dates[0][:4]), int(ceil_dates[1][:4])]
+
+    return {
+        "a0": a0, "b": b, "cF": cF, "cC": cC,
+        "anchors": {
+            "ceiling_dates": ceil_dates,
+            "floor_dates": floor_dates,
+            "ceiling_years": ceil_years,
+        }
+    }
+
+# -------------------------- LOAD DATA ---------------------------
 
 btc = get_btc_df().rename(columns={"price":"btc"})
 denoms = collect_denominators()
@@ -181,7 +245,7 @@ def year_ticks_log(first_date: datetime, last_date: datetime):
 first_date = base["date"].iloc[0].to_pydatetime()
 xtickvals, xticktext = year_ticks_log(first_date, END_PROJ)
 
-# -------------------- PRECOMPUTE PER DENOM (data only) ---------
+# -------------------- PER-DENOM PAYLOAD -------------------------
 
 def series_for_denom(df: pd.DataFrame, denom_key: Optional[str]):
     if not denom_key or denom_key.lower() in ("usd","none"):
@@ -193,6 +257,8 @@ def series_for_denom(df: pd.DataFrame, denom_key: Optional[str]):
 
 def build_payload(denom_key: Optional[str]):
     y_main, y_label, denom_series = series_for_denom(base, denom_key)
+    defaults = suggest_defaults_for_series(base["date"], base["x_days"], y_main)
+
     return {
         "label": y_label,
         "x_main": base["x_days"].tolist(),
@@ -200,7 +266,8 @@ def build_payload(denom_key: Optional[str]):
         "date_iso_main": base["date_iso"].tolist(),
         "x_grid": x_grid.tolist(),
         "main_rebased": (y_main / y_main.iloc[0]).tolist(),
-        "denom_rebased": (denom_series/denom_series.iloc[0]).tolist() if denom_series is not None else [math.nan]*len(base),
+        "denom_rebased": (denom_series/denom_series.iloc[0]).tolist() if denom_series is not None else [float("nan")]*len(base),
+        "defaults": defaults,  # per-denom robust params and suggested anchors
     }
 
 PRECOMP = {"USD": build_payload(None)}
@@ -208,9 +275,8 @@ for k in sorted(denoms.keys()):
     PRECOMP[k] = build_payload(k)
 init = PRECOMP["USD"]
 
-# -------------------------- FIGURE (initial rails = defaults) ---
+# -------------------------- FIGURE (rails drawn via JS) ----------
 
-# We’ll draw empty rails now; JS will compute and restyle immediately based on defaults.
 traces=[]; vis_norm=[]; vis_cmp=[]
 
 def add_line_on_grid(name, color, width=1.2, dash=None, bold=False):
@@ -242,7 +308,7 @@ traces.append(go.Scatter(
 ))
 vis_norm.append(True); vis_cmp.append(False)
 
-# Compare-mode lines (rebased)
+# (Optional) Compare/rebased placeholders
 traces.append(go.Scatter(x=init["x_main"], y=init["main_rebased"], name="Main (rebased)",
                          mode="lines", hoverinfo="skip", visible=False, line=dict(color=BTC_COLOR)))
 traces.append(go.Scatter(x=init["x_main"], y=init["denom_rebased"], name="Denominator (rebased)",
@@ -251,28 +317,29 @@ vis_norm.extend([False, False]); vis_cmp.extend([True, True])
 
 fig = go.Figure(data=traces)
 
-# Y ticks: faux "0" then powers of 10 with commas
-def make_y_ticks(max_y: float):
-    exp_max = 8  # just to seed; JS will adjust panel values dynamically
-    vals=[1e-8] + [10**e for e in range(0, exp_max+1)]
+# Y ticks: faux "0" then powers of 10 with commas (panel shows precise values)
+def make_y_ticks():
+    exp_max = 8
+    vals=["1e-8"]  # placeholder as string to avoid float repr issues in proto HTML; relayout later if needed
     texts=["0"] + [f"{int(10**e):,}" for e in range(0, exp_max+1)]
+    vals=[1e-8] + [10**e for e in range(0, exp_max+1)]
     return vals, texts
 
-ytickvals, yticktext = make_y_ticks(1)
+ytickvals, yticktext = make_y_ticks()
 
 fig.update_layout(
     template="plotly_white",
     showlegend=True,
     hovermode="x",
     hoverdistance=30, spikedistance=30,
-    title=f"BTC Purchase Indicator — Anchor Rails",
+    title=f"BTC Purchase Indicator — Rails",
     xaxis=dict(type="log", title=None, tickmode="array", tickvals=xtickvals, ticktext=xticktext),
     yaxis=dict(type="log", title=init["label"], tickmode="array", tickvals=ytickvals, ticktext=yticktext),
     legend=dict(x=1.02, xanchor="left", y=1.0, yanchor="top", bgcolor="rgba(255,255,255,0.0)"),
-    margin=dict(l=70, r=420, t=70, b=70),
+    margin=dict(l=70, r=460, t=70, b=70),
 )
 
-# ---------------------- HTML (+ Anchors UI) ---------------------
+# ---------------------- HTML + JS (defaults + anchors UI) -------
 
 ensure_dir(os.path.dirname(OUTPUT_HTML))
 plot_html = fig.to_html(full_html=False, include_plotlyjs="cdn",
@@ -288,7 +355,7 @@ html_tpl = Template(r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>BTC Purchase Indicator</title>
 <style>
-  :root { --panelW: 420px; }
+  :root { --panelW: 460px; }
   body { font-family: Inter, Roboto, -apple-system, Segoe UI, Arial, sans-serif; margin: 0; }
   .layout { display: grid; grid-template-columns: 1fr var(--panelW); height: 100vh; }
   .left { padding: 8px 0 8px 8px; }
@@ -332,33 +399,35 @@ html_tpl = Template(r"""<!DOCTYPE html>
     </div>
 
     <fieldset id="anchors">
-      <legend>Anchors</legend>
-      <div style="display:flex; flex-direction:column; gap:8px; width:100%;">
-        <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <legend>Rails Mode & Anchors</legend>
+      <div style="display:flex; flex-direction:column; gap:10px; width:100%;">
+
+        <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+          <label><input type="radio" name="railsMode" value="AUTO" checked/> Auto (Quantiles)</label>
+          <label><input type="radio" name="railsMode" value="A"/> Anchors: 2013-start + Date</label>
+          <label><input type="radio" name="railsMode" value="B"/> Anchors: Year Lows</label>
+          <label><input type="radio" name="railsMode" value="C"/> Anchors: Two Dates</label>
+        </div>
+
+        <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
           <b>Ceiling (Highs):</b>
           <label>Year 1 <input type="number" id="ceilY1" value="2011" min="2010" max="2100" style="width:90px"/></label>
           <label>Year 2 <input type="number" id="ceilY2" value="2017" min="2010" max="2100" style="width:90px"/></label>
+          <span style="font-size:12px;color:#6b7280;">(used for A/B/C; ignored in Auto)</span>
         </div>
 
-        <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-          <b>Floor:</b>
-          <label><input type="radio" name="floorMode" value="A" checked/> 2013-start + Date</label>
-          <label><input type="radio" name="floorMode" value="B"/> Lows in two Years</label>
-          <label><input type="radio" name="floorMode" value="C"/> Two Dates</label>
-        </div>
-
-        <div id="floorA" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-          <span>2013 earliest + </span>
+        <div id="floorA" style="display:none; gap:12px; align-items:center; flex-wrap:wrap;">
+          <span>Floor: earliest 2013 + </span>
           <label>Date <input type="date" id="floorA_date" value="2015-10-01"/></label>
         </div>
 
-        <div id="floorB" style="display:none; gap:10px; align-items:center; flex-wrap:wrap;">
+        <div id="floorB" style="display:none; gap:12px; align-items:center; flex-wrap:wrap;">
           <label>Year 1 <input type="number" id="floorB_y1" value="2015" min="2010" max="2100" style="width:90px"/></label>
           <label>Year 2 <input type="number" id="floorB_y2" value="2022" min="2010" max="2100" style="width:90px"/></label>
-          <span>(use <i>lows</i>)</span>
+          <span style="font-size:12px;color:#6b7280;">(use lows)</span>
         </div>
 
-        <div id="floorC" style="display:none; gap:10px; align-items:center; flex-wrap:wrap;">
+        <div id="floorC" style="display:none; gap:12px; align-items:center; flex-wrap:wrap;">
           <label>Date 1 <input type="date" id="floorC_d1" value="2013-01-01"/></label>
           <label>Date 2 <input type="date" id="floorC_d2" value="2015-10-01"/></label>
         </div>
@@ -393,7 +462,6 @@ html_tpl = Template(r"""<!DOCTYPE html>
 const PRECOMP      = $PRECOMP_JSON;
 const GENESIS_ISO  = "$GENESIS_ISO";
 
-// ---------- helpers ----------
 function fmtUSD(v){ if(!isFinite(v)) return '$—'; return '$' + Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}); }
 function shortMonthName(m){ return ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][m]; }
 function dateFromDaysShort(x){
@@ -419,7 +487,87 @@ function positionPctLog(y,f,c){
   return Math.max(0, Math.min(100, 100*(ly-lf)/Math.max(1e-12, lc-lf)));
 }
 
-// find index by nearest date
+// ---------- UI elements ----------
+const denomSel  = document.getElementById('denomSel');
+const denoms = Object.keys(PRECOMP).filter(k => k!=='USD');
+document.getElementById('denomsDetected').textContent = denoms.length ? denoms.join(', ') : '(none)';
+['USD', ...denoms].forEach(k => {
+  const opt=document.createElement('option');
+  opt.value=k; opt.textContent=(k==='USD')?'USD/None':k;
+  denomSel.appendChild(opt);
+});
+
+const railsModeRadios = [...document.querySelectorAll('input[name="railsMode"]')];
+const ceilY1 = document.getElementById('ceilY1');
+const ceilY2 = document.getElementById('ceilY2');
+const floorA = document.getElementById('floorA'), floorA_date=document.getElementById('floorA_date');
+const floorB = document.getElementById('floorB'), floorB_y1=document.getElementById('floorB_y1'), floorB_y2=document.getElementById('floorB_y2');
+const floorC = document.getElementById('floorC'), floorC_d1=document.getElementById('floorC_d1'), floorC_d2=document.getElementById('floorC_d2');
+const applyBtn = document.getElementById('applyAnchors');
+
+function currentRailsMode(){ return railsModeRadios.find(r=>r.checked).value; }
+function showFloorUI(){
+  const m=currentRailsMode();
+  floorA.style.display = (m==='A')?'flex':'none';
+  floorB.style.display = (m==='B')?'flex':'none';
+  floorC.style.display = (m==='C')?'flex':'none';
+}
+railsModeRadios.forEach(r => r.addEventListener('change', showFloorUI));
+showFloorUI();
+
+const elDate=document.querySelector('#readout .date');
+const elF=document.getElementById('vF'), el25=document.getElementById('v25'),
+      el50=document.getElementById('v50'), el75=document.getElementById('v75'), elC=document.getElementById('vC');
+const elMain=document.getElementById('mainVal'), elPPct=document.getElementById('pPct');
+
+let CURRENT_RAILS = null;
+let locked=false, lockedX=null;
+
+function updatePanel(P, xDays){
+  elDate.textContent = dateFromDaysShort(xDays);
+  const F = interp(P.x_grid, CURRENT_RAILS.FLOOR,   xDays);
+  const v25=interp(P.x_grid, CURRENT_RAILS.P25,     xDays);
+  const v50=interp(P.x_grid, CURRENT_RAILS.P50,     xDays);
+  const v75=interp(P.x_grid, CURRENT_RAILS.P75,     xDays);
+  const C = interp(P.x_grid, CURRENT_RAILS.CEILING, xDays);
+  elF.textContent=fmtUSD(F); el25.textContent=fmtUSD(v25); el50.textContent=fmtUSD(v50); el75.textContent=fmtUSD(v75); elC.textContent=fmtUSD(C);
+
+  // nearest observed price
+  let idx=0,best=1e99;
+  for(let i=0;i<P.x_main.length;i++){ const d=Math.abs(P.x_main[i]-xDays); if(d<best){best=d; idx=i;} }
+  const y=P.y_main[idx]; elMain.textContent = fmtUSD(y);
+  const p = positionPctLog(y,F,C);
+  elPPct.textContent = `(p≈${p.toFixed(1)}%)`;
+
+  const plotDiv=document.querySelector('.left .js-plotly-plot');
+  Plotly.relayout(plotDiv, {"title.text": `BTC Purchase Indicator — Rails (p≈${p.toFixed(1)}%)`});
+}
+
+function restyleRails(P){
+  const plotDiv=document.querySelector('.left .js-plotly-plot');
+  // traces: Floor(0),25(1),50(2),75(3),Ceil(4)
+  Plotly.restyle(plotDiv, {x:[P.x_grid], y:[CURRENT_RAILS.FLOOR]},   [0]);
+  Plotly.restyle(plotDiv, {x:[P.x_grid], y:[CURRENT_RAILS.P25]},     [1]);
+  Plotly.restyle(plotDiv, {x:[P.x_grid], y:[CURRENT_RAILS.P50]},     [2]);
+  Plotly.restyle(plotDiv, {x:[P.x_grid], y:[CURRENT_RAILS.P75]},     [3]);
+  Plotly.restyle(plotDiv, {x:[P.x_grid], y:[CURRENT_RAILS.CEILING]}, [4]);
+}
+
+function railsFromQuantiles(P){
+  const a0 = P.defaults.a0, b = P.defaults.b;
+  const cF = P.defaults.cF, cC = P.defaults.cC;
+  const lx = P.x_grid.map(v => Math.log10(v));
+  const logF = lx.map(v => a0 + b*v + cF);
+  const logC = lx.map(v => a0 + b*v + cC);
+  function exp10(arr){ return arr.map(v => Math.pow(10, v)); }
+  const FLOOR   = exp10(logF);
+  const CEILING = exp10(logC);
+  const P25     = logF.map((lf,i)=> Math.pow(10, lf + 0.25*(logC[i]-lf)));
+  const P50     = logF.map((lf,i)=> Math.pow(10, lf + 0.50*(logC[i]-lf)));
+  const P75     = logF.map((lf,i)=> Math.pow(10, lf + 0.75*(logC[i]-lf)));
+  return {FLOOR, P25, P50, P75, CEILING};
+}
+
 function nearestIndexByDate(isoArr, targetISO){
   const t=parseISO(targetISO).getTime();
   let bestI=0, best=1e99;
@@ -442,7 +590,6 @@ function extremeInYear(isoArr, yArr, xArr, year, mode){
   }
   return {x:xArr[bestI], y:yArr[bestI], dateISO: isoArr[bestI]};
 }
-
 function lineFromTwoPointsLog(x1,y1,x2,y2){
   const lx1=Math.log10(x1), ly1=Math.log10(y1);
   const lx2=Math.log10(x2), ly2=Math.log10(y2);
@@ -451,134 +598,83 @@ function lineFromTwoPointsLog(x1,y1,x2,y2){
   return {a,b};
 }
 function railsFromAnchors(P, ceilY1, ceilY2, floorMode, floorArgs){
-  // Ceiling anchors (highs by year)
+  // Ceiling from highs by year
   const c1 = extremeInYear(P.date_iso_main, P.y_main, P.x_main, ceilY1, 'max');
   const c2 = extremeInYear(P.date_iso_main, P.y_main, P.x_main, ceilY2, 'max');
   const {a:aC, b} = lineFromTwoPointsLog(c1.x, c1.y, c2.x, c2.y);
 
-  // Floor anchors
+  // Floor
   let f1x,f1y, f2x,f2y;
   if(floorMode==='A'){ // earliest 2013 + date
-    // earliest 2013
     let first2013 = -1;
     for(let i=0;i<P.date_iso_main.length;i++){ if(P.date_iso_main[i].slice(0,4)==='2013'){ first2013=i; break; } }
     if(first2013<0) throw new Error("No 2013 data to anchor floor");
     f1x=P.x_main[first2013]; f1y=P.y_main[first2013];
-    // specific date (nearest)
     const idx=nearestIndexByDate(P.date_iso_main, floorArgs.dateISO);
     f2x=P.x_main[idx]; f2y=P.y_main[idx];
-  } else if(floorMode==='B'){ // two YEARS lows
+  } else if(floorMode==='B'){ // two years (lows)
     const f1=extremeInYear(P.date_iso_main, P.y_main, P.x_main, floorArgs.y1, 'min');
     const f2=extremeInYear(P.date_iso_main, P.y_main, P.x_main, floorArgs.y2, 'min');
     f1x=f1.x; f1y=f1.y; f2x=f2.x; f2y=f2.y;
-  } else { // 'C' two DATES
+  } else { // 'C' two dates
     const i1=nearestIndexByDate(P.date_iso_main, floorArgs.d1ISO);
     const i2=nearestIndexByDate(P.date_iso_main, floorArgs.d2ISO);
     f1x=P.x_main[i1]; f1y=P.y_main[i1];
     f2x=P.x_main[i2]; f2y=P.y_main[i2];
   }
 
-  // Intercept aF consistent with slope b (average of two floor anchors in log-space)
+  // Intercept aF with same slope b (average across the two floor anchors in log space)
   const aF1 = Math.log10(f1y) - b*Math.log10(f1x);
   const aF2 = Math.log10(f2y) - b*Math.log10(f2x);
-  const aF = (aF1 + aF2)/2;
+  const aF  = (aF1 + aF2)/2;
 
   const lx = P.x_grid.map(v => Math.log10(v));
   const logF = lx.map(v => aF + b*v);
   const logC = lx.map(v => aC + b*v);
-
   function exp10(arr){ return arr.map(v => Math.pow(10, v)); }
   const FLOOR   = exp10(logF);
   const CEILING = exp10(logC);
   const P25     = logF.map((lf,i)=> Math.pow(10, lf + 0.25*(logC[i]-lf)));
   const P50     = logF.map((lf,i)=> Math.pow(10, lf + 0.50*(logC[i]-lf)));
   const P75     = logF.map((lf,i)=> Math.pow(10, lf + 0.75*(logC[i]-lf)));
-
   return {FLOOR, P25, P50, P75, CEILING};
 }
 
-// ---------- DOM ----------
-const denomSel  = document.getElementById('denomSel');
-const denoms = Object.keys(PRECOMP).filter(k => k!=='USD');
-document.getElementById('denomsDetected').textContent = denoms.length ? denoms.join(', ') : '(none)';
-['USD', ...denoms].forEach(k => {
-  const opt=document.createElement('option');
-  opt.value=k; opt.textContent=(k==='USD')?'USD/None':k;
-  denomSel.appendChild(opt);
-});
+function prefillAnchorsForDenom(P){
+  // Prefill UI with per-denom defaults (nice starting points)
+  const years = P.defaults.anchors.ceiling_years || [2011,2017];
+  ceilY1.value = years[0];
+  ceilY2.value = years[1];
 
-const elDate=document.querySelector('#readout .date');
-const elF=document.getElementById('vF'), el25=document.getElementById('v25'),
-      el50=document.getElementById('v50'), el75=document.getElementById('v75'), elC=document.getElementById('vC');
-const elMain=document.getElementById('mainVal'), elPPct=document.getElementById('pPct');
+  // For floor preset dates, use defaults floor_dates if present
+  const fd = P.defaults.anchors.floor_dates || [];
+  if(fd.length>=1) { floorC_d1.value = fd[0]; }
+  if(fd.length>=2) { floorC_d2.value = fd[1]; floorA_date.value = fd[1]; }
 
-// anchors UI
-const ceilY1 = document.getElementById('ceilY1');
-const ceilY2 = document.getElementById('ceilY2');
-const floorModeRadios = [...document.querySelectorAll('input[name="floorMode"]')];
-const floorA = document.getElementById('floorA'), floorA_date=document.getElementById('floorA_date');
-const floorB = document.getElementById('floorB'), floorB_y1=document.getElementById('floorB_y1'), floorB_y2=document.getElementById('floorB_y2');
-const floorC = document.getElementById('floorC'), floorC_d1=document.getElementById('floorC_d1'), floorC_d2=document.getElementById('floorC_d2');
-const applyBtn = document.getElementById('applyAnchors');
-
-function currentFloorMode(){ return floorModeRadios.find(r=>r.checked).value; }
-function showFloorUI(){
-  const mode=currentFloorMode();
-  floorA.style.display = (mode==='A')?'flex':'none';
-  floorB.style.display = (mode==='B')?'flex':'none';
-  floorC.style.display = (mode==='C')?'flex':'none';
-}
-floorModeRadios.forEach(r => r.addEventListener('change', showFloorUI));
-showFloorUI();
-
-// Keep current rails in memory
-let CURRENT_RAILS = null;
-let locked=false, lockedX=null;
-
-function updatePanel(P, xDays){
-  elDate.textContent = dateFromDaysShort(xDays);
-  const F = interp(P.x_grid, CURRENT_RAILS.FLOOR,   xDays);
-  const v25=interp(P.x_grid, CURRENT_RAILS.P25,     xDays);
-  const v50=interp(P.x_grid, CURRENT_RAILS.P50,     xDays);
-  const v75=interp(P.x_grid, CURRENT_RAILS.P75,     xDays);
-  const C = interp(P.x_grid, CURRENT_RAILS.CEILING, xDays);
-  elF.textContent=fmtUSD(F); el25.textContent=fmtUSD(v25); el50.textContent=fmtUSD(v50); el75.textContent=fmtUSD(v75); elC.textContent=fmtUSD(C);
-
-  // nearest observed price
-  let idx=0,best=1e99;
-  for(let i=0;i<P.x_main.length;i++){ const d=Math.abs(P.x_main[i]-xDays); if(d<best){best=d; idx=i;} }
-  const y=P.y_main[idx]; elMain.textContent = fmtUSD(y);
-  const p = positionPctLog(y,F,C);
-  elPPct.textContent = `(p≈${p.toFixed(1)}%)`;
-
-  const plotDiv=document.querySelector('.left .js-plotly-plot');
-  Plotly.relayout(plotDiv, {"title.text": `BTC Purchase Indicator — Anchor Rails (p≈${p.toFixed(1)}%)`});
+  // For floor year lows, derive years from those dates if available
+  if(fd.length>=2){
+    floorB_y1.value = parseInt(fd[0].slice(0,4));
+    floorB_y2.value = parseInt(fd[1].slice(0,4));
+  }
 }
 
-function restyleRails(P){
-  const plotDiv=document.querySelector('.left .js-plotly-plot');
-  // traces: Floor(0),25(1),50(2),75(3),Ceil(4)
-  Plotly.restyle(plotDiv, {x:[P.x_grid], y:[CURRENT_RAILS.FLOOR]},   [0]);
-  Plotly.restyle(plotDiv, {x:[P.x_grid], y:[CURRENT_RAILS.P25]},     [1]);
-  Plotly.restyle(plotDiv, {x:[P.x_grid], y:[CURRENT_RAILS.P50]},     [2]);
-  Plotly.restyle(plotDiv, {x:[P.x_grid], y:[CURRENT_RAILS.P75]},     [3]);
-  Plotly.restyle(plotDiv, {x:[P.x_grid], y:[CURRENT_RAILS.CEILING]}, [4]);
-}
-
-// compute rails from current UI for selected denom
 function computeAndApplyRails(denKey){
   const P = PRECOMP[denKey];
-  const y1 = parseInt(ceilY1.value,10);
-  const y2 = parseInt(ceilY2.value,10);
-  const mode = currentFloorMode();
+  const mode = currentRailsMode();
   let rails=null;
   try{
-    if(mode==='A'){
-      rails = railsFromAnchors(P, y1, y2, 'A', {dateISO: floorA_date.value || '2015-10-01'});
-    }else if(mode==='B'){
-      rails = railsFromAnchors(P, y1, y2, 'B', {y1: parseInt(floorB_y1.value,10), y2: parseInt(floorB_y2.value,10)});
+    if(mode==='AUTO'){
+      rails = railsFromQuantiles(P);
     }else{
-      rails = railsFromAnchors(P, y1, y2, 'C', {d1ISO: floorC_d1.value, d2ISO: floorC_d2.value});
+      const y1 = parseInt(ceilY1.value,10);
+      const y2 = parseInt(ceilY2.value,10);
+      if(mode==='A'){
+        rails = railsFromAnchors(P, y1, y2, 'A', {dateISO: floorA_date.value || '2015-10-01'});
+      }else if(mode==='B'){
+        rails = railsFromAnchors(P, y1, y2, 'B', {y1: parseInt(floorB_y1.value,10), y2: parseInt(floorB_y2.value,10)});
+      }else{
+        rails = railsFromAnchors(P, y1, y2, 'C', {d1ISO: floorC_d1.value, d2ISO: floorC_d2.value});
+      }
     }
   }catch(e){
     console.error(e);
@@ -627,9 +723,10 @@ document.addEventListener('DOMContentLoaded', function(){
     }catch(e){ console.error(e); }
   });
 
-  // Denominator change → recompute rails and relabel axis
+  // Denominator change → prefill defaults → recompute rails → relabel axis
   denomSel.addEventListener('change', function(){
     const key=denomSel.value, P=PRECOMP[key];
+    prefillAnchorsForDenom(P);
     Plotly.restyle(plotDiv, { x:[P.x_main], y:[P.y_main], name:[P.label] }, [5]);
     Plotly.restyle(plotDiv, { x:[P.x_main], y:[P.y_main] }, [6]); // cursor
     Plotly.restyle(plotDiv, { x:[P.x_main], y:[P.main_rebased] }, [7]);
@@ -638,13 +735,20 @@ document.addEventListener('DOMContentLoaded', function(){
     computeAndApplyRails(key);
   });
 
-  // Apply Anchors
+  // Apply Anchors button
   applyBtn.addEventListener('click', function(){ computeAndApplyRails(denomSel.value); });
 
-  // Initial rails (defaults 2011/2017 highs; 2013-start + 2015-10-01 floor)
+  // Initialize with USD defaults
+  prefillAnchorsForDenom(PRECOMP['USD']);
   computeAndApplyRails('USD');
 });
 
+// util used above
+function daysFromISO(s){
+  const d0=new Date(GENESIS_ISO+'T00:00:00Z');
+  const d=parseISO(s);
+  return ((d.getTime()-d0.getTime())/86400000)+1.0;
+}
 </script>
 </body>
 </html>
