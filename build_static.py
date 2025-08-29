@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BTC Purchase Indicator — Envelope Mode (Floor/Ceiling + log-midlines 10%, 50%, 90%)
+BTC Purchase Indicator — Envelope Mode (Floor/Ceiling + log-midlines 10%, 50% (bold), 90%)
 
 Model:
 - Trend: log10(price) = a + b * log10(days since Genesis)
@@ -14,6 +14,7 @@ UI:
 - p% is the log-space position between Floor and Ceiling at the chosen date.
 - Y-axis title updates with denominator; x-axis title removed. Odd years hidden after 2026.
 
+Requires: pandas, numpy, plotly, statsmodels, requests
 """
 
 import os, io, glob, time, math, json
@@ -147,10 +148,10 @@ def collect_denominators() -> Dict[str, pd.DataFrame]:
 
 # --------------------------- MODEL ------------------------------
 
-def fit_trend_median(x_days: np.ndarray, y_price: np.ndarray) -> Tuple[float,float,pd.Series]:
+def fit_trend_median(x_days: np.ndarray, y_price: np.ndarray) -> Tuple[float,float,np.ndarray]:
     """
     Robust central trend via median (q=0.5) quantile regression in log–log space.
-    Returns (a,b,residuals), where residuals are y - (a+b*x) in log10 space.
+    Returns (a,b,residuals as np.ndarray), where residuals are y - (a+b*x) in log10 space.
     """
     m=(x_days>0)&(y_price>0)&np.isfinite(x_days)&np.isfinite(y_price)
     x=x_days[m]; y=np.log10(y_price[m]); X=pd.DataFrame({"logx":np.log10(x)})
@@ -159,18 +160,16 @@ def fit_trend_median(x_days: np.ndarray, y_price: np.ndarray) -> Tuple[float,flo
     res=model.fit(q=0.5)
     a=float(res.params["const"]); b=float(res.params["logx"])
     resid = y - (a + b*np.log10(x))
-    return a,b,resid
+    return a,b,np.asarray(resid)
 
 def ew_envelopes(resid: np.ndarray, dates: pd.Series, halflife_years: float) -> Tuple[np.ndarray,np.ndarray]:
     """
     Exponentially weighted floor (lower envelope) and ceiling (upper envelope) on log residuals.
     The smoothing uses time deltas (days) so unequal spacing is ok.
     """
-    # convert date spacing to days
     d = pd.to_datetime(dates).to_numpy()
     d_days = np.r_[0.0, (d[1:] - d[:-1]) / np.timedelta64(1, "D")]
     hl_days = halflife_years * 365.25
-    # per-step decay lambda = 0.5^(delta/hl)
     lambdas = np.power(0.5, d_days/hl_days)
     L = np.empty_like(resid); U = np.empty_like(resid)
     L[0] = resid[0]; U[0] = resid[0]
@@ -198,7 +197,6 @@ def predict_env_lines(a: float, b: float,
     lx = np.log10(x_grid)
     trend = a + b*lx  # log10(price)
     def to_price(log_offset): return (10**(trend + log_offset)).tolist()
-    # fractions in log residual space:
     frac10 = Lg + 0.10*(Ug - Lg)
     frac50 = Lg + 0.50*(Ug - Lg)
     frac90 = Lg + 0.90*(Ug - Lg)
@@ -268,13 +266,13 @@ def build_payload(denom_key: Optional[str]):
     a,b,resid = fit_trend_median(x_vals, y_main.values)
 
     # 2) envelopes in log-residual space on main dates
-    L_resid, U_resid = ew_envelopes(resid.values, base["date"], ENVELOPE_HALFLIFE_YEARS)
+    L_resid, U_resid = ew_envelopes(resid, base["date"], ENVELOPE_HALFLIFE_YEARS)
 
     # 3) build Floor/Ceiling + midlines on x_grid
     env_lines = predict_env_lines(a,b,x_vals,L_resid,U_resid,x_grid)
 
     # p% at the latest data point (used only as initial title; panel recomputes dynamically)
-    r_last = resid.values[-1]
+    r_last = resid[-1]
     lo, hi = L_resid[-1], U_resid[-1]
     p_init = float(np.clip((r_last - lo) / max(1e-12, (hi - lo)), 0, 1)) * 100.0
 
@@ -287,7 +285,7 @@ def build_payload(denom_key: Optional[str]):
         "main_rebased": rebase_to_one(y_main).tolist(),
         "denom_rebased": rebase_to_one(denom_series).tolist() if denom_series is not None else [math.nan]*len(base),
         "p_init": p_init,
-        "trend_params": {"a":a, "b":b},   # for debugging/future
+        "trend_params": {"a":a, "b":b},
         "envelope_resid": {"L": L_resid.tolist(), "U": U_resid.tolist()},
     }
 
@@ -300,7 +298,6 @@ init = PRECOMP["USD"]
 
 traces=[]; vis_norm=[]; vis_cmp=[]
 
-# Envelope lines on x_grid
 def add_line(y_list, name, color, width=1.2, dash=None, bold=False, showlegend=True):
     line=dict(width=width, color=color)
     if dash: line["dash"]=dash
@@ -311,6 +308,7 @@ def add_line(y_list, name, color, width=1.2, dash=None, bold=False, showlegend=T
     ))
     vis_norm.append(True); vis_cmp.append(False)
 
+# Envelopes/midlines on x_grid
 add_line(init["env"]["FLOOR"],   "Floor",   LINE_FLOOR,   width=1.2)
 add_line(init["env"]["P10"],     "10%",     LINE_10,      width=1.2, dash="dot")
 add_line(init["env"]["P50"],     "50%",     LINE_50,      bold=True)
