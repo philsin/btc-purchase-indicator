@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 """
-BTC Purchase Indicator — Porkopolis-style power-law view (log-log)
+BTC Purchase Indicator — Log–Log power-law view with YEAR ticks (Bitbo/Porkopolis style)
 
-- Model: power-law in time  log10(price) = a + b * log10(days_since_genesis)
-- X axis: log scale of DAYS since Genesis (2009-01-03)
-- Y axis: log scale; faux "0" label then 1, 10, 100… with comma separators
-- Bands: percentiles (q10, q30, q50, q70, q90) enforced non-crossing with soft gap
-- UI: right-side static panel (bold short date), legend fixed to top-right, denominator dropdown
-- Compare mode (rebased lines) hides bands
-- Copy Snapshot (chart + side panel); Safari fallback opens PNG
-- Mobile-friendly CSS
+What this does
+--------------
+- Model: log10(price) ~ a + b * log10(days since Genesis), i.e., power law in time.
+- X axis: still **log of days since Genesis** (keeps the same scaling), but **tick labels are calendar YEARS**.
+  * This matches the log–log geometry you want while visually labeling the axis in years.
+- Y axis: log scale; faux "0" tick label then 1, 10, 100, ... with comma separators.
+- Start of chart = **first available BTC datapoint** (no fixed 2011 cutoff).
+- Bands: q10/q30/q50/q70/q90 with non-crossing enforcement + a soft log-space gap so fills don’t touch.
+- UI: legend pinned right, static side “hover” panel (bold short date at top, values color-matched),
+      denominator dropdown (data/denominator_*.csv), Compare mode (rebased lines) hides bands.
+- Copy Snapshot (chart + side panel); Safari/iOS fallback opens a PNG tab.
+- Mobile-friendly CSS.
+
+If network access is blocked in CI, add data/btc_usd.csv with columns: date,price
+Deps: pandas numpy plotly statsmodels requests
 """
 
 import os, io, glob, time, math, json
@@ -29,8 +36,7 @@ OUTPUT_HTML   = "docs/index.html"
 DATA_DIR      = "data"
 BTC_FILE      = os.path.join(DATA_DIR, "btc_usd.csv")
 
-GENESIS_DATE  = datetime(2009, 1, 3)  # Porkopolis uses days since 2009-01-03 (Genesis) [power-law x]. 
-START_CUTOFF  = datetime(2011, 1, 1)  # filter for cleaner early data, but x still counts from Genesis
+GENESIS_DATE  = datetime(2009, 1, 3)   # days counted from Genesis
 END_PROJ      = datetime(2040, 12, 31)
 
 QUANTILES     = (0.1, 0.3, 0.5, 0.7, 0.9)
@@ -53,7 +59,7 @@ BAND_NAMES = {
     1.0: "Top 10%",
 }
 
-# Soft log-space gap between adjacent quantiles so fills don't touch visually (~0.23%)
+# Soft log-space gap so adjacent quantiles don't visually touch (~0.23%)
 MIN_GAP_LOG10 = 1e-3
 
 # ---------------------------- UTILS -----------------------------
@@ -73,12 +79,12 @@ def _retry(fn, tries=3, base_delay=1.0, factor=2.0):
             if i<tries-1: time.sleep(base_delay*(factor**i))
     raise last
 
-# Robust: works for Series, arrays, DatetimeIndex
+# Robust for Series, arrays, or DatetimeIndex
 def days_since_genesis(dates, genesis):
     d = pd.to_datetime(dates)
     s = pd.Series(d)
     delta = s - pd.Timestamp(genesis)
-    return (delta / np.timedelta64(1, "D")).astype(float) + 1.0  # +1 => no log(0)
+    return (delta / np.timedelta64(1, "D")).astype(float) + 1.0  # +1 => avoid log(0)
 
 # ------------------------- DATA LOADERS -------------------------
 
@@ -157,7 +163,7 @@ def collect_denominators() -> Dict[str, pd.DataFrame]:
 # --------------------------- MODEL ------------------------------
 
 def fit_quantile_params(x_days: np.ndarray, y: np.ndarray, qs=QUANTILES) -> Dict[float, Tuple[float,float]]:
-    """Power-law in time: log10(y) = a + b * log10(days_since_genesis)."""
+    """Power-law in time: log10(y) = a + b * log10(days since Genesis)."""
     m=(x_days>0)&(y>0)&np.isfinite(x_days)&np.isfinite(y)
     x=x_days[m]; z=np.log10(y[m]); X=pd.DataFrame({"logx":np.log10(x)})
     if len(x)<10: return {}
@@ -217,22 +223,43 @@ def classify_band(y_last: float, x_last_days: float, params: Dict[float,Tuple[fl
 btc = get_btc_df().rename(columns={"price":"btc"})
 denoms = collect_denominators()
 
-# align & enrich
-base = btc.copy()
+# Start exactly where BTC data begins (no fixed cutoff)
+base = btc.sort_values("date").reset_index(drop=True)
+if base.empty:
+    raise RuntimeError("No BTC data found")
+
+# Merge denominators (optional)
 for name, df in denoms.items():
     base = base.merge(df.rename(columns={"price": name.lower()}), on="date", how="left")
 
-# Trim visible history for cleanliness, but compute x (days) from Genesis
-base = base[base["date"] >= START_CUTOFF].reset_index(drop=True)
-if base.empty: raise RuntimeError("No BTC data on/after 2011-01-01")
-
+# Compute x as days since Genesis; also keep dates in string forms
 base["x_days"]   = days_since_genesis(base["date"], GENESIS_DATE)
 base["date_iso"] = base["date"].dt.strftime("%Y-%m-%d")
 base["date_str"] = base["date"].dt.strftime("%m/%d/%y")
 
-# X grid in DAYS (log space) through END_PROJ
-x_end = float(days_since_genesis(pd.Series([END_PROJ]), GENESIS_DATE).iloc[0])
-x_grid = np.logspace(np.log10(1.0), np.log10(x_end), 600)
+# X grid (log-spaced) from first available point to END_PROJ
+x_start = float(base["x_days"].iloc[0])
+x_end   = float(days_since_genesis(pd.Series([END_PROJ]), GENESIS_DATE).iloc[0])
+x_grid  = np.logspace(np.log10(max(1.0, x_start)), np.log10(x_end), 600)
+
+# -------------------- TICKS: years mapped onto log(days) ---------------------
+
+def year_ticks_log(first_date: datetime, last_date: datetime):
+    """Return tick positions (in days since Genesis) and labels (years) for Jan 1 each year."""
+    y0 = first_date.year
+    y1 = last_date.year
+    vals, labs = [], []
+    for y in range(y0, y1+1):
+        d = datetime(y, 1, 1)
+        if d < first_date: continue
+        if d > last_date: break
+        dv = float(days_since_genesis(pd.Series([d]), GENESIS_DATE).iloc[0])
+        if dv <= 0: continue
+        vals.append(dv); labs.append(str(y))
+    return vals, labs
+
+first_date = base["date"].iloc[0].to_pydatetime()
+xtickvals_years, xticktext_years = year_ticks_log(first_date, END_PROJ)
 
 # -------------------- PRECOMPUTE PER DENOM ---------------------
 
@@ -281,7 +308,7 @@ init = PRECOMP["USD"]
 
 traces=[]; vis_norm=[]; vis_cmp=[]
 
-# 0..4 quantile lines (x = DAYS since Genesis; log axis)
+# 0..4 quantile lines (x = DAYS since Genesis, log axis)
 for q in Q_ORDER:
     traces.append(go.Scatter(
         x=init["x_grid"], y=init["q_lines"][str(q)], mode="lines",
@@ -290,7 +317,7 @@ for q in Q_ORDER:
     ))
     vis_norm.append(True); vis_cmp.append(False)
 
-# 5..12 filled bands
+# 5..12 filled bands (inner → outer)
 def add_band(pair_key, ql, qh):
     U = init["bands"][pair_key]["upper"]; L = init["bands"][pair_key]["lower"]
     traces.append(go.Scatter(x=init["x_grid"], y=U, mode="lines",
@@ -304,7 +331,7 @@ def add_band(pair_key, ql, qh):
 
 add_band("0.3-0.5",0.3,0.5); add_band("0.5-0.7",0.5,0.7); add_band("0.1-0.3",0.1,0.3); add_band("0.7-0.9",0.7,0.9)
 
-# 13 main
+# 13 main line
 traces.append(go.Scatter(x=init["x_main"], y=init["y_main"], mode="lines",
                          name=init["label"], line=dict(width=1.6, color=init["line_color"]),
                          hoverinfo="skip"))
@@ -333,14 +360,9 @@ for q in Q_ORDER:
 y_max = max(y_candidates)
 ytickvals, yticktext = make_y_ticks(y_max)
 
-# X ticks: powers of 10 days (1, 10, 100, 1,000, 10,000)
-def make_x_ticks(xmax: float):
-    exp_max = int(math.ceil(math.log10(max(1.0, xmax))))
-    vals=[10**e for e in range(0, exp_max+1)]
-    texts=[("1" if v<10 else f"{int(v):,}") for v in vals]
-    return vals, texts
-
-xtickvals, xticktext = make_x_ticks(max(init["x_grid"]))
+# X ticks: map Jan 1 each year to DAYS-since-Genesis, and label with the year (keep log scaling)
+xtickvals = [v for v in xtickvals_years if v >= x_start and v <= x_end]
+xticktext = xticktext_years[-len(xtickvals):] if len(xtickvals_years) != len(xtickvals) else xticktext_years
 
 fig.update_layout(
     template="plotly_white",
@@ -349,8 +371,9 @@ fig.update_layout(
     title=f"BTC Purchase Indicator — {init['band_label']} (p≈{init['percentile']:.2f})",
     xaxis=dict(
         type="log",
-        title="Days since Genesis (log scale)",
-        tickmode="array", tickvals=xtickvals, ticktext=xticktext
+        title="Year (log scale in days since Genesis)",
+        tickmode="array", tickvals=xtickvals, ticktext=xticktext,
+        range=[math.log10(x_start), math.log10(x_end)]
     ),
     yaxis=dict(
         type="log",
@@ -361,7 +384,7 @@ fig.update_layout(
     margin=dict(l=70, r=360, t=70, b=70),
 )
 
-# Mode buttons
+# Mode buttons (hide bands in Compare mode)
 vis_cmp_mask=[False]*len(traces); vis_cmp_mask[14]=True; vis_cmp_mask[15]=True
 mode_menu=dict(
     buttons=[
@@ -463,7 +486,7 @@ document.getElementById('denomsDetected').textContent = detected.length ? detect
   denomSel.appendChild(opt);
 });
 
-// helpers
+// Helpers
 function numFmt(v){
   if(!isFinite(v)) return '—';
   if (v >= 1000) return Number(v).toLocaleString(undefined, {maximumFractionDigits: 2});
@@ -483,7 +506,7 @@ function interp(xArr,yArr,x){
   const t=(x-xArr[lo])/(xArr[hi]-xArr[lo]); return yArr[lo]+t*(yArr[hi]-yArr[lo]);
 }
 
-// panel elements
+// Panel elements
 const elDate=document.querySelector('#readout .date');
 const elQ10=document.getElementById('q10'), elQ30=document.getElementById('q30'),
       elQ50=document.getElementById('q50'), elQ70=document.getElementById('q70'), elQ90=document.getElementById('q90');
@@ -510,11 +533,11 @@ document.addEventListener('DOMContentLoaded', function(){
   const plotDiv=document.querySelector('.left .js-plotly-plot');
   plotDiv.on('plotly_hover', function(ev){
     if(!ev.points||!ev.points.length) return;
-    updatePanel(denomSel.value, ev.points[0].x); // x is DAYS (log axis)
+    updatePanel(denomSel.value, ev.points[0].x); // x = days (log axis)
   });
 });
 
-// denom change → restyle traces
+// Denominator change → restyle all traces
 denomSel.addEventListener('change', function(){
   const key=denomSel.value, P=PRECOMP[key];
   const plotDiv=document.querySelector('.left .js-plotly-plot');
@@ -535,10 +558,10 @@ denomSel.addEventListener('change', function(){
   updatePanel(key, P.x_main[P.x_main.length-1]);
 });
 
-// initial panel at latest point
+// Initial panel at latest point
 updatePanel('USD', PRECOMP['USD'].x_main[PRECOMP['USD'].x_main.length-1]);
 
-// copy snapshot (chart + panel). iOS Safari fallback opens image.
+// Copy snapshot (chart + panel). Safari/iOS: open PNG tab fallback.
 document.getElementById('copyBtn').addEventListener('click', async function(){
   const node=document.getElementById('capture');
   try{
