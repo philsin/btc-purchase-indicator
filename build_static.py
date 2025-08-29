@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 BTC Purchase Indicator — power-law (log–log) with constant log-offset bands
+
 - Trend: log10(price) = a + b*log10(days since Genesis)
 - Bands: parallel lines via residual quantiles c_p so P_p(t) = 10^c_p * A * t^b
 - Non-crossing by construction + tiny log-gap so fills don't touch
 - BTC line = black
 - Live hover (panel follows cursor); lockable date picker
 - Panel: $ currency, right aligned (monospace), "BTC Price" label, Band label colored, p as %
-- X-axis title removed; hide odd years after 2030
+- X-axis title removed; hide odd years after 2026
 """
 
 import os, io, glob, time, math, json
@@ -168,7 +169,6 @@ def fit_trend_median(x_days: np.ndarray, y_price: np.ndarray) -> Tuple[float,flo
 def residual_quantiles(resid: pd.Series, qs: Tuple[float,...]) -> Dict[float,float]:
     """Quantiles in log space; enforce strict monotonicity with tiny gap."""
     cq = {float(q): float(np.nanquantile(resid, q)) for q in qs}
-    # ensure increasing with MIN_GAP_LOG10
     order = sorted(cq.keys())
     for i in range(1,len(order)):
         prev,cur = cq[order[i-1]], cq[order[i]]
@@ -185,7 +185,6 @@ def predict_parallel_bands(a: float, b: float, cq: Dict[float,float], x_days_gri
         ylog = trend_log + val
         out[str(q)] = (10**ylog).tolist()
     return out
-
 
 def rebase_to_one(s: pd.Series) -> pd.Series:
     s=pd.Series(s).astype(float).replace([np.inf,-np.inf],np.nan).dropna()
@@ -211,7 +210,7 @@ x_start = float(base["x_days"].iloc[0])
 x_end   = float(days_since_genesis(pd.Series([END_PROJ]), GENESIS_DATE).iloc[0])
 x_grid  = np.logspace(np.log10(max(1.0, x_start)), np.log10(x_end), 600)
 
-# Year ticks mapped to log(days); hide odd years > 2030
+# Year ticks mapped to log(days); hide odd years > 2026
 def year_ticks_log(first_date: datetime, last_date: datetime):
     y0, y1 = first_date.year, last_date.year
     vals, labs = [], []
@@ -224,6 +223,8 @@ def year_ticks_log(first_date: datetime, last_date: datetime):
             continue
         vals.append(dv); labs.append(str(y))
     return vals, labs
+first_date = base["date"].iloc[0].to_pydatetime()
+xtickvals, xticktext = year_ticks_log(first_date, END_PROJ)
 
 # -------------------- PRECOMPUTE PER DENOM ---------------------
 
@@ -238,58 +239,58 @@ def series_for_denom(df: pd.DataFrame, denom_key: Optional[str]):
 def build_payload(denom_key: Optional[str]):
     y_main, y_label, denom_series = series_for_denom(base, denom_key)
     x_vals = base["x_days"].values.astype(float)
+
     # 1) trend (median)
     a,b,resid = fit_trend_median(x_vals, y_main.values)
     # 2) residual quantiles for constant parallel bands
     cq = residual_quantiles(resid, QUANTILES)
-    # 3) predictions on x_grid
+    # 3) predictions on x_grid -> lists
     q_lines = predict_parallel_bands(a,b,cq,x_grid)
-    q_lines = {k: (v.tolist() if hasattr(v, "tolist") else list(v)) for k, v in q_lines.items()}
+
     # classify latest
     valid_idx = np.where(np.isfinite(y_main.values))[0]
     last_idx  = int(valid_idx[-1])
     x_last    = float(base["x_days"].iloc[last_idx])
     y_last    = float(y_main.iloc[last_idx])
-    # compute which band (using log residual vs c_q)
+
     r_last = math.log10(y_last) - (a + b*math.log10(x_last))
-    qs_sorted = sorted(cq.items())
-    band_lbl="Top 10%"; band_col=BAND_COLORS[0.9]; p=1.0
-    if r_last < qs_sorted[0][1]:
-        band_lbl="Bottom 10%"; band_col=BAND_COLORS[0.1]; p=0.1 * max(0.0, (r_last - (qs_sorted[0][1]-0.05))/(0.05))
+    edges=[0.1,0.3,0.5,0.7,0.9]
+    band_lbl="Top 10%"; band_col=BAND_COLORS[0.9]; p=95.0
+    if r_last < cq[0.1]:
+        band_lbl="Bottom 10%"; band_col=BAND_COLORS[0.1]; p=5.0
     else:
-        edges=[0.1,0.3,0.5,0.7,0.9]
         for i in range(len(edges)-1):
             ql, qh = edges[i], edges[i+1]
             el, eh = cq[ql], cq[qh]
             if r_last < eh:
                 t = (r_last - el) / max(1e-12, (eh - el))
-                p = ql + (qh-ql)*float(np.clip(t,0,1))
+                p = (ql + (qh-ql)*float(np.clip(t,0,1))) * 100.0
                 if   ql==0.1: band_lbl="10–30%"; band_col=BAND_COLORS[0.3]
                 elif ql==0.3: band_lbl="30–50%"; band_col=BAND_COLORS[0.5]
                 elif ql==0.5: band_lbl="50–70%"; band_col=BAND_COLORS[0.7]
                 elif ql==0.7: band_lbl="70–90%"; band_col=BAND_COLORS[0.9]
                 break
-    # pack
-bands = {
-    "0.1-0.3": {"lower": q_lines["0.1"], "upper": q_lines["0.3"]},
-    "0.3-0.5": {"lower": q_lines["0.3"], "upper": q_lines["0.5"]},
-    "0.5-0.7": {"lower": q_lines["0.5"], "upper": q_lines["0.7"]},
-    "0.7-0.9": {"lower": q_lines["0.7"], "upper": q_lines["0.9"]},
-}
 
-return {
-    "label": y_label,
-    "x_main": base["x_days"].tolist(),
-    "y_main": y_main.tolist(),
-    "x_grid": x_grid.tolist(),
-    "q_lines": q_lines,          # already plain lists
-    "bands": bands,              # <-- uses lists
-    "main_rebased": rebase_to_one(y_main).tolist(),
-    "denom_rebased": rebase_to_one(denom_series).tolist() if denom_series is not None else [math.nan]*len(base),
-    "band_label": band_lbl, "percentile": p, "band_color": band_col,
-    "trend_params": {"a":a, "b":b, "cq": cq},
-}
+    # build bands dict using lists (no .tolist())
+    bands = {
+        "0.1-0.3": {"lower": q_lines["0.1"], "upper": q_lines["0.3"]},
+        "0.3-0.5": {"lower": q_lines["0.3"], "upper": q_lines["0.5"]},
+        "0.5-0.7": {"lower": q_lines["0.5"], "upper": q_lines["0.7"]},
+        "0.7-0.9": {"lower": q_lines["0.7"], "upper": q_lines["0.9"]},
+    }
 
+    return {
+        "label": y_label,
+        "x_main": base["x_days"].tolist(),
+        "y_main": y_main.tolist(),
+        "x_grid": x_grid.tolist(),
+        "q_lines": q_lines,              # lists
+        "bands": bands,                  # lists
+        "main_rebased": rebase_to_one(y_main).tolist(),
+        "denom_rebased": rebase_to_one(denom_series).tolist() if denom_series is not None else [math.nan]*len(base),
+        "band_label": band_lbl, "percentile": p, "band_color": band_col,
+        "trend_params": {"a":a, "b":b, "cq": cq},
+    }
 
 PRECOMP = {"USD": build_payload(None)}
 for k in sorted(denoms.keys()):
@@ -352,10 +353,9 @@ ytickvals, yticktext = make_y_ticks(y_max)
 fig.update_layout(
     template="plotly_white",
     showlegend=True,
-    # IMPORTANT: turn hovermode on so plotly_hover fires; we hide the tooltip via CSS
-    hovermode="x",
+    hovermode="x",  # keep events for live hover
     hoverdistance=30, spikedistance=30,
-    title=f"BTC Purchase Indicator — {init['band_label']} (p≈{init['percentile']*100:.1f}%)",
+    title=f"BTC Purchase Indicator — {init['band_label']} (p≈{init['percentile']:.1f}%)",
     xaxis=dict(type="log", title=None, tickmode="array", tickvals=xtickvals, ticktext=xticktext),
     yaxis=dict(type="log", title="BTC / <DENOMINATOR>", tickmode="array", tickvals=ytickvals, ticktext=yticktext),
     legend=dict(x=1.02, xanchor="left", y=1.0, yanchor="top", bgcolor="rgba(255,255,255,0.0)"),
@@ -404,9 +404,8 @@ ensure_dir(os.path.dirname(OUTPUT_HTML))
 plot_html = fig.to_html(full_html=False, include_plotlyjs="cdn",
                         config={"displayModeBar": True, "modeBarButtonsToRemove": ["toImage"]})
 
-precomp_json   = json.dumps(PRECOMP)
+precomp_json   = json.dumps(PRECOMP)  # all lists now JSON-safe
 band_colors_js = json.dumps({str(k): v for k,v in BAND_COLORS.items()})
-band_names_js  = json.dumps(BAND_NAMES)
 genesis_iso    = GENESIS_DATE.strftime("%Y-%m-%d")
 
 html_tpl = Template(r"""<!DOCTYPE html>
@@ -435,7 +434,7 @@ html_tpl = Template(r"""<!DOCTYPE html>
   #readout .num { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
                   font-variant-numeric: tabular-nums; text-align:right; min-width: 12ch; white-space:pre; }
 
-  /* Hide Plotly's popup; keep events alive */
+  /* Hide Plotly tooltip; keep events alive for hover */
   .hoverlayer { display:none !important; }
 
   @media (max-width: 900px) {
@@ -512,9 +511,8 @@ function interp(xArr,yArr,x){
   const t=(x-xArr[lo])/(xArr[hi]-xArr[lo]); return yArr[lo]+t*(yArr[hi]-yArr[lo]);
 }
 function percFromY(y, q10,q30,q50,q70,q90){
-  // Work in log space for linearity between bands
   const ly=Math.log10(y), l10=Math.log10(q10), l30=Math.log10(q30), l50=Math.log10(q50), l70=Math.log10(q70), l90=Math.log10(q90);
-  if (ly < l10) return 5; // ~below 10th
+  if (ly < l10) return 5;
   if (ly < l30) return 10 + 20*( (ly-l10)/Math.max(1e-12, (l30-l10)) );
   if (ly < l50) return 30 + 20*( (ly-l30)/Math.max(1e-12, (l50-l30)) );
   if (ly < l70) return 50 + 20*( (ly-l50)/Math.max(1e-12, (l70-l50)) );
@@ -558,7 +556,6 @@ function updatePanel(den,xDays){
   elBand.textContent = name; elBand.style.color = color;
 
   const p = percFromY(y,q10,q30,q50,q70,q90);
-  // also reflect in page title
   const plotDiv=document.querySelector('.left .js-plotly-plot');
   Plotly.relayout(plotDiv, {"title.text": `BTC Purchase Indicator — ${name} (p≈${p.toFixed(1)}%)`});
 }
@@ -566,7 +563,7 @@ function updatePanel(den,xDays){
 document.addEventListener('DOMContentLoaded', function(){
   const plotDiv=document.querySelector('.left .js-plotly-plot');
 
-  // Live hover ON (we kept hovermode='x'), tooltip hidden via CSS
+  // Live hover ON
   plotDiv.on('plotly_hover', function(ev){
     if(!ev.points||!ev.points.length) return;
     if(locked) return;
@@ -621,7 +618,6 @@ document.addEventListener('DOMContentLoaded', function(){
     Plotly.restyle(plotDiv, { x:[P.x_main], y:[P.main_rebased] }, [14]);
     Plotly.restyle(plotDiv, { x:[P.x_main], y:[P.denom_rebased] }, [15]);
 
-    // annotations for this denom
     function bandAnnotations(P){
       const xs=P.x_grid; const idx=Math.max(0, Math.floor(0.82*(xs.length-1)));
       const q10=P.q_lines["0.1"], q30=P.q_lines["0.3"], q50=P.q_lines["0.5"], q70=P.q_lines["0.7"], q90=P.q_lines["0.9"];
@@ -664,7 +660,7 @@ html = html_tpl.safe_substitute(
     COL_70=BAND_COLORS[0.7],
     COL_90=BAND_COLORS[0.9],
     INIT_BAND=init["band_label"],
-    INIT_PCT=f"{init['percentile']*100:.1f}",
+    INIT_PCT=f"{init['percentile']:.1f}",
 )
 
 with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
