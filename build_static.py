@@ -1,24 +1,14 @@
 #!/usr/bin/env python3
 """
-BTC Purchase Indicator — Parallel Best-Fit Rails (Floor / 10% / 50% / 90% / Ceiling)
-
-Model:
-- Trend: log10(price) = a + b * log10(days since Genesis)  (median QuantReg)
-- Residuals: e(t) = log10(price) - (a + b*log10(days))
-- Rails = constant log-offsets from trend using residual quantiles:
-    Floor   = q_F  (default 0.08)
-    10%     = q10
-    50%     = q50 (median, ~0)  -- drawn **bold**
-    90%     = q90
-    Ceiling = q_C  (default 0.92)
-
-All rails are straight, parallel lines in log–log space (Bitbo-style).
+BTC Purchase Indicator — Anchor-based Parallel Rails
+Ceiling: line through 2011 high & 2017 high (log–log).
+Floor:   parallel to ceiling; intercept fit to 2015 low & 2022 low (log–log).
+Midlines: 25%, 50% (bold), 75% between floor & ceiling in log-space.
 
 UI:
-- Right panel tracks cursor unless a date is locked.
-- p% = position of BTC (log-space) between Floor and Ceiling at chosen date.
-- Denominator dropdown; y-axis title updates; odd years hidden after 2026; no x-axis title.
-- Copy Chart button: clipboard if allowed, else downloads PNG.
+- Right panel follows cursor unless locked by date.
+- p% is BTC's log-space position between floor & ceiling.
+- Denominator dropdown; y-axis title updates; odd years after 2026 hidden; no x-axis title.
 """
 
 import os, io, glob, time, math, json
@@ -30,7 +20,6 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
-from statsmodels.regression.quantile_regression import QuantReg
 
 # ---------------------------- CONFIG ----------------------------
 
@@ -41,16 +30,15 @@ BTC_FILE      = os.path.join(DATA_DIR, "btc_usd.csv")
 GENESIS_DATE  = datetime(2009, 1, 3)
 END_PROJ      = datetime(2040, 12, 31)
 
-# Choose how "tight" the outer rails are (residual quantiles)
-FLOOR_Q   = 0.08
-CEIL_Q    = 0.92
-LINE_QS   = (0.10, 0.50, 0.90)   # the labeled interior rails
+# Anchor years
+CEIL_YEARS = (2011, 2017)  # highs
+FLOOR_YEARS = (2015, 2022) # lows
 
 # Colors
 LINE_FLOOR   = "#D32F2F"
-LINE_10      = "#F57C00"
+LINE_25      = "#F57C00"
 LINE_50      = "#111111"  # bold/black
-LINE_90      = "#2E7D32"
+LINE_75      = "#2E7D32"
 LINE_CEILING = "#6A1B9A"
 BTC_COLOR    = "#000000"
 
@@ -148,33 +136,65 @@ def collect_denominators() -> Dict[str, pd.DataFrame]:
         except Exception as e: print(f"[warn] bad denom {p}: {e}")
     return opts
 
+# --------------------------- ANCHORS ----------------------------
+
+def pick_anchor_for_year(dates: pd.Series, values: pd.Series, x_days: pd.Series, year: int, mode: str) -> Tuple[float,float]:
+    """Return (x_days, value) for max/min within a calendar year."""
+    mask = dates.dt.year == year
+    sub_idx = np.where(mask)[0]
+    if len(sub_idx) == 0:
+        raise RuntimeError(f"No data for year {year}; supply data/btc_usd.csv or fetch API.")
+    if mode == "max":
+        i = sub_idx[np.argmax(values.iloc[sub_idx].values)]
+    else:
+        i = sub_idx[np.argmin(values.iloc[sub_idx].values)]
+    return float(x_days.iloc[i]), float(values.iloc[i])
+
+def line_from_two_points_parallelized(x1, y1, x2, y2) -> Tuple[float,float]:
+    """Return intercept a and slope b of a line in log space through two points (x,y)."""
+    lx1, ly1 = math.log10(x1), math.log10(y1)
+    lx2, ly2 = math.log10(x2), math.log10(y2)
+    b = (ly2 - ly1) / (lx2 - lx1)
+    a = ly1 - b*lx1
+    return a, b
+
 # --------------------------- MODEL ------------------------------
 
-def fit_trend_median(x_days: np.ndarray, y_price: np.ndarray) -> Tuple[float,float,np.ndarray]:
+def build_parallel_rails_from_anchors(dates: pd.Series, x_days: pd.Series, y_series: pd.Series,
+                                      ceil_years=(2011,2017), floor_years=(2015,2022),
+                                      x_grid: np.ndarray=None) -> Dict[str, list]:
     """
-    Robust central trend via median (q=0.5) quantile regression in log–log space.
-    Returns (a,b,residuals as np.ndarray), where residuals are y - (a+b*x) in log10 space.
+    Build rails using anchor highs and lows.
+    Ceiling slope b from ceiling anchors; floor intercept fitted (same b) to two lows.
     """
-    m=(x_days>0)&(y_price>0)&np.isfinite(x_days)&np.isfinite(y_price)
-    x=x_days[m]; y=np.log10(y_price[m]); X=pd.DataFrame({"logx":np.log10(x)})
-    if len(x)<10: raise RuntimeError("Not enough data to fit trend")
-    model=QuantReg(y, pd.concat([pd.Series(1.0,index=X.index,name="const"), X],axis=1))
-    res=model.fit(q=0.5)
-    a=float(res.params["const"]); b=float(res.params["logx"])
-    resid = y - (a + b*np.log10(x))
-    return a,b,np.asarray(resid)
+    # Ceiling anchors
+    xC1, yC1 = pick_anchor_for_year(dates, y_series, x_days, ceil_years[0], "max")
+    xC2, yC2 = pick_anchor_for_year(dates, y_series, x_days, ceil_years[1], "max")
+    aC, b = line_from_two_points_parallelized(xC1, yC1, xC2, yC2)
 
-def residual_quantiles(resid: np.ndarray, qs: List[float]) -> Dict[float,float]:
-    return {float(q): float(np.nanquantile(resid, q)) for q in qs}
+    # Floor intercept (same slope b) fit to lows (least squares in log-space with fixed slope)
+    xF1, yF1 = pick_anchor_for_year(dates, y_series, x_days, floor_years[0], "min")
+    xF2, yF2 = pick_anchor_for_year(dates, y_series, x_days, floor_years[1], "min")
+    lf1 = math.log10(yF1) - b*math.log10(xF1)
+    lf2 = math.log10(yF2) - b*math.log10(xF2)
+    aF = (lf1 + lf2) / 2.0
 
-def predict_parallel_lines(a: float, b: float, c_map: Dict[float,float], x_grid: np.ndarray) -> Dict[str, list]:
-    """Straight, parallel rails as lists on x_grid for given residual offsets c_map (by quantile)."""
+    # Rails on grid
     lx = np.log10(x_grid)
-    trend = a + b*lx
-    out={}
-    for q,c in c_map.items():
-        out[str(q)] = (10**(trend + c)).tolist()
-    return out
+    logF = aF + b*lx
+    logC = aC + b*lx
+    def to_price(logv): return (10**logv).tolist()
+
+    rails = {
+        "FLOOR":  to_price(logF),
+        "P25":    to_price(logF + 0.25*(logC - logF)),
+        "P50":    to_price(logF + 0.50*(logC - logF)),
+        "P75":    to_price(logF + 0.75*(logC - logF)),
+        "CEILING":to_price(logC),
+        "params": {"aF":aF, "aC":aC, "b":b,
+                   "anchors":{"ceil":[[xC1,yC1],[xC2,yC2]], "floor":[[xF1,yF1],[xF2,yF2]]}}
+    }
+    return rails
 
 def rebase_to_one(s: pd.Series) -> pd.Series:
     s=pd.Series(s).astype(float).replace([np.inf,-np.inf],np.nan).dropna()
@@ -228,35 +248,42 @@ def series_for_denom(df: pd.DataFrame, denom_key: Optional[str]):
 
 def build_payload(denom_key: Optional[str]):
     y_main, y_label, denom_series = series_for_denom(base, denom_key)
-    x_vals = base["x_days"].values.astype(float)
 
-    # Trend + residuals
-    a,b,resid = fit_trend_median(x_vals, y_main.values)
+    # Build rails from anchors on current series (auto highs/lows for the specified years)
+    rails = build_parallel_rails_from_anchors(
+        dates=base["date"], x_days=base["x_days"], y_series=y_main,
+        ceil_years=CEIL_YEARS, floor_years=FLOOR_YEARS, x_grid=x_grid
+    )
 
-    # Quantile offsets (constant, parallel rails)
-    qs_needed = [FLOOR_Q, 0.10, 0.50, 0.90, CEIL_Q]
-    c_map = residual_quantiles(resid, qs_needed)
+    # p% at latest observed date
+    last_x = float(base["x_days"].iloc[-1])
+    # interpolate floor/ceiling at last_x from grid
+    def interp(xa, ya, x):
+        xa = np.asarray(xa); ya=np.asarray(ya)
+        if x<=xa[0]: return float(ya[0])
+        if x>=xa[-1]: return float(ya[-1])
+        i = np.searchsorted(xa, x) - 1
+        t = (x - xa[i])/(xa[i+1]-xa[i])
+        return float(ya[i] + t*(ya[i+1]-ya[i]))
+    F_last = interp(x_grid, rails["FLOOR"], last_x)
+    C_last = interp(x_grid, rails["CEILING"], last_x)
+    y_last = float(y_main.iloc[-1])
 
-    rails = predict_parallel_lines(a,b,c_map,x_grid)
+    def pos_pct_log(y,f,c):
+        ly, lf, lc = math.log10(y), math.log10(f), math.log10(c)
+        return max(0.0, min(100.0, 100.0*(ly-lf)/max(1e-12, lc-lf)))
+    p_init = pos_pct_log(y_last, F_last, C_last)
 
-    # p% at latest point vs Floor/Ceiling (log-space)
-    r_last = resid[-1]
-    p_init = float(np.clip(
-        (r_last - c_map[FLOOR_Q]) / max(1e-12, (c_map[CEIL_Q] - c_map[FLOOR_Q])),
-        0, 1
-    )) * 100.0
-
-    # Pack
     return {
         "label": y_label,
         "x_main": base["x_days"].tolist(),
         "y_main": y_main.tolist(),
         "x_grid": x_grid.tolist(),
-        "rails": {k: v for k,v in rails.items()},   # dict of lists keyed by quantile as string
+        "rails": {k: (v if isinstance(v,list) else v) for k,v in rails.items() if k!="params"},
+        "params": rails["params"],
         "main_rebased": rebase_to_one(y_main).tolist(),
         "denom_rebased": rebase_to_one(denom_series).tolist() if denom_series is not None else [math.nan]*len(base),
         "p_init": p_init,
-        "trend_params": {"a":a, "b":b, "c_map": {str(k): float(v) for k,v in c_map.items()}},
     }
 
 PRECOMP = {"USD": build_payload(None)}
@@ -277,12 +304,12 @@ def add_line_on_grid(y_list, name, color, width=1.2, dash=None, bold=False):
     ))
     vis_norm.append(True); vis_cmp.append(False)
 
-# Draw rails in order: Floor, 10%, 50% (bold), 90%, Ceiling
-add_line_on_grid(init["rails"][str(FLOOR_Q)], "Floor",   LINE_FLOOR,   width=1.2)
-add_line_on_grid(init["rails"]["0.1"],        "10%",     LINE_10,      width=1.2, dash="dot")
-add_line_on_grid(init["rails"]["0.5"],        "50%",     LINE_50,      bold=True)
-add_line_on_grid(init["rails"]["0.9"],        "90%",     LINE_90,      width=1.2, dash="dot")
-add_line_on_grid(init["rails"][str(CEIL_Q)],  "Ceiling", LINE_CEILING, width=1.2)
+# Draw rails in order: Floor, 25%, 50% (bold), 75%, Ceiling
+add_line_on_grid(init["rails"]["FLOOR"], "Floor",   LINE_FLOOR,   width=1.2)
+add_line_on_grid(init["rails"]["P25"],   "25%",     LINE_25,      width=1.2, dash="dot")
+add_line_on_grid(init["rails"]["P50"],   "50%",     LINE_50,      bold=True)
+add_line_on_grid(init["rails"]["P75"],   "75%",     LINE_75,      width=1.2, dash="dot")
+add_line_on_grid(init["rails"]["CEILING"], "Ceiling", LINE_CEILING, width=1.2)
 
 # BTC price (black)
 traces.append(go.Scatter(x=init["x_main"], y=init["y_main"], mode="lines",
@@ -314,7 +341,7 @@ def make_y_ticks(max_y: float):
     return vals, texts
 
 y_candidates = [np.nanmax(init["y_main"])] + [
-    np.nanmax(init["rails"][k]) for k in [str(FLOOR_Q),"0.1","0.5","0.9",str(CEIL_Q)]
+    np.nanmax(init["rails"][k]) for k in ["FLOOR","P25","P50","P75","CEILING"]
 ]
 y_max = max(y_candidates)
 ytickvals, yticktext = make_y_ticks(y_max)
@@ -324,7 +351,7 @@ fig.update_layout(
     showlegend=True,
     hovermode="x",  # keep events for live hover
     hoverdistance=30, spikedistance=30,
-    title=f"BTC Purchase Indicator — Parallel Rails (p≈{init['p_init']:.1f}%)",
+    title=f"BTC Purchase Indicator — Anchor Rails (p≈{init['p_init']:.1f}%)",
     xaxis=dict(type="log", title=None, tickmode="array", tickvals=xtickvals, ticktext=xticktext),
     yaxis=dict(type="log", title=init["label"], tickmode="array", tickvals=ytickvals, ticktext=yticktext),
     legend=dict(x=1.02, xanchor="left", y=1.0, yanchor="top", bgcolor="rgba(255,255,255,0.0)"),
@@ -337,7 +364,7 @@ ensure_dir(os.path.dirname(OUTPUT_HTML))
 plot_html = fig.to_html(full_html=False, include_plotlyjs="cdn",
                         config={"displayModeBar": True, "modeBarButtonsToRemove": ["toImage"]})
 
-precomp_json   = json.dumps(PRECOMP)  # JSON-safe (lists only)
+precomp_json   = json.dumps(PRECOMP)  # JSON-safe
 genesis_iso    = GENESIS_DATE.strftime("%Y-%m-%d")
 
 html_tpl = Template(r"""<!DOCTYPE html>
@@ -398,9 +425,9 @@ html_tpl = Template(r"""<!DOCTYPE html>
     <div id="readout">
       <div class="date">—</div>
       <div class="row"><div><span style="color:$COL_F;">Floor</span></div><div class="num" id="vF">$0.00</div><div></div></div>
-      <div class="row"><div><span style="color:$COL_10;">10%</span></div><div class="num" id="v10">$0.00</div><div></div></div>
+      <div class="row"><div><span style="color:$COL_25;">25%</span></div><div class="num" id="v25">$0.00</div><div></div></div>
       <div class="row"><div><span style="color:$COL_50;font-weight:700;">50%</span></div><div class="num" id="v50" style="font-weight:700;">$0.00</div><div></div></div>
-      <div class="row"><div><span style="color:$COL_90;">90%</span></div><div class="num" id="v90">$0.00</div><div></div></div>
+      <div class="row"><div><span style="color:$COL_75;">75%</span></div><div class="num" id="v75">$0.00</div><div></div></div>
       <div class="row"><div><span style="color:$COL_C;">Ceiling</span></div><div class="num" id="vC">$0.00</div><div></div></div>
 
       <div style="margin-top:10px;"><b>BTC Price:</b> <span class="num" id="mainVal">$0.00</span></div>
@@ -413,8 +440,6 @@ html_tpl = Template(r"""<!DOCTYPE html>
 <script>
 const PRECOMP      = $PRECOMP_JSON;
 const GENESIS_ISO  = "$GENESIS_ISO";
-const FLOOR_Q      = $FLOOR_Q;
-const CEIL_Q       = $CEIL_Q;
 
 const denomSel = document.getElementById('denomSel');
 const detected = Object.keys(PRECOMP).filter(k => k !== 'USD');
@@ -450,8 +475,8 @@ function positionPctLog(y, f, c){ // y price, f floor, c ceiling -> 0..100 in lo
 
 // Panel elements
 const elDate=document.querySelector('#readout .date');
-const elF=document.getElementById('vF'), el10=document.getElementById('v10'),
-      el50=document.getElementById('v50'), el90=document.getElementById('v90'), elC=document.getElementById('vC');
+const elF=document.getElementById('vF'), el25=document.getElementById('v25'),
+      el50=document.getElementById('v50'), el75=document.getElementById('v75'), elC=document.getElementById('vC');
 const elMain=document.getElementById('mainVal'), elPPct=document.getElementById('pPct');
 
 let locked=false, lockedX=null;
@@ -460,14 +485,14 @@ function updatePanel(den,xDays){
   const P=PRECOMP[den];
   elDate.textContent = dateFromDaysShort(xDays);
 
-  const F=interp(P.x_grid,P.rails[String(FLOOR_Q)],xDays);
-  const v10=interp(P.x_grid,P.rails["0.1"],xDays);
-  const v50=interp(P.x_grid,P.rails["0.5"],xDays);
-  const v90=interp(P.x_grid,P.rails["0.9"],xDays);
-  const C=interp(P.x_grid,P.rails[String(CEIL_Q)],xDays);
+  const F=interp(P.x_grid,P.rails.FLOOR,xDays);
+  const v25=interp(P.x_grid,P.rails.P25,xDays);
+  const v50=interp(P.x_grid,P.rails.P50,xDays);
+  const v75=interp(P.x_grid,P.rails.P75,xDays);
+  const C=interp(P.x_grid,P.rails.CEILING,xDays);
 
-  elF.textContent=fmtUSD(F); el10.textContent=fmtUSD(v10); el50.textContent=fmtUSD(v50);
-  el90.textContent=fmtUSD(v90); elC.textContent=fmtUSD(C);
+  elF.textContent=fmtUSD(F); el25.textContent=fmtUSD(v25); el50.textContent=fmtUSD(v50);
+  el75.textContent=fmtUSD(v75); elC.textContent=fmtUSD(C);
 
   // nearest observed price
   const xa=P.x_main, ya=P.y_main; let idx=0,best=1e99;
@@ -478,7 +503,7 @@ function updatePanel(den,xDays){
   elPPct.textContent = `(p≈${p.toFixed(1)}%)`;
 
   const plotDiv=document.querySelector('.left .js-plotly-plot');
-  Plotly.relayout(plotDiv, {"title.text": `BTC Purchase Indicator — Parallel Rails (p≈${p.toFixed(1)}%)`});
+  Plotly.relayout(plotDiv, {"title.text": `BTC Purchase Indicator — Anchor Rails (p≈${p.toFixed(1)}%)`});
 }
 
 document.addEventListener('DOMContentLoaded', function(){
@@ -529,12 +554,12 @@ document.addEventListener('DOMContentLoaded', function(){
     function restyleLine(traceIdx, arr){
       Plotly.restyle(plotDiv, { x:[P.x_grid], y:[arr] }, [traceIdx]);
     }
-    // Order: Floor(0), 10%(1), 50%(2), 90%(3), Ceiling(4), BTC(5), cursor(6), rebased(7,8)
-    restyleLine(0, P.rails[String(FLOOR_Q)]);
-    restyleLine(1, P.rails["0.1"]);
-    restyleLine(2, P.rails["0.5"]);
-    restyleLine(3, P.rails["0.9"]);
-    restyleLine(4, P.rails[String(CEIL_Q)]);
+    // Order: Floor(0), 25%(1), 50%(2), 75%(3), Ceiling(4), BTC(5), cursor(6), rebased(7,8)
+    restyleLine(0, P.rails.FLOOR);
+    restyleLine(1, P.rails.P25);
+    restyleLine(2, P.rails.P50);
+    restyleLine(3, P.rails.P75);
+    restyleLine(4, P.rails.CEILING);
 
     Plotly.restyle(plotDiv, { x:[P.x_main], y:[P.y_main], name:[P.label] }, [5]);
     Plotly.restyle(plotDiv, { x:[P.x_main], y:[P.y_main] }, [6]); // cursor
@@ -559,10 +584,8 @@ html = html_tpl.safe_substitute(
     PLOT_HTML=plot_html,
     PRECOMP_JSON=precomp_json,
     GENESIS_ISO=genesis_iso,
-    COL_F=LINE_FLOOR, COL_10=LINE_10, COL_50=LINE_50, COL_90=LINE_90, COL_C=LINE_CEILING,
+    COL_F=LINE_FLOOR, COL_25=LINE_25, COL_50=LINE_50, COL_75=LINE_75, COL_C=LINE_CEILING,
     P_INIT=f"{init['p_init']:.1f}",
-    FLOOR_Q=f"{FLOOR_Q}",
-    CEIL_Q=f"{CEIL_Q}",
 )
 
 with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
