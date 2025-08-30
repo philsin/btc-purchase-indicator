@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # ─────────────────────────────────────────────────────────────────────────────
-# BTC Purchase Indicator — Midline Percentiles Edition (full UI + width slider)
+# BTC Purchase Indicator — Midline Percentiles (flex layout + width slider +
+# symmetric/winsorized rails so ceiling/floor don't explode)
 # ─────────────────────────────────────────────────────────────────────────────
 import os, io, glob, time, json
 from datetime import datetime, timezone
@@ -19,7 +20,9 @@ BTC_FILE      = os.path.join(DATA_DIR, "btc_usd.csv")
 GENESIS_DATE  = datetime(2009, 1, 3)
 END_PROJ      = datetime(2040, 12, 31)
 
-EPS_LOG       = 0.015  # small buffer so rails never touch in log space
+EPS_LOG         = 0.010       # tiny spacing so rails never touch (≈2.3%)
+RESID_WINSOR    = 0.02        # clip extreme residuals at 2% tails before percentiles
+SYMMETRIC_RAILS = True        # mirror upper/lower rails about median residual
 
 # Colors (ramp red→green)
 COL_FLOOR   = "#D32F2F"
@@ -36,8 +39,7 @@ def years_since_genesis(dates, genesis=GENESIS_DATE):
     d = pd.to_datetime(dates)
     s = pd.Series(d)
     delta_days = (s - pd.Timestamp(genesis)) / np.timedelta64(1, "D")
-    # + one day so log(x) never hits zero
-    return (delta_days.astype(float) / 365.25) + (1.0/365.25)
+    return (delta_days.astype(float) / 365.25) + (1.0/365.25)  # avoid log(0)
 
 def _retry(fn, tries=3, base=1.0, factor=2.0):
     last=None
@@ -116,23 +118,50 @@ def collect_denominators():
             print(f"[warn] bad denom {p}: {e}")
     return out
 
-# ---------- Fitting (midline & residual percentiles) ----------
+# ---------- Fitting ----------
 def quantile_fit_loglog(x_years: np.ndarray, y: np.ndarray, q=0.5):
     m = (x_years>0)&(y>0)&np.isfinite(x_years)&np.isfinite(y)
     x = np.log10(x_years[m]); z = np.log10(y[m])
     X = pd.DataFrame({"const":1.0,"logx":x})
     res = QuantReg(z,X).fit(q=q)
     a0 = float(res.params["const"]); b = float(res.params["logx"])
-    resid = z - (a0 + b*x)
+    resid = z - (a0 + b*x)  # log residuals about the q50 midline
     return a0,b,resid,m
+
+def winsorize(arr, p):
+    lo, hi = np.nanquantile(arr, p), np.nanquantile(arr, 1-p)
+    return np.clip(arr, lo, hi)
+
+def symmetric_quantiles(resid, q_low, q_high):
+    """Return (low, high) as symmetric offsets about the median residual."""
+    med = float(np.nanmedian(resid))
+    # distances from median
+    d_hi = float(np.nanquantile(resid - med, q_high))
+    d_lo = float(np.nanquantile(med - resid, q_high))
+    d = max(d_hi, d_lo)
+    return med - d, med + d
 
 def defaults_for_series(dates, x_years, y_series):
     a0,b,resid,_ = quantile_fit_loglog(x_years.values, y_series.values, q=0.5)
-    # constant log residual offsets around the same midline
-    c025 = float(np.nanquantile(resid, 0.025)) - EPS_LOG
-    c200 = float(np.nanquantile(resid, 0.200))
-    c800 = float(np.nanquantile(resid, 0.800))
-    c975 = float(np.nanquantile(resid, 0.975)) + EPS_LOG
+
+    r = resid.copy()
+    if RESID_WINSOR and RESID_WINSOR>0:
+        r = winsorize(r, RESID_WINSOR)
+
+    if SYMMETRIC_RAILS:
+        # Symmetric 2.5/97.5 and 20/80 around median residual
+        c025, c975 = symmetric_quantiles(r, 0.025, 0.975)
+        c200, c800 = symmetric_quantiles(r, 0.200, 0.800)
+    else:
+        c025 = float(np.nanquantile(r, 0.025))
+        c975 = float(np.nanquantile(r, 0.975))
+        c200 = float(np.nanquantile(r, 0.200))
+        c800 = float(np.nanquantile(r, 0.800))
+
+    # keep rails from touching
+    c025 -= EPS_LOG
+    c975 += EPS_LOG
+
     return {"a0":a0,"b":b,"c025":c025,"c200":c200,"c800":c800,"c975":c975}
 
 # ---------- Data prep ----------
@@ -149,7 +178,7 @@ base["date_iso"] = base["date"].dt.strftime("%Y-%m-%d")
 # grid for rails
 x_start = float(base["x_years"].iloc[0])
 x_end   = float(years_since_genesis(pd.Series([END_PROJ]), GENESIS_DATE).iloc[0])
-x_grid  = np.logspace(np.log10(max(1e-6,x_start)), np.log10(x_end), 600)
+x_grid  = np.logspace(np.log10(max(1e-6,x_start)), np.log10(x_end), 700)
 
 def year_ticks_log(first_dt: datetime, last_dt: datetime):
     vals,labs = [],[]
@@ -175,7 +204,7 @@ def series_for_denom(df, key):
     return df["btc"], "BTC / USD", None
 
 def build_payload(key=None):
-    y,label,den = series_for_denom(base, key)
+    y,label,_ = series_for_denom(base, key)
     d = defaults_for_series(base["date"], base["x_years"], y)
     return {
         "label": label,
@@ -210,7 +239,7 @@ traces = [
                line=dict(width=0), opacity=0.003, hoverinfo="x", showlegend=False, name="_cursor")
 ]
 
-# y tick labels with commas (include 0 label at bottom)
+# y tick labels with commas (include 0 label)
 def y_ticks():
     vals=[1e-8]+[10**e for e in range(0,9)]
     labs=["0"]+[f"{int(10**e):,}" for e in range(0,9)]
@@ -226,26 +255,26 @@ fig.update_layout(
     xaxis=dict(type="log", title=None, tickmode="array", tickvals=xtickvals, ticktext=xticktext),
     yaxis=dict(type="log", title=P0["label"], tickmode="array", tickvals=ytickvals, ticktext=yticktext),
     legend=dict(x=1.02, xanchor="left", y=1.0, yanchor="top"),
-    # wider chart area by default (reduce right margin)
-    margin=dict(l=70, r=420, t=70, b=70),
+    margin=dict(l=70, r=420, t=70, b=70),  # generous plotting space
 )
 
 ensure_dir(os.path.dirname(OUTPUT_HTML))
 plot_html = fig.to_html(full_html=False, include_plotlyjs="cdn",
                         config={"responsive":True,"displayModeBar":True,"modeBarButtonsToRemove":["toImage"]})
 
-# ---------- HTML + JS ----------
+# ---------- HTML + JS (flex + ResizeObserver + working width slider) ----------
 html_tpl = Template(r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>BTC Purchase Indicator</title>
 <style>
-:root{--panelW:420px} /* smaller right panel by default to widen the chart */
+:root{--panelW:420px; --chartPct:72%} /* default chart width percentage */
 html,body{height:100%}body{margin:0;font-family:Inter,system-ui,Segoe UI,Arial,sans-serif}
-.layout{display:grid;grid-template-columns:70% var(--panelW);min-height:100vh;width:100vw} /* 70% chart width by default */
-.left{padding:8px 0 8px 8px}.left .js-plotly-plot,.left .plotly-graph-div{width:100%!important}
-.right{border-left:1px solid #e5e7eb;padding:12px;display:flex;flex-direction:column;gap:12px;overflow:auto}
+.layout{display:flex;min-height:100vh;width:100vw}
+.left{flex: 1 1 var(--chartPct); min-width: 280px; padding:8px 0 8px 8px}
+.left .js-plotly-plot,.left .plotly-graph-div{width:100%!important}
+.right{flex: 0 0 var(--panelW); border-left:1px solid #e5e7eb; padding:12px; display:flex; flex-direction:column; gap:12px; overflow:auto}
 #controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 select,button,input[type=date],input[type=range]{font-size:14px;padding:8px 10px;border-radius:8px;border:1px solid #d1d5db;background:#fff}
 #readout{border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#fafafa;font-size:14px}
@@ -253,10 +282,10 @@ select,button,input[type=date],input[type=range]{font-size:14px;padding:8px 10px
 #readout .row{display:grid;grid-template-columns:auto 1fr auto;column-gap:8px;align-items:baseline}
 #readout .num{font-family:ui-monospace,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums;text-align:right;min-width:12ch;white-space:pre}
 .hoverlayer{opacity:0!important;pointer-events:none}
-@media (max-width:900px){
-  .layout{grid-template-columns:1fr}
-  .right{border-left:none;border-top:1px solid #e5e7eb}
-  .left{padding:8px}
+@media (max-width: 900px){
+  .layout{flex-direction:column}
+  .right{flex: 0 0 auto; border-left:none; border-top:1px solid #e5e7eb}
+  .left{flex: 0 0 auto; width:100%; padding:8px}
 }
 #chartWidthBox{display:flex;align-items:center;gap:8px}
 #chartW{width:220px}
@@ -277,9 +306,9 @@ select,button,input[type=date],input[type=range]{font-size:14px;padding:8px 10px
 
     <div id="chartWidthBox">
       <b>Chart Width:</b>
-      <input type="range" id="chartW" min="50" max="85" value="70"/>
-      <span id="chartWVal">70%</span>
-      <span style="color:#6b7280;font-size:12px;">(adjusts plot / panel ratio)</span>
+      <input type="range" id="chartW" min="55" max="90" value="72"/>
+      <span id="chartWVal">72%</span>
+      <span style="color:#6b7280;font-size:12px;">(plot / panel ratio)</span>
     </div>
 
     <div style="font-size:12px;color:#6b7280;">Detected denominators: <span id="denomsDetected"></span></div>
@@ -299,7 +328,6 @@ select,button,input[type=date],input[type=range]{font-size:14px;padding:8px 10px
 <script src="https://unpkg.com/html-to-image@1.11.11/dist/html-to-image.umd.js"></script>
 <script>
 const PRECOMP = $PRECOMP_JSON;
-
 function fmtUSD(v){ if(!isFinite(v)) return '$—'; return '$'+Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}); }
 const MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 const GENESIS = new Date('$GENESIS_ISO'+'T00:00:00Z');
@@ -325,7 +353,7 @@ function pctWithinLog(y,f,c){
   return Math.max(0,Math.min(100,100*(ly-lf)/Math.max(1e-12,lc-lf)));
 }
 
-// Build rails strictly from midline & residual offsets (all parallel)
+// Rails from midline + residual offsets (parallel)
 function railsFromPercentiles(P){
   const {a0,b,c025,c200,c800,c975}=P.defaults;
   const lx=P.x_grid.map(v=>Math.log10(v));
@@ -340,8 +368,8 @@ function railsFromPercentiles(P){
   };
 }
 
-// UI refs
-const plotDiv=document.querySelector('.left .js-plotly-plot');
+// DOM
+const plotDiv=document.querySelector('.left .js-plotly-plot') || document.querySelector('.left .plotly-graph-div');
 const denomSel=document.getElementById('denomSel');
 const datePick=document.getElementById('datePick');
 const setBtn=document.getElementById('setDateBtn');
@@ -352,18 +380,25 @@ const elDate=document.querySelector('#readout .date');
 const elF=document.getElementById('vF'), el20=document.getElementById('v20'), el50=document.getElementById('v50'),
       el80=document.getElementById('v80'), elC=document.getElementById('vC'), elMain=document.getElementById('mainVal'),
       elP=document.getElementById('pPct');
-
 const chartW=document.getElementById('chartW');
 const chartWVal=document.getElementById('chartWVal');
 const layoutRoot=document.querySelector('.layout');
+const leftPane=document.querySelector('.left');
 
-// chart width slider
+// Make slider actually change the chart column and trigger resize
 function applyChartWidth(pct){
-  layoutRoot.style.gridTemplateColumns = `${pct}% var(--panelW)`;
-  chartWVal.textContent = `${pct}%`;
+  document.documentElement.style.setProperty('--chartPct', pct+'%');
+  chartWVal.textContent=pct+'%';
+  if(window.Plotly && plotDiv){ Plotly.Plots.resize(plotDiv); }
 }
 chartW.addEventListener('input', ()=>applyChartWidth(chartW.value));
 applyChartWidth(chartW.value);
+
+// Also observe width changes (mobile orientation, panel open/close, etc.)
+if(window.ResizeObserver){
+  const ro=new ResizeObserver(()=>{ if(window.Plotly&&plotDiv) Plotly.Plots.resize(plotDiv); });
+  ro.observe(leftPane);
+}
 
 const extraDenoms = Object.keys(PRECOMP).filter(k=>k!=='USD');
 elDenoms.textContent = extraDenoms.length ? extraDenoms.join(', ') : '(none)';
@@ -393,7 +428,6 @@ function updatePanel(P, xYears){
   elF.textContent=fmtUSD(F); el20.textContent=fmtUSD(v20); el50.textContent=fmtUSD(v50);
   el80.textContent=fmtUSD(v80); elC.textContent=fmtUSD(C);
 
-  // nearest observed point for price
   let idx=0,best=1e99; for(let i=0;i<P.x_main.length;i++){ const d=Math.abs(P.x_main[i]-xYears); if(d<best){best=d; idx=i;} }
   const y=P.y_main[idx]; elMain.textContent=fmtUSD(y);
   elP.textContent = `(p≈${pctWithinLog(y,F,C).toFixed(1)}%)`;
@@ -455,4 +489,4 @@ html = html_tpl.safe_substitute(
 ensure_dir(os.path.dirname(OUTPUT_HTML))
 with open(OUTPUT_HTML,"w",encoding="utf-8") as f:
     f.write(html)
-print(f"Wrote %s" % OUTPUT_HTML)
+print(f"Wrote {OUTPUT_HTML}")
