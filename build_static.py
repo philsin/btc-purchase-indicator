@@ -3,6 +3,9 @@
 """
 BTC Purchase Indicator — dynamic percentile rails with an editable dashboard.
 
+Adds GOLD (XAUUSD) and S&P 500 (SPX) as denominators automatically:
+- Saves to data/denominator_gold.csv and data/denominator_spx.csv if missing.
+
 Generates docs/index.html from data in ./data:
 - data/btc_usd.csv (optional; otherwise fetched from Blockchain.info)
 - data/denominator_*.csv (optional denominators; columns: date,price)
@@ -24,12 +27,28 @@ BTC_FILE     = os.path.join(DATA_DIR, "btc_usd.csv")
 OUTPUT_HTML  = "docs/index.html"
 
 GENESIS_DATE = datetime(2009, 1, 3)
-END_PROJ     = datetime(2040, 12, 31)
-X_START_DATE = datetime(2011, 1, 1)
+END_PROJ     = datetime(2040, 12, 31)      # fixed horizon
+X_START_DATE = datetime(2011, 1, 1)        # force chart start
 
 RESID_WINSOR     = 0.02   # clip 2% tails
 EPS_LOG_SPACING  = 0.010  # tiny spacing for extreme rails
 COL_BTC          = "#000000"
+
+# Built-in denominator targets we’ll auto-fetch if not present
+AUTO_DENOMS = {
+    "GOLD": {
+        "path": os.path.join(DATA_DIR, "denominator_gold.csv"),
+        # Stooq: xauusd daily CSV
+        "url":  "https://stooq.com/q/d/l/?s=xauusd&i=d",
+        "parser": "stooq"
+    },
+    "SPX": {
+        "path": os.path.join(DATA_DIR, "denominator_spx.csv"),
+        # Stooq: ^spx daily CSV (S&P 500 index)
+        "url":  "https://stooq.com/q/d/l/?s=%5Espx&i=d",
+        "parser": "stooq"
+    },
+}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Data helpers
@@ -37,17 +56,21 @@ COL_BTC          = "#000000"
 def years_since_genesis(dates):
     d = pd.to_datetime(dates)
     delta_days = (d - GENESIS_DATE) / np.timedelta64(1, "D")
-    return (delta_days.astype(float) / 365.25) + (1.0/365.25)  # +1 day => log(x)>0
+    # +1 day so log(x) > 0 at start
+    return (delta_days.astype(float) / 365.25) + (1.0/365.25)
 
 def fetch_btc_csv() -> pd.DataFrame:
+    """Load BTC (date, price). Use local file if present, else fetch."""
     os.makedirs(DATA_DIR, exist_ok=True)
     if os.path.exists(BTC_FILE):
         df = pd.read_csv(BTC_FILE, parse_dates=["date"])
         return df.sort_values("date").dropna()
 
     url = "https://api.blockchain.info/charts/market-price?timespan=all&format=csv&sampled=false"
-    r = requests.get(url, timeout=30); r.raise_for_status()
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
     raw = r.text.strip()
+    # header can be present or absent; handle both
     if raw.splitlines()[0].lower().startswith("timestamp"):
         df = pd.read_csv(io.StringIO(raw))
         ts = [c for c in df.columns if c.lower().startswith("timestamp")][0]
@@ -61,13 +84,51 @@ def fetch_btc_csv() -> pd.DataFrame:
     df.to_csv(BTC_FILE, index=False)
     return df
 
+def _fetch_stooq_csv(url: str) -> pd.DataFrame:
+    """
+    Fetch a Stooq daily CSV and return DataFrame(date, price=Close).
+    CSV columns: Date,Open,High,Low,Close,Volume
+    """
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    df = pd.read_csv(io.StringIO(r.text))
+    # Some Stooq responses can include 'No data' — guard it
+    if "Date" not in df.columns or "Close" not in df.columns or df.empty:
+        raise ValueError("stooq returned no data")
+    out = df[["Date","Close"]].rename(columns={"Date":"date","Close":"price"})
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    out["price"] = pd.to_numeric(out["price"], errors="coerce")
+    out = out.sort_values("date").dropna()
+    return out
+
+def ensure_auto_denominators():
+    """If GOLD/SPX files are missing, fetch from Stooq and save as date,price."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    for key, info in AUTO_DENOMS.items():
+        path = info["path"]
+        if os.path.exists(path):
+            continue
+        try:
+            if info["parser"] == "stooq":
+                df = _fetch_stooq_csv(info["url"])
+            else:
+                continue
+            # save as date,price
+            df.to_csv(path, index=False)
+            print(f"[auto-denom] wrote {path} ({len(df)} rows)")
+        except Exception as e:
+            print(f"[warn] could not fetch {key} from {info['url']}: {e}")
+
 def load_denominators():
+    """Return { KEY: DataFrame(date, price) } for ./data/denominator_*.csv, plus auto ones."""
+    ensure_auto_denominators()
     out={}
     for p in glob.glob(os.path.join(DATA_DIR, "denominator_*.csv")):
         key = os.path.splitext(os.path.basename(p))[0].replace("denominator_","").upper()
         try:
             df = pd.read_csv(p, parse_dates=["date"])
-            if len(df.columns) < 2: continue
+            if len(df.columns) < 2:
+                continue
             price_col = [c for c in df.columns if c.lower()!="date"][0]
             df = df.rename(columns={price_col:"price"})[["date","price"]]
             df["price"] = pd.to_numeric(df["price"], errors="coerce")
@@ -143,6 +204,7 @@ def y_ticks():
 btc = fetch_btc_csv().rename(columns={"price":"btc"})
 denoms = load_denominators()
 
+# Merge denominators into base
 base = btc.sort_values("date").reset_index(drop=True)
 for key, df in denoms.items():
     base = base.merge(df.rename(columns={"price": key.lower()}), on="date", how="left")
@@ -150,9 +212,11 @@ for key, df in denoms.items():
 base["x_years"]   = years_since_genesis(base["date"])
 base["date_iso"]  = base["date"].dt.strftime("%Y-%m-%d")
 
+# Horizon
 first_dt = max(base["date"].iloc[0], X_START_DATE)
 max_dt   = END_PROJ
 
+# x_grid to horizon
 x_start = float(years_since_genesis(pd.Series([first_dt])).iloc[0])
 x_end   = float(years_since_genesis(pd.Series([max_dt])).iloc[0])
 x_grid  = np.logspace(np.log10(max(1e-6, x_start)), np.log10(x_end), 700)
@@ -194,14 +258,14 @@ MAX_RAIL_SLOTS = 12
 def add_stub(idx):
     return go.Scatter(
         x=P0["x_grid"], y=[None]*len(P0["x_grid"]), mode="lines",
-        name=f"Rail {idx+1}", line=dict(width=1.6, color="#999"),
-        visible=False, hoverinfo="skip"
+        name=f"Rail {idx+1}", line=dict(width=1.6, color="#999"), visible=False, hoverinfo="skip"
     )
 
 traces = [add_stub(i) for i in range(MAX_RAIL_SLOTS)]
 traces += [
     go.Scatter(x=P0["x_main"], y=P0["y_main"], mode="lines",
                name="BTC / USD", line=dict(color=COL_BTC,width=2.0), hoverinfo="skip"),
+    # transparent cursor trace to keep x-hover alive
     go.Scatter(x=P0["x_main"], y=P0["y_main"], mode="lines",
                line=dict(width=0), opacity=0.003, hoverinfo="x", showlegend=False, name="_cursor")
 ]
@@ -229,7 +293,7 @@ plot_html = fig.to_html(full_html=False, include_plotlyjs="cdn",
                         config={"responsive":True,"displayModeBar":True,"modeBarButtonsToRemove":["toImage"]})
 
 # ──────────────────────────────────────────────────────────────────────────────
-# HTML + JS
+# HTML + JS (unchanged rails dashboard + percentile p fix)
 # ──────────────────────────────────────────────────────────────────────────────
 HTML = f"""<!doctype html>
 <html lang="en"><head>
@@ -501,10 +565,6 @@ let locked=false, lockedX=null;
 function updatePanel(P,xYears){{
   elDate.textContent=shortDateFromYears(xYears);
 
-  // 2.5% .. 97.5% envelope values (still used for context if you want)
-  const floor = interp(P.x_grid, seriesForPercent(P, 2.5),  xYears);
-  const ceil  = interp(P.x_grid, seriesForPercent(P, 97.5), xYears);
-
   // Fill each selected rail’s readout
   rails.forEach(p=>{{
     const v = interp(P.x_grid, seriesForPercent(P,p), xYears);
@@ -517,7 +577,7 @@ function updatePanel(P,xYears){{
   for(let i=0;i<P.x_main.length;i++){{ const d=Math.abs(P.x_main[i]-xYears); if(d<best){{best=d; idx=i;}} }}
   const y=P.y_main[idx]; elMain.textContent=fmtUSD(y);
 
-  // Compute empirical percentile of current price via residual CDF
+  // Empirical percentile of current price via residual CDF
   const d=P.support;
   const logx = Math.log10(xYears);
   const ly   = Math.log10(y);
