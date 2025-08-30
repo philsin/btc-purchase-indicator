@@ -27,6 +27,9 @@ OUTPUT_HTML  = "docs/index.html"
 GENESIS_DATE = datetime(2009, 1, 3)
 END_PROJ     = datetime(2040, 12, 31)
 
+# Force x-axis start date
+X_START_DATE = datetime(2011, 1, 1)
+
 # Default future horizon (years beyond last data) to show rails without wasting half the plot
 FUTURE_YEARS = 3   # change to taste
 
@@ -180,13 +183,16 @@ base["date_iso"]  = base["date"].dt.strftime("%Y-%m-%d")
 last_dt = base["date"].iloc[-1]
 max_dt  = datetime(min(END_PROJ.year, last_dt.year + FUTURE_YEARS), 12, 31)
 
-# x_grid for rails (log-spaced in x-years) to the chosen horizon
-x_start = float(base["x_years"].iloc[0])
+# Start date for axis/ticks/rails: respect data min, but not earlier than X_START_DATE
+first_dt = max(base["date"].iloc[0], X_START_DATE)
+
+# x_grid for rails (log-spaced in x-years) between first_dt .. max_dt
+x_start = float(years_since_genesis(pd.Series([first_dt])).iloc[0])
 x_end   = float(years_since_genesis(pd.Series([max_dt])).iloc[0])
 x_grid  = np.logspace(np.log10(max(1e-6, x_start)), np.log10(x_end), 700)
 
 # x/y ticks (to horizon)
-xtickvals, xticktext = year_ticks_log(base["date"].iloc[0], max_dt)
+xtickvals, xticktext = year_ticks_log(first_dt, max_dt)
 ytickvals, yticktext = y_ticks()
 
 def series_for_denom(df, key):
@@ -238,8 +244,8 @@ fig = go.Figure([
                line=dict(width=0), opacity=0.003, hoverinfo="x", showlegend=False, name="_cursor")
 ])
 
-# Set the default visible range to [first data .. horizon]
-x_min = float(base["x_years"].iloc[0])
+# Set the default visible range to [first_dt .. horizon]
+x_min = float(years_since_genesis(pd.Series([first_dt])).iloc[0])
 x_max = float(years_since_genesis(pd.Series([max_dt])).iloc[0])
 
 fig.update_layout(
@@ -253,7 +259,7 @@ fig.update_layout(
         tickmode="array",
         tickvals=xtickvals,
         ticktext=xticktext,
-        range=[np.log10(x_min), np.log10(x_max)],   # avoid big empty right half
+        range=[np.log10(x_min), np.log10(x_max)],   # start at 2011-01-01
         showspikes=False
     ),
     yaxis=dict(
