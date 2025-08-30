@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BTC Purchase Indicator — Power-law rails with a robust median midline,
-winsorized & symmetric percentile offsets, and a responsive UI with a Rails Dashboard.
+BTC Purchase Indicator — dynamic percentile rails with an editable dashboard.
 
 Generates docs/index.html from data in ./data:
 - data/btc_usd.csv (optional; otherwise fetched from Blockchain.info)
@@ -26,18 +25,11 @@ OUTPUT_HTML  = "docs/index.html"
 
 GENESIS_DATE = datetime(2009, 1, 3)
 END_PROJ     = datetime(2040, 12, 31)      # fixed horizon
+X_START_DATE = datetime(2011, 1, 1)        # force chart start
 
-# Force chart x-axis to start here
-X_START_DATE = datetime(2011, 1, 1)
-
-# Rails behaviour
-RESID_WINSOR     = 0.02   # clip 2% tails in residuals (robust ceiling/floor)
-EPS_LOG_SPACING  = 0.010  # keep extreme rails from touching a bit
-
-# Colors for BTC & panel labels
-COL_BTC     = "#000000"
-COL_FLOOR   = "#D32F2F"   # used only for "Floor" label in panel (20%)
-COL_CEILING = "#2E7D32"   # used only for "Ceiling" label in panel (97.5%)
+RESID_WINSOR     = 0.02   # clip 2% tails
+EPS_LOG_SPACING  = 0.010  # tiny spacing for extreme rails
+COL_BTC          = "#000000"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Data helpers
@@ -49,17 +41,14 @@ def years_since_genesis(dates):
     return (delta_days.astype(float) / 365.25) + (1.0/365.25)
 
 def fetch_btc_csv() -> pd.DataFrame:
-    """Load BTC (date, price). Use local file if present, else fetch."""
     os.makedirs(DATA_DIR, exist_ok=True)
     if os.path.exists(BTC_FILE):
         df = pd.read_csv(BTC_FILE, parse_dates=["date"])
         return df.sort_values("date").dropna()
 
     url = "https://api.blockchain.info/charts/market-price?timespan=all&format=csv&sampled=false"
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
+    r = requests.get(url, timeout=30); r.raise_for_status()
     raw = r.text.strip()
-    # header can be present or absent; handle both
     if raw.splitlines()[0].lower().startswith("timestamp"):
         df = pd.read_csv(io.StringIO(raw))
         ts = [c for c in df.columns if c.lower().startswith("timestamp")][0]
@@ -74,15 +63,12 @@ def fetch_btc_csv() -> pd.DataFrame:
     return df
 
 def load_denominators():
-    """Return { KEY: DataFrame(date, price) } for ./data/denominator_*.csv"""
     out={}
     for p in glob.glob(os.path.join(DATA_DIR, "denominator_*.csv")):
         key = os.path.splitext(os.path.basename(p))[0].replace("denominator_","").upper()
         try:
             df = pd.read_csv(p, parse_dates=["date"])
-            # tolerate arbitrary second column name
-            if len(df.columns) < 2:
-                continue
+            if len(df.columns) < 2: continue
             price_col = [c for c in df.columns if c.lower()!="date"][0]
             df = df.rename(columns={price_col:"price"})[["date","price"]]
             df["price"] = pd.to_numeric(df["price"], errors="coerce")
@@ -93,10 +79,9 @@ def load_denominators():
     return out
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Fitting + compact support for dynamic rails (sent to JS)
+# Fit support for dynamic rails
 # ──────────────────────────────────────────────────────────────────────────────
 def quantile_fit_loglog(x_years, y_vals, q=0.5):
-    """Quantile regression of log10(y) on log10(x_years)."""
     x_years = np.asarray(x_years); y_vals = np.asarray(y_vals)
     mask = np.isfinite(x_years) & np.isfinite(y_vals) & (x_years>0) & (y_vals>0)
     xlog = np.log10(x_years[mask]); ylog = np.log10(y_vals[mask])
@@ -108,14 +93,11 @@ def quantile_fit_loglog(x_years, y_vals, q=0.5):
 
 def build_support_for_dynamic_rails(x_years, y_vals):
     """
-    Compute a compact lookup so JS can draw ANY percentile rail smoothly:
-    - a0, b: midline params for log10(y) = a0 + b*log10(xyears)
-    - med:   median of residuals (may be ~0)
-    - q_grid:   0.50..0.995 (100 points)
-    - d_grid:   symmetric offset d at each q (max of hi/lo tails)
-               such that rails are med ± d
-      Then, for a desired percentile p in [0,1], set q = 1 - p,
-      offset = med + (p>=0.5 ? +d(q) : -d(q)).
+    Provide everything JS needs to draw any percentile rail via interpolation:
+      - a0, b: midline parameters for log10(y) = a0 + b*log10(xyears)
+      - q_grid: dense percentile grid in [0.001..0.999]
+      - off_grid: quantile(resid, q_grid) - median(resid)
+    So offset(50%) == 0, <50% negative, >50% positive. Simple and robust.
     """
     a0, b, resid = quantile_fit_loglog(x_years, y_vals, q=0.5)
     r = np.copy(resid)
@@ -124,31 +106,21 @@ def build_support_for_dynamic_rails(x_years, y_vals):
         r = np.clip(r, lo, hi)
 
     med = float(np.nanmedian(r))
-    pos = r - med; pos = pos[pos>0.0]
-    neg = med - r; neg = neg[neg>0.0]
-    pos.sort(); neg.sort()
+    q_grid = np.linspace(0.001, 0.999, 999)
+    rq = np.quantile(r, q_grid)
+    off_grid = rq - med
+    # Nudge the very top/bottom so extremes don't touch midline on extrapolation
+    off_grid[0]  -= EPS_LOG_SPACING
+    off_grid[-1] += EPS_LOG_SPACING
 
-    q_grid = np.linspace(0.50, 0.995, 100)
-    d_grid = []
-    for q in q_grid:
-        d_hi = float(np.quantile(pos, q)) if pos.size else 0.0
-        d_lo = float(np.quantile(neg, q)) if neg.size else 0.0
-        d = max(d_hi, d_lo)
-        d_grid.append(d)
-
-    # Nudge the very top end so ceiling cannot touch midline when extrapolated
-    # (applied client-side too, but this keeps intent clear)
-    d_grid[-1] += EPS_LOG_SPACING
-
-    return {"a0":a0, "b":b, "med":float(med),
-            "q_grid": [float(q) for q in q_grid],
-            "d_grid": [float(d) for d in d_grid]}
+    return {"a0":a0, "b":b,
+            "q_grid":[float(q) for q in q_grid],
+            "off_grid":[float(v) for v in off_grid]}
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Axis ticks
+# Ticks
 # ──────────────────────────────────────────────────────────────────────────────
 def year_ticks_log(first_dt, last_dt):
-    """Whole-year ticks on log-x (years since genesis). Hide odd labels after 2026."""
     vals, labs = [], []
     y0, y1 = first_dt.year, last_dt.year
     for y in range(y0, y1+1):
@@ -156,7 +128,7 @@ def year_ticks_log(first_dt, last_dt):
         if d < first_dt or d > last_dt: continue
         vy = float(years_since_genesis(pd.Series([d])).iloc[0])
         if vy <= 0: continue
-        if y > 2026 and (y % 2 == 1):
+        if y > 2026 and (y % 2 == 1):  # hide odd labels after 2026
             continue
         vals.append(vy); labs.append(str(y))
     return vals, labs
@@ -172,7 +144,6 @@ def y_ticks():
 btc = fetch_btc_csv().rename(columns={"price":"btc"})
 denoms = load_denominators()
 
-# Merge denominators into base
 base = btc.sort_values("date").reset_index(drop=True)
 for key, df in denoms.items():
     base = base.merge(df.rename(columns={"price": key.lower()}), on="date", how="left")
@@ -180,21 +151,19 @@ for key, df in denoms.items():
 base["x_years"]   = years_since_genesis(base["date"])
 base["date_iso"]  = base["date"].dt.strftime("%Y-%m-%d")
 
-# Horizon: fixed to END_PROJ (12/31/2040)
+# Horizon
 first_dt = max(base["date"].iloc[0], X_START_DATE)
 max_dt   = END_PROJ
 
-# x_grid for rails (log-spaced in x-years) between first_dt .. max_dt
+# x_grid to horizon
 x_start = float(years_since_genesis(pd.Series([first_dt])).iloc[0])
 x_end   = float(years_since_genesis(pd.Series([max_dt])).iloc[0])
 x_grid  = np.logspace(np.log10(max(1e-6, x_start)), np.log10(x_end), 700)
 
-# x/y ticks (to horizon)
 xtickvals, xticktext = year_ticks_log(first_dt, max_dt)
 ytickvals, yticktext = y_ticks()
 
 def series_for_denom(df, key):
-    """Return (series, label)."""
     if not key or key.lower() in ("usd", "none"):
         return df["btc"], "BTC / USD"
     k = key.lower()
@@ -221,12 +190,11 @@ for k in sorted(denoms.keys()):
 P0 = PRECOMP["USD"]
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Base figure (we pre-allocate rail stubs; content filled by JS)
+# Figure with pre-allocated rail slots
 # ──────────────────────────────────────────────────────────────────────────────
-MAX_RAIL_SLOTS = 12  # plenty of headroom
+MAX_RAIL_SLOTS = 12
 
 def add_stub(idx):
-    # start invisible; JS will fill name/color/line and set visible
     return go.Scatter(
         x=P0["x_grid"], y=[None]*len(P0["x_grid"]), mode="lines",
         name=f"Rail {idx+1}", line=dict(width=1.6, color="#999"), visible=False, hoverinfo="skip"
@@ -236,20 +204,18 @@ traces = [add_stub(i) for i in range(MAX_RAIL_SLOTS)]
 traces += [
     go.Scatter(x=P0["x_main"], y=P0["y_main"], mode="lines",
                name="BTC / USD", line=dict(color=COL_BTC,width=2.0), hoverinfo="skip"),
-    # transparent cursor trace to keep x-hover alive
     go.Scatter(x=P0["x_main"], y=P0["y_main"], mode="lines",
                line=dict(width=0), opacity=0.003, hoverinfo="x", showlegend=False, name="_cursor")
 ]
 
 fig = go.Figure(traces)
 
-# Set the default visible range to [first_dt .. 2040-12-31]
 x_min = float(years_since_genesis(pd.Series([first_dt])).iloc[0])
 x_max = float(years_since_genesis(pd.Series([max_dt])).iloc[0])
 
 fig.update_layout(
     template="plotly_white",
-    hovermode="x unified",   # unified hover label (no persistent spike)
+    hovermode="x unified",
     showlegend=True,
     title="BTC Purchase Indicator — Rails",
     xaxis=dict(type="log", title=None, tickmode="array",
@@ -265,7 +231,7 @@ plot_html = fig.to_html(full_html=False, include_plotlyjs="cdn",
                         config={"responsive":True,"displayModeBar":True,"modeBarButtonsToRemove":["toImage"]})
 
 # ──────────────────────────────────────────────────────────────────────────────
-# HTML + JS (pixel width + dynamic Rails Dashboard)
+# HTML + JS
 # ──────────────────────────────────────────────────────────────────────────────
 HTML = f"""<!doctype html>
 <html lang="en"><head>
@@ -326,7 +292,7 @@ legend{{padding:0 6px;color:#374151;font-weight:600;font-size:13px}}
       <legend>Rails</legend>
       <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
         <button id="editBtn">Edit Rails</button>
-        <span class="smallnote">Toggle edit mode to add/remove/change percent lines. Sorted automatically (high→low).</span>
+        <span class="smallnote">Add/remove/change percents. Sorted automatically (high→low).</span>
       </div>
       <div id="railsView" class="smallnote">Current: <span id="railsListText"></span></div>
 
@@ -335,7 +301,7 @@ legend{{padding:0 6px;color:#374151;font-weight:600;font-size:13px}}
         <div class="rail-row" style="margin-top:6px;">
           <input type="number" id="addPct" placeholder="Add % (e.g. 92.5)" step="0.1" min="0.1" max="99.9"/>
           <button id="addBtn">Add</button>
-          <span class="smallnote">Valid range: 0.1–99.9. Use 20 for Floor, 97.5 for Ceiling, 50 for mid.</span>
+          <span class="smallnote">Valid range: 0.1–99.9. Midline is 50.</span>
         </div>
       </div>
     </fieldset>
@@ -355,6 +321,8 @@ legend{{padding:0 6px;color:#374151;font-weight:600;font-size:13px}}
 <script>
 const PRECOMP = {json.dumps(PRECOMP)};
 const GENESIS = new Date('{GENESIS_DATE.strftime("%Y-%m-%d")}T00:00:00Z');
+const MAX_SLOTS = {MAX_RAIL_SLOTS};
+const EPS_LOG_SPACING = {EPS_LOG_SPACING};
 
 function fmtUSD(v){{ return (isFinite(v)? '$'+Number(v).toLocaleString(undefined,{{minimumFractionDigits:2,maximumFractionDigits:2}}) : '$—'); }}
 const MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -365,13 +333,11 @@ function interp(xs, ys, x){{ let lo=0,hi=xs.length-1; if(x<=xs[0]) return ys[0];
   const t=(x-xs[lo])/(xs[hi]-xs[lo]); return ys[lo]+t*(ys[hi]-ys[lo]); }}
 function pctWithinLog(y,f,c){{ const ly=Math.log10(y), lf=Math.log10(f), lc=Math.log10(c); return Math.max(0,Math.min(100,100*(ly-lf)/Math.max(1e-12,lc-lf))); }}
 
-// Smooth red→yellow→green color scale based on percentile p (0..100)
+// Smooth red→yellow→green by percentile (0..100)
 function colorForPercent(p){{ 
-  const t = Math.max(0, Math.min(1, p/100)); // 0..1
-  // piecewise: red (#D32F2F)→yellow (#FBC02D)→green (#2E7D32)
+  const t = Math.max(0, Math.min(1, p/100));
   function hex(c){{ return Math.max(0, Math.min(255, Math.round(c))); }}
   function toHex(r,g,b){{ return '#' + [r,g,b].map(v=>hex(v).toString(16).padStart(2,'0')).join(''); }}
-  // first half 0..0.5 red→yellow
   if (t<=0.5) {{
     const u=t/0.5;
     const r=0xD3 + (0xFB-0xD3)*u;
@@ -387,6 +353,7 @@ function colorForPercent(p){{
   }}
 }}
 
+// DOM handles
 const leftCol=document.getElementById('leftCol');
 const plotDiv=document.querySelector('.left .js-plotly-plot') || document.querySelector('.left .plotly-graph-div');
 const denomSel=document.getElementById('denomSel');
@@ -425,121 +392,91 @@ fitBtn.addEventListener('click',()=>{{
 }});
 if(window.ResizeObserver) new ResizeObserver(()=>{{ if(window.Plotly&&plotDiv) Plotly.Plots.resize(plotDiv); }}).observe(leftCol);
 
-// Build denom list
+// Denominators
 const denomKeys = Object.keys(PRECOMP);
 const extra = denomKeys.filter(k=>k!=='USD');
 elDenoms.textContent = extra.length ? extra.join(', ') : '(none)';
 ['USD', ...extra].forEach(k=>{{ const o=document.createElement('option'); o.value=k; o.textContent=(k==='USD')?'USD/None':k; denomSel.appendChild(o); }});
 
 // Rails state (sorted high→low)
-let rails = [97.5, 90, 75, 50, 25, 20];  // initial set
-const MAX_SLOTS = {MAX_RAIL_SLOTS};
+let rails = [97.5, 90, 75, 50, 25, 20];
 
 function sortRails(){{
   rails = rails
     .filter(p=>isFinite(p))
     .map(p=>Math.max(0.1, Math.min(99.9, Number(p))))
-    .filter((p,i,arr)=>arr.indexOf(p)===i) // dedupe
-    .sort((a,b)=>b-a); // high→low
+    .filter((p,i,arr)=>arr.indexOf(p)===i)
+    .sort((a,b)=>b-a);
 }}
-
 function railsText(){{
   return rails.map(p=>String(p).replace(/\.0$/, '')+'%').join(', ');
 }}
+// Safe id for readout rows (avoid '.' in ids)
+function idFor(p){{ return 'v'+String(p).replace('.', '_'); }}
 
-// Build readout rows dynamically (to match rails selection)
+// Readout rows to match rails
 function rebuildReadoutRows(){{
   elRows.innerHTML='';
   rails.forEach(p=>{{
-    const row=document.createElement('div');
-    row.className='row';
+    const row=document.createElement('div'); row.className='row';
     const lab=document.createElement('div');
-    const val=document.createElement('div'); val.className='num'; val.id='v'+p;
+    const val=document.createElement('div'); val.className='num'; val.id=idFor(p);
     const color = colorForPercent(p);
-    let labelText = (Math.abs(p-20)<1e-9)?'Floor': (Math.abs(p-97.5)<1e-9?'Ceiling': p+'%');
-    // make 50% bold
-    const bOpen = (Math.abs(p-50)<1e-9)?'<b>':'';
-    const bClose= (Math.abs(p-50)<1e-9)?'</b>':'';
-    lab.innerHTML = `<span style="color:${{color}};">${{bOpen}}${{labelText}}${{bClose}}</span>`;
+    const isMid = Math.abs(p-50)<1e-9;
+    lab.innerHTML = `<span style="color:${{color}};">${{isMid?'<b>':''}}${{p}}%${{isMid?'</b>':''}}</span>`;
     row.appendChild(lab); row.appendChild(val); row.appendChild(document.createElement('div'));
     elRows.appendChild(row);
   }});
 }}
 
-// Editor UI
+// Editor
 function rebuildEditor(){{
   railItems.innerHTML='';
   rails.forEach((p,idx)=>{{
     const row=document.createElement('div'); row.className='rail-row';
     const color=colorForPercent(p);
-    const lab=document.createElement('span'); lab.style.minWidth='38px'; lab.style.color=color; lab.textContent=(Math.abs(p-20)<1e-9?'Floor':Math.abs(p-97.5)<1e-9?'Ceiling':p+'%');
+    const lab=document.createElement('span'); lab.style.minWidth='38px'; lab.style.color=color; lab.textContent=p+'%';
     const inp=document.createElement('input'); inp.type='number'; inp.step='0.1'; inp.min='0.1'; inp.max='99.9'; inp.value=String(p);
     const rm=document.createElement('button'); rm.textContent='Remove';
-    inp.addEventListener('change',()=>{{ 
-      const v=Number(inp.value);
-      rails[idx]=isFinite(v)?v:p;
-      sortRails(); syncAll();
-    }});
+    inp.addEventListener('change',()=>{{ const v=Number(inp.value); rails[idx]=isFinite(v)?v:p; sortRails(); syncAll(); }});
     rm.addEventListener('click',()=>{{ rails.splice(idx,1); syncAll(); }});
     row.appendChild(lab); row.appendChild(inp); row.appendChild(rm);
     railItems.appendChild(row);
   }});
   railsListText.textContent = railsText();
 }}
+addBtn.addEventListener('click',()=>{{ const v=Number(addPct.value); if(!isFinite(v)) return; rails.push(v); addPct.value=''; sortRails(); syncAll(); }});
+editBtn.addEventListener('click',()=>{{ railsEditor.classList.toggle('hidden'); railsView.classList.toggle('hidden'); editBtn.textContent = railsEditor.classList.contains('hidden') ? 'Edit Rails' : 'Done'; }});
 
-addBtn.addEventListener('click',()=>{{
-  const v=Number(addPct.value);
-  if (!isFinite(v)) return;
-  rails.push(v);
-  addPct.value='';
-  sortRails(); syncAll();
-}});
-
-editBtn.addEventListener('click',()=>{{
-  railsEditor.classList.toggle('hidden');
-  railsView.classList.toggle('hidden');
-  editBtn.textContent = railsEditor.classList.contains('hidden') ? 'Edit Rails' : 'Done';
-}});
-
-// Compute logM(x) across grid (midline); helper to get offset d for percentile
-function logMidline(P){{ 
-  const d=P.support; 
-  return P.x_grid.map(x=> (d.a0 + d.b*Math.log10(x)) );
-}}
+// Midline + offset helpers
+function logMidline(P){{ const d=P.support; return P.x_grid.map(x=> (d.a0 + d.b*Math.log10(x)) ); }}
 function offsetForPercent(P, percent){{
   const d=P.support;
-  const qUpper = 1 - (percent/100);
-  const q = Math.max(d.q_grid[0], Math.min(d.q_grid[d.q_grid.length-1], qUpper));
-  const off = interp(d.q_grid, d.d_grid, q);
-  const med = d.med;
-  // symmetric: med ± d
-  return (percent>=50 ? med + off : med - off);
+  const p01 = Math.max(d.q_grid[0], Math.min(d.q_grid[d.q_grid.length-1], percent/100));
+  const off = interp(d.q_grid, d.off_grid, p01);
+  return off;
 }}
-
 function seriesForPercent(P, percent){{
   const logM = logMidline(P); const off = offsetForPercent(P, percent);
-  // small epsilon at the very top to avoid touching midline in far extrapolation
-  const eps = (percent>97.4)? {EPS_LOG_SPACING} : 0.0;
-  return logM.map(v=> Math.pow(10, v + off + (percent>=50? eps: -eps)) );
+  const eps = (percent>=99.0||percent<=1.0)? EPS_LOG_SPACING : 0.0;
+  return logM.map(v=> Math.pow(10, v + off + (percent>=50? eps : -eps)) );
 }}
 
-// Render rails into pre-allocated slots (0..MAX_SLOTS-1)
+// Render into pre-allocated slots
 function renderRails(P){{
-  // Ensure we don't exceed slot count
   const n = Math.min(rails.length, MAX_SLOTS);
   for (let i=0;i<MAX_SLOTS;i++){{ 
     const visible = (i<n);
     let restyle = {{visible: visible}};
     if (visible) {{
       const p = rails[i];
-      const name = (Math.abs(p-20)<1e-9)?'Floor' : (Math.abs(p-97.5)<1e-9?'Ceiling': (p+'%'));
       const color = colorForPercent(p);
-      const dash = (Math.abs(p-50)<1e-9)? undefined : 'dot';
+      const dash  = (Math.abs(p-50)<1e-9)? 'solid' : 'dot';
       const width = (Math.abs(p-50)<1e-9)? 2.6 : 1.6;
       restyle = Object.assign(restyle, {{
         x: [P.x_grid],
         y: [seriesForPercent(P, p)],
-        name: name,
+        name: p+'%',
         line: {{color: color, width: width, dash: dash}}
       }});
     }}
@@ -554,31 +491,26 @@ let locked=false, lockedX=null;
 function updatePanel(P,xYears){{
   elDate.textContent=shortDateFromYears(xYears);
 
-  // Determine "Floor" and "Ceiling" chosen (if present), else use min/max rails
+  // Use min/max rails for band position (or 20/97.5 if present)
   const pFloor = rails.find(p=>Math.abs(p-20)<1e-9) ?? Math.min(...rails);
   const pCeil  = rails.find(p=>Math.abs(p-97.5)<1e-9) ?? Math.max(...rails);
 
   const floor = interp(P.x_grid, seriesForPercent(P,pFloor), xYears);
   const ceil  = interp(P.x_grid, seriesForPercent(P,pCeil),  xYears);
 
-  // Fill each readout row in current order
   rails.forEach(p=>{{
     const v = interp(P.x_grid, seriesForPercent(P,p), xYears);
-    const el = document.getElementById('v'+p);
+    const el = document.getElementById(idFor(p));
     if (el) el.textContent = fmtUSD(v);
   }});
 
-  // Main series value near xYears (snap to nearest x_main)
+  // snap price to nearest x_main
   let idx=0,best=1e99; 
-  for(let i=0;i<P.x_main.length;i++){{ 
-    const d=Math.abs(P.x_main[i]-xYears); if(d<best){{best=d; idx=i;}} 
-  }}
+  for(let i=0;i<P.x_main.length;i++){{ const d=Math.abs(P.x_main[i]-xYears); if(d<best){{best=d; idx=i;}} }}
   const y=P.y_main[idx]; elMain.textContent=fmtUSD(y);
   elP.textContent = `(p≈${{pctWithinLog(y, floor, ceil).toFixed(1)}}%)`;
   Plotly.relayout(plotDiv, {{"yaxis.title.text": P.label}});
 }}
-
-// Rails visibility sync is implicit because rails are always visible in slots that are used
 
 // Hover & controls
 plotDiv.on('plotly_hover', ev=>{{ if(ev.points && ev.points.length && !locked) updatePanel(PRECOMP[denomSel.value], ev.points[0].x); }});
@@ -596,13 +528,13 @@ copyBtn.onclick = async ()=>{{
 // Denominator change
 denomSel.onchange = ()=>{{ 
   const key=denomSel.value, P=PRECOMP[key];
-  Plotly.restyle(plotDiv, {{x:[P.x_main], y:[P.y_main], name:[P.label]}}, [{MAX_RAIL_SLOTS}]);     // BTC line
-  Plotly.restyle(plotDiv, {{x:[P.x_main], y:[P.y_main]}},              [{MAX_RAIL_SLOTS}+1]);      // cursor
+  Plotly.restyle(plotDiv, {{x:[P.x_main], y:[P.y_main], name:[P.label]}}, [{MAX_RAIL_SLOTS}]);
+  Plotly.restyle(plotDiv, {{x:[P.x_main], y:[P.y_main]}},              [{MAX_RAIL_SLOTS}+1]);
   renderRails(P);
   updatePanel(P,(typeof lockedX==='number')?lockedX:P.x_main[P.x_main.length-1]);
 }};
 
-// Sync everything (rails list, editor, figure, readout)
+// Sync everything
 function syncAll(){{
   sortRails();
   rebuildEditor();
@@ -618,7 +550,6 @@ rebuildReadoutRows();
 rebuildEditor();
 renderRails(PRECOMP['USD']);
 updatePanel(PRECOMP['USD'], PRECOMP['USD'].x_main[PRECOMP['USD'].x_main.length-1]);
-
 </script>
 </body></html>
 """
