@@ -253,7 +253,7 @@ HTML = f"""<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>BTC Purchase Indicator</title>
 <style>
-:root{{--panelW:420px; --chartPct:74%}}
+:root{{--panelW:420px; --chartPct:74%;}}
 html,body{{height:100%}} body{{margin:0;font-family:Inter,system-ui,Segoe UI,Arial,sans-serif}}
 .layout{{display:flex;min-height:100vh;width:100vw}}
 .left{{flex:1 1 var(--chartPct);min-width:280px;padding:8px 0 8px 8px}}
