@@ -360,11 +360,11 @@ if(window.ResizeObserver) new ResizeObserver(()=>{{ if(window.Plotly&&plotDiv) P
 const denomKeys = Object.keys(PRECOMP);
 const extra = denomKeys.filter(k=>k!=='USD');
 elDenoms.textContent = extra.length ? extra.join(', ') : '(none)';
-['USD', ...extra].forEach(k=>{ const o=document.createElement('option'); o.value=k; o.textContent=(k==='USD')?'USD/None':k; denomSel.appendChild(o); });
+['USD', ...extra].forEach(k=>{{ const o=document.createElement('option'); o.value=k; o.textContent=(k==='USD')?'USD/None':k; denomSel.appendChild(o); }});
 
 let CURRENT_RAILS=null, locked=false, lockedX=null;
 
-function applyRails(P){{
+function applyRails(P){{ 
   CURRENT_RAILS = railsFromPercentiles(P);
   Plotly.restyle(plotDiv, {{x:[P.x_grid], y:[CURRENT_RAILS.FLOOR]}},   [0]);
   Plotly.restyle(plotDiv, {{x:[P.x_grid], y:[CURRENT_RAILS.P20]}},     [1]);
@@ -373,7 +373,7 @@ function applyRails(P){{
   Plotly.restyle(plotDiv, {{x:[P.x_grid], y:[CURRENT_RAILS.CEILING]}}, [4]);
 }}
 
-function updatePanel(P,xYears){{
+function updatePanel(P,xYears){{ 
   elDate.textContent=shortDateFromYears(xYears);
   const F=interp(P.x_grid,CURRENT_RAILS.FLOOR,xYears);
   const v20=interp(P.x_grid,CURRENT_RAILS.P20,xYears);
@@ -391,16 +391,16 @@ function updatePanel(P,xYears){{
 plotDiv.on('plotly_hover', ev=>{{ if(ev.points && ev.points.length && !locked) updatePanel(PRECOMP[denomSel.value], ev.points[0].x); }});
 setBtn.onclick = ()=>{{ if(!datePick.value) return; locked=true; lockedX=yearsFromISO(datePick.value); updatePanel(PRECOMP[denomSel.value], lockedX); }};
 liveBtn.onclick = ()=>{{ locked=false; lockedX=null; }};
-copyBtn.onclick = async ()=>{{
+copyBtn.onclick = async ()=>{{ 
   const node=document.getElementById('capture');
-  try{{
+  try{{ 
     const url=await htmlToImage.toPng(node,{{pixelRatio:2}});
     try{{ if(navigator.clipboard && window.ClipboardItem){{ const blob=await (await fetch(url)).blob(); await navigator.clipboard.write([new ClipboardItem({{'image/png':blob}})]); return; }} }}catch(e){{}}
     const a=document.createElement('a'); a.href=url; a.download='btc-indicator.png'; document.body.appendChild(a); a.click(); a.remove();
   }}catch(e){{ console.error(e); }}
 }};
 
-denomSel.onchange = ()=>{{
+denomSel.onchange = ()=>{{ 
   const key=denomSel.value, P=PRECOMP[key];
   Plotly.restyle(plotDiv, {{x:[P.x_main], y:[P.y_main], name:[P.label]}}, [5]);
   Plotly.restyle(plotDiv, {{x:[P.x_main], y:[P.y_main]}}, [6]);
