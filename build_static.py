@@ -30,19 +30,19 @@ END_PROJ     = datetime(2040, 12, 31)
 # Force x-axis start date
 X_START_DATE = datetime(2011, 1, 1)
 
-# Default future horizon (years beyond last data) to show rails without wasting half the plot
-FUTURE_YEARS = 3   # change to taste
+# Show rails FUTURE_YEARS past last data point (keeps plot from being half-empty)
+FUTURE_YEARS = 3
 
 # Rails behaviour
-RESID_WINSOR     = 0.02   # clip 2% tails in residuals (robust ceiling/floor)
-SYMMETRIC_RAILS  = True   # mirror rails about median residual
-EPS_LOG_SPACING  = 0.010  # keep rails from touching (~2.3% in linear space)
+RESID_WINSOR     = 0.02   # clip 2% tails in residuals
+SYMMETRIC_RAILS  = True   # mirror bands about median residual
+EPS_LOG_SPACING  = 0.010  # keep extreme rails from touching
 
 # Colors (floor→ceiling red→green)
 COL_FLOOR   = "#D32F2F"
-COL_20      = "#F57C00"
+COL_LLOW    = "#F57C00"   # now "35%"
 COL_50      = "#FBC02D"
-COL_80      = "#66BB6A"
+COL_UUP     = "#66BB6A"   # now "90%"
 COL_CEILING = "#2E7D32"
 COL_BTC     = "#000000"
 
@@ -52,21 +52,17 @@ COL_BTC     = "#000000"
 def years_since_genesis(dates):
     d = pd.to_datetime(dates)
     delta_days = (d - GENESIS_DATE) / np.timedelta64(1, "D")
-    # +1 day so log(x) > 0 at start
-    return (delta_days.astype(float) / 365.25) + (1.0/365.25)
+    return (delta_days.astype(float) / 365.25) + (1.0/365.25)  # +1 day so log(x)>0
 
 def fetch_btc_csv() -> pd.DataFrame:
-    """Load BTC (date, price). Use local file if present, else fetch."""
     os.makedirs(DATA_DIR, exist_ok=True)
     if os.path.exists(BTC_FILE):
         df = pd.read_csv(BTC_FILE, parse_dates=["date"])
         return df.sort_values("date").dropna()
 
     url = "https://api.blockchain.info/charts/market-price?timespan=all&format=csv&sampled=false"
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
+    r = requests.get(url, timeout=30); r.raise_for_status()
     raw = r.text.strip()
-    # header can be present or absent; handle both
     if raw.splitlines()[0].lower().startswith("timestamp"):
         df = pd.read_csv(io.StringIO(raw))
         ts = [c for c in df.columns if c.lower().startswith("timestamp")][0]
@@ -81,15 +77,12 @@ def fetch_btc_csv() -> pd.DataFrame:
     return df
 
 def load_denominators():
-    """Return { KEY: DataFrame(date, price) } for ./data/denominator_*.csv"""
     out={}
     for p in glob.glob(os.path.join(DATA_DIR, "denominator_*.csv")):
         key = os.path.splitext(os.path.basename(p))[0].replace("denominator_","").upper()
         try:
             df = pd.read_csv(p, parse_dates=["date"])
-            # tolerate arbitrary second column name
-            if len(df.columns) < 2:
-                continue
+            if len(df.columns) < 2: continue
             price_col = [c for c in df.columns if c.lower()!="date"][0]
             df = df.rename(columns={price_col:"price"})[["date","price"]]
             df["price"] = pd.to_numeric(df["price"], errors="coerce")
@@ -103,7 +96,6 @@ def load_denominators():
 # Power-law fit & rails
 # ──────────────────────────────────────────────────────────────────────────────
 def quantile_fit_loglog(x_years, y_vals, q=0.5):
-    """Quantile regression of log10(y) on log10(x_years)."""
     x_years = np.asarray(x_years); y_vals = np.asarray(y_vals)
     mask = np.isfinite(x_years) & np.isfinite(y_vals) & (x_years>0) & (y_vals>0)
     xlog = np.log10(x_years[mask]); ylog = np.log10(y_vals[mask])
@@ -118,7 +110,10 @@ def winsorize(arr, p):
     return np.clip(arr, lo, hi)
 
 def symmetric_offsets(resid, q_upper):
-    """Return (low, high) symmetric about median residual."""
+    """
+    Return (low, high) offsets symmetric about median residual such that
+    median±d correspond roughly to the (1-q_upper) / q_upper bands.
+    """
     med = float(np.nanmedian(resid))
     d_hi = float(np.nanquantile(resid - med, q_upper))
     d_lo = float(np.nanquantile(med - resid, q_upper))
@@ -126,27 +121,38 @@ def symmetric_offsets(resid, q_upper):
     return med - d, med + d
 
 def compute_defaults(x_years, y_vals):
-    """Find midline (q50) and rail offsets at 2.5/97.5 and 20/80."""
+    """
+    Midline (q50) and rail offsets:
+      - Floor  -> 20th percentile (use low from q_upper=0.80)
+      - Lower dashed -> 35th percentile (low from q_upper=0.65)
+      - Upper dashed -> 90th percentile (high from q_upper=0.90)
+      - Ceiling -> 97.5th percentile (high from q_upper=0.975)
+    """
     a0, b, resid = quantile_fit_loglog(x_years, y_vals, q=0.5)
     r = winsorize(resid, RESID_WINSOR) if RESID_WINSOR else resid
-    if SYMMETRIC_RAILS:
-        c025, c975 = symmetric_offsets(r, 0.975)
-        c200, c800 = symmetric_offsets(r, 0.800)
-    else:
-        c025 = float(np.nanquantile(r, 0.025))
-        c975 = float(np.nanquantile(r, 0.975))
-        c200 = float(np.nanquantile(r, 0.200))
-        c800 = float(np.nanquantile(r, 0.800))
-    # keep floor/ceiling from touching on future extrapolation
-    c025 -= EPS_LOG_SPACING
-    c975 += EPS_LOG_SPACING
-    return {"a0":a0,"b":b,"c025":c025,"c200":c200,"c800":c800,"c975":c975}
+
+    # base symmetric bands
+    lo20, hi80   = symmetric_offsets(r, 0.80)   # ~20/80
+    lo35, hi65   = symmetric_offsets(r, 0.65)   # ~35/65
+    lo900, hi90  = symmetric_offsets(r, 0.90)   # ~10/90
+    lo025, hi975 = symmetric_offsets(r, 0.975)  # ~2.5/97.5
+
+    # keep extremes from touching
+    lo025 -= EPS_LOG_SPACING
+    hi975 += EPS_LOG_SPACING
+
+    return {
+        "a0": a0, "b": b,
+        "c200": lo20,     # 20% (floor)
+        "c350lo": lo35,   # 35% (lower dash)
+        "c900hi": hi90,   # 90% (upper dash)
+        "c975": hi975     # 97.5% (ceiling)
+    }
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Axis ticks
 # ──────────────────────────────────────────────────────────────────────────────
 def year_ticks_log(first_dt, last_dt):
-    """Whole-year ticks on log-x (years since genesis). Hide odd years after 2026."""
     vals, labs = [], []
     y0, y1 = first_dt.year, last_dt.year
     for y in range(y0, y1+1):
@@ -160,7 +166,6 @@ def year_ticks_log(first_dt, last_dt):
     return vals, labs
 
 def y_ticks():
-    # True log scale: no fake "0" tick
     vals = [10**e for e in range(0,9)]
     labs = [f"{int(10**e):,}" for e in range(0,9)]
     return vals, labs
@@ -171,7 +176,6 @@ def y_ticks():
 btc = fetch_btc_csv().rename(columns={"price":"btc"})
 denoms = load_denominators()
 
-# Merge denominators into base
 base = btc.sort_values("date").reset_index(drop=True)
 for key, df in denoms.items():
     base = base.merge(df.rename(columns={"price": key.lower()}), on="date", how="left")
@@ -179,24 +183,21 @@ for key, df in denoms.items():
 base["x_years"]   = years_since_genesis(base["date"])
 base["date_iso"]  = base["date"].dt.strftime("%Y-%m-%d")
 
-# Horizon limited to FUTURE_YEARS past the last data date (but never beyond END_PROJ)
+# Horizon
 last_dt = base["date"].iloc[-1]
 max_dt  = datetime(min(END_PROJ.year, last_dt.year + FUTURE_YEARS), 12, 31)
-
-# Start date for axis/ticks/rails: respect data min, but not earlier than X_START_DATE
 first_dt = max(base["date"].iloc[0], X_START_DATE)
 
-# x_grid for rails (log-spaced in x-years) between first_dt .. max_dt
+# x_grid
 x_start = float(years_since_genesis(pd.Series([first_dt])).iloc[0])
 x_end   = float(years_since_genesis(pd.Series([max_dt])).iloc[0])
 x_grid  = np.logspace(np.log10(max(1e-6, x_start)), np.log10(x_end), 700)
 
-# x/y ticks (to horizon)
+# ticks
 xtickvals, xticktext = year_ticks_log(first_dt, max_dt)
 ytickvals, yticktext = y_ticks()
 
 def series_for_denom(df, key):
-    """Return (series, label)."""
     if not key or key.lower() in ("usd", "none"):
         return df["btc"], "BTC / USD"
     k = key.lower()
@@ -219,11 +220,10 @@ def build_payload(df, denom_key=None):
 PRECOMP = {"USD": build_payload(base, None)}
 for k in sorted(denoms.keys()):
     PRECOMP[k] = build_payload(base, k)
-
 P0 = PRECOMP["USD"]
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Base figure (rails are filled at runtime via JS)
+# Base figure (rails filled at runtime via JS)
 # ──────────────────────────────────────────────────────────────────────────────
 def add_stub(name, color, width=1.6, dash=None, bold=False):
     line = dict(width=2.6 if bold else width, color=color)
@@ -233,42 +233,29 @@ def add_stub(name, color, width=1.6, dash=None, bold=False):
 
 fig = go.Figure([
     add_stub("Floor",   COL_FLOOR),
-    add_stub("20%",     COL_20, dash="dot"),
+    add_stub("35%",     COL_LLOW, dash="dot"),
     add_stub("50%",     COL_50, bold=True),
-    add_stub("80%",     COL_80, dash="dot"),
+    add_stub("90%",     COL_UUP, dash="dot"),
     add_stub("Ceiling", COL_CEILING),
     go.Scatter(x=P0["x_main"], y=P0["y_main"], mode="lines",
                name="BTC / USD", line=dict(color=COL_BTC,width=2.0), hoverinfo="skip"),
-    # transparent cursor trace to keep x-hover alive
     go.Scatter(x=P0["x_main"], y=P0["y_main"], mode="lines",
                line=dict(width=0), opacity=0.003, hoverinfo="x", showlegend=False, name="_cursor")
 ])
 
-# Set the default visible range to [first_dt .. horizon]
 x_min = float(years_since_genesis(pd.Series([first_dt])).iloc[0])
 x_max = float(years_since_genesis(pd.Series([max_dt])).iloc[0])
 
 fig.update_layout(
     template="plotly_white",
-    hovermode="x unified",               # unified hover label (no persistent line)
+    hovermode="x unified",
     showlegend=True,
     title="BTC Purchase Indicator — Rails",
-    xaxis=dict(
-        type="log",
-        title=None,
-        tickmode="array",
-        tickvals=xtickvals,
-        ticktext=xticktext,
-        range=[np.log10(x_min), np.log10(x_max)],   # start at 2011-01-01
-        showspikes=False
-    ),
-    yaxis=dict(
-        type="log",
-        title=P0["label"],
-        tickmode="array",
-        tickvals=ytickvals,
-        ticktext=yticktext
-    ),
+    xaxis=dict(type="log", title=None, tickmode="array",
+               tickvals=xtickvals, ticktext=xticktext,
+               range=[np.log10(x_min), np.log10(x_max)], showspikes=False),
+    yaxis=dict(type="log", title=P0["label"],
+               tickmode="array", tickvals=ytickvals, ticktext=yticktext),
     legend=dict(x=1.02, xanchor="left", y=1.0, yanchor="top"),
     margin=dict(l=70, r=420, t=70, b=70),
 )
@@ -277,7 +264,7 @@ plot_html = fig.to_html(full_html=False, include_plotlyjs="cdn",
                         config={"responsive":True,"displayModeBar":True,"modeBarButtonsToRemove":["toImage"]})
 
 # ──────────────────────────────────────────────────────────────────────────────
-# HTML + JS (responsive layout + pixel width control)
+# HTML + JS
 # ──────────────────────────────────────────────────────────────────────────────
 HTML = f"""<!doctype html>
 <html lang="en"><head>
@@ -332,9 +319,9 @@ select,button,input[type=date],input[type=number]{{font-size:14px;padding:8px 10
     <div id="readout">
       <div class="date">—</div>
       <div class="row"><div><span style="color:{COL_FLOOR};">Floor</span></div><div id="vF"  class="num">$0.00</div><div></div></div>
-      <div class="row"><div><span style="color:{COL_20};">20%</span></div>  <div id="v20" class="num">$0.00</div><div></div></div>
+      <div class="row"><div><span style="color:{COL_LLOW};">35%</span></div>  <div id="v35" class="num">$0.00</div><div></div></div>
       <div class="row"><div><span style="color:{COL_50};font-weight:700;">50%</span></div><div id="v50" class="num" style="font-weight:700;">$0.00</div><div></div></div>
-      <div class="row"><div><span style="color:{COL_80};">80%</span></div>  <div id="v80" class="num">$0.00</div><div></div></div>
+      <div class="row"><div><span style="color:{COL_UUP};">90%</span></div>  <div id="v90" class="num">$0.00</div><div></div></div>
       <div class="row"><div><span style="color:{COL_CEILING};">Ceiling</span></div><div id="vC"  class="num">$0.00</div><div></div></div>
       <div style="margin-top:10px;"><b>BTC Price:</b> <span id="mainVal" class="num">$0.00</span></div>
       <div><b>Position:</b> <span id="pPct" style="font-weight:600;">(p≈—)</span></div>
@@ -362,11 +349,11 @@ function railsFromPercentiles(P){{
   const logM=lx.map(v=>d.a0 + d.b*v);
   const exp=a=>a.map(v=>Math.pow(10,v));
   return {{
-    FLOOR:   exp(logM.map(v=>v+d.c025)),
-    P20:     exp(logM.map(v=>v+d.c200)),
+    FLOOR:   exp(logM.map(v=>v+d.c200)),   // 20% floor
+    P35:     exp(logM.map(v=>v+d.c350lo)), // 35% lower dashed
     P50:     exp(logM),
-    P80:     exp(logM.map(v=>v+d.c800)),
-    CEILING: exp(logM.map(v=>v+d.c975))
+    P90:     exp(logM.map(v=>v+d.c900hi)), // 90% upper dashed
+    CEILING: exp(logM.map(v=>v+d.c975))    // 97.5% ceiling
   }};
 }}
 
@@ -380,8 +367,8 @@ const copyBtn=document.getElementById('copyBtn');
 const fitBtn=document.getElementById('fitBtn');
 const elDenoms=document.getElementById('denomsDetected');
 const elDate=document.querySelector('#readout .date');
-const elF=document.getElementById('vF'), el20=document.getElementById('v20'), el50=document.getElementById('v50'),
-      el80=document.getElementById('v80'), elC=document.getElementById('vC'), elMain=document.getElementById('mainVal'),
+const elF=document.getElementById('vF'), el35=document.getElementById('v35'), el50=document.getElementById('v50'),
+      el90=document.getElementById('v90'), elC=document.getElementById('vC'), elMain=document.getElementById('mainVal'),
       elP=document.getElementById('pPct');
 const chartWpx=document.getElementById('chartWpx');
 
@@ -393,7 +380,6 @@ function applyChartWidthPx(px){{
 }}
 chartWpx.addEventListener('change',()=>applyChartWidthPx(chartWpx.value));
 fitBtn.addEventListener('click',()=>{{ 
-  // Fill remaining space minus panel width & paddings
   const total=document.documentElement.clientWidth || window.innerWidth;
   const panel=420; const pad=32; 
   const target=Math.max(400, total - panel - pad);
@@ -403,7 +389,7 @@ if(window.ResizeObserver) new ResizeObserver(()=>{{ if(window.Plotly&&plotDiv) P
 
 const denomKeys = Object.keys(PRECOMP);
 const extra = denomKeys.filter(k=>k!=='USD');
-elDenoms.textContent = extra.length ? extra.join(', ') : '(none)';
+document.getElementById('denomsDetected').textContent = extra.length ? extra.join(', ') : '(none)';
 ['USD', ...extra].forEach(k=>{{ const o=document.createElement('option'); o.value=k; o.textContent=(k==='USD')?'USD/None':k; denomSel.appendChild(o); }});
 
 let CURRENT_RAILS=null, locked=false, lockedX=null;
@@ -411,20 +397,20 @@ let CURRENT_RAILS=null, locked=false, lockedX=null;
 function applyRails(P){{ 
   CURRENT_RAILS = railsFromPercentiles(P);
   Plotly.restyle(plotDiv, {{x:[P.x_grid], y:[CURRENT_RAILS.FLOOR]}},   [0]);
-  Plotly.restyle(plotDiv, {{x:[P.x_grid], y:[CURRENT_RAILS.P20]}},     [1]);
+  Plotly.restyle(plotDiv, {{x:[P.x_grid], y:[CURRENT_RAILS.P35]}},     [1]);
   Plotly.restyle(plotDiv, {{x:[P.x_grid], y:[CURRENT_RAILS.P50]}},     [2]);
-  Plotly.restyle(plotDiv, {{x:[P.x_grid], y:[CURRENT_RAILS.P80]}},     [3]);
+  Plotly.restyle(plotDiv, {{x:[P.x_grid], y:[CURRENT_RAILS.P90]}},     [3]);
   Plotly.restyle(plotDiv, {{x:[P.x_grid], y:[CURRENT_RAILS.CEILING]}}, [4]);
 }}
 
 function updatePanel(P,xYears){{ 
   elDate.textContent=shortDateFromYears(xYears);
   const F=interp(P.x_grid,CURRENT_RAILS.FLOOR,xYears);
-  const v20=interp(P.x_grid,CURRENT_RAILS.P20,xYears);
+  const v35=interp(P.x_grid,CURRENT_RAILS.P35,xYears);
   const v50=interp(P.x_grid,CURRENT_RAILS.P50,xYears);
-  const v80=interp(P.x_grid,CURRENT_RAILS.P80,xYears);
+  const v90=interp(P.x_grid,CURRENT_RAILS.P90,xYears);
   const C=interp(P.x_grid,CURRENT_RAILS.CEILING,xYears);
-  elF.textContent=fmtUSD(F); el20.textContent=fmtUSD(v20); el50.textContent=fmtUSD(v50); el80.textContent=fmtUSD(v80); elC.textContent=fmtUSD(C);
+  elF.textContent=fmtUSD(F); el35.textContent=fmtUSD(v35); el50.textContent=fmtUSD(v50); el90.textContent=fmtUSD(v90); elC.textContent=fmtUSD(C);
 
   let idx=0,best=1e99; for(let i=0;i<P.x_main.length;i++){{ const d=Math.abs(P.x_main[i]-xYears); if(d<best){{best=d; idx=i;}} }}
   const y=P.y_main[idx]; elMain.textContent=fmtUSD(y);
