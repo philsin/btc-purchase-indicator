@@ -184,8 +184,7 @@ base["x_years"]   = years_since_genesis(base["date"])
 base["date_iso"]  = base["date"].dt.strftime("%Y-%m-%d")
 
 # Horizon
-last_dt = base["date"].iloc[-1]
-max_dt  = datetime(min(END_PROJ.year, last_dt.year + FUTURE_YEARS), 12, 31)
+max_dt = END_PROJ  
 first_dt = max(base["date"].iloc[0], X_START_DATE)
 
 # x_grid
