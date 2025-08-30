@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ─────────────────────────────────────────────────────────────────────────────
-# BTC Purchase Indicator — Midline Percentiles Edition (full UI, responsive)
+# BTC Purchase Indicator — Midline Percentiles Edition (full UI + width slider)
 # ─────────────────────────────────────────────────────────────────────────────
 import os, io, glob, time, json
 from datetime import datetime, timezone
@@ -226,7 +226,8 @@ fig.update_layout(
     xaxis=dict(type="log", title=None, tickmode="array", tickvals=xtickvals, ticktext=xticktext),
     yaxis=dict(type="log", title=P0["label"], tickmode="array", tickvals=ytickvals, ticktext=yticktext),
     legend=dict(x=1.02, xanchor="left", y=1.0, yanchor="top"),
-    margin=dict(l=70, r=520, t=70, b=70),
+    # wider chart area by default (reduce right margin)
+    margin=dict(l=70, r=420, t=70, b=70),
 )
 
 ensure_dir(os.path.dirname(OUTPUT_HTML))
@@ -240,19 +241,26 @@ html_tpl = Template(r"""<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>BTC Purchase Indicator</title>
 <style>
-:root{--panelW:520px}
+:root{--panelW:420px} /* smaller right panel by default to widen the chart */
 html,body{height:100%}body{margin:0;font-family:Inter,system-ui,Segoe UI,Arial,sans-serif}
-.layout{display:grid;grid-template-columns:1fr var(--panelW);min-height:100vh;width:100vw}
+.layout{display:grid;grid-template-columns:70% var(--panelW);min-height:100vh;width:100vw} /* 70% chart width by default */
 .left{padding:8px 0 8px 8px}.left .js-plotly-plot,.left .plotly-graph-div{width:100%!important}
 .right{border-left:1px solid #e5e7eb;padding:12px;display:flex;flex-direction:column;gap:12px;overflow:auto}
 #controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-select,button,input[type=date]{font-size:14px;padding:8px 10px;border-radius:8px;border:1px solid #d1d5db;background:#fff}
+select,button,input[type=date],input[type=range]{font-size:14px;padding:8px 10px;border-radius:8px;border:1px solid #d1d5db;background:#fff}
 #readout{border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#fafafa;font-size:14px}
 #readout .date{font-weight:700;margin-bottom:6px}
 #readout .row{display:grid;grid-template-columns:auto 1fr auto;column-gap:8px;align-items:baseline}
 #readout .num{font-family:ui-monospace,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums;text-align:right;min-width:12ch;white-space:pre}
 .hoverlayer{opacity:0!important;pointer-events:none}
-@media (max-width:900px){.layout{grid-template-columns:1fr}.right{border-left:none;border-top:1px solid #e5e7eb}.left{padding:8px}}
+@media (max-width:900px){
+  .layout{grid-template-columns:1fr}
+  .right{border-left:none;border-top:1px solid #e5e7eb}
+  .left{padding:8px}
+}
+#chartWidthBox{display:flex;align-items:center;gap:8px}
+#chartW{width:220px}
+#chartWVal{min-width:3ch;text-align:right}
 </style>
 </head><body>
 <div id="capture" class="layout">
@@ -265,6 +273,13 @@ select,button,input[type=date]{font-size:14px;padding:8px 10px;border-radius:8px
       <button id="setDateBtn">Set Date</button>
       <button id="liveBtn">Live Hover</button>
       <button id="copyBtn">Copy Chart</button>
+    </div>
+
+    <div id="chartWidthBox">
+      <b>Chart Width:</b>
+      <input type="range" id="chartW" min="50" max="85" value="70"/>
+      <span id="chartWVal">70%</span>
+      <span style="color:#6b7280;font-size:12px;">(adjusts plot / panel ratio)</span>
     </div>
 
     <div style="font-size:12px;color:#6b7280;">Detected denominators: <span id="denomsDetected"></span></div>
@@ -338,6 +353,18 @@ const elF=document.getElementById('vF'), el20=document.getElementById('v20'), el
       el80=document.getElementById('v80'), elC=document.getElementById('vC'), elMain=document.getElementById('mainVal'),
       elP=document.getElementById('pPct');
 
+const chartW=document.getElementById('chartW');
+const chartWVal=document.getElementById('chartWVal');
+const layoutRoot=document.querySelector('.layout');
+
+// chart width slider
+function applyChartWidth(pct){
+  layoutRoot.style.gridTemplateColumns = `${pct}% var(--panelW)`;
+  chartWVal.textContent = `${pct}%`;
+}
+chartW.addEventListener('input', ()=>applyChartWidth(chartW.value));
+applyChartWidth(chartW.value);
+
 const extraDenoms = Object.keys(PRECOMP).filter(k=>k!=='USD');
 elDenoms.textContent = extraDenoms.length ? extraDenoms.join(', ') : '(none)';
 ['USD', ...extraDenoms].forEach(k => {
@@ -370,7 +397,7 @@ function updatePanel(P, xYears){
   let idx=0,best=1e99; for(let i=0;i<P.x_main.length;i++){ const d=Math.abs(P.x_main[i]-xYears); if(d<best){best=d; idx=i;} }
   const y=P.y_main[idx]; elMain.textContent=fmtUSD(y);
   elP.textContent = `(p≈${pctWithinLog(y,F,C).toFixed(1)}%)`;
-  Plotly.relayout(plotDiv, {"title.text": `BTC Purchase Indicator — Rails (p≈${pctWithinLog(y,F,C).toFixed(1)}%)`});
+  Plotly.relayout(plotDiv, {"yaxis.title.text": P.label});
 }
 
 plotDiv.on('plotly_hover', ev=>{
@@ -406,7 +433,6 @@ denomSel.onchange = ()=>{
   const key=denomSel.value, P=PRECOMP[key];
   Plotly.restyle(plotDiv, { x:[P.x_main], y:[P.y_main], name:[P.label] }, [5]);
   Plotly.restyle(plotDiv, { x:[P.x_main], y:[P.y_main] }, [6]); // cursor
-  Plotly.relayout(plotDiv, {"yaxis.title.text": P.label});
   applyRails(P);
   updatePanel(P, (typeof lockedX==='number')?lockedX:P.x_main[P.x_main.length-1]);
 };
@@ -429,4 +455,4 @@ html = html_tpl.safe_substitute(
 ensure_dir(os.path.dirname(OUTPUT_HTML))
 with open(OUTPUT_HTML,"w",encoding="utf-8") as f:
     f.write(html)
-print(f"Wrote {OUTPUT_HTML}")
+print(f"Wrote %s" % OUTPUT_HTML)
