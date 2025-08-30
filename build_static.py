@@ -9,7 +9,7 @@ Generates docs/index.html from data in ./data:
 - data/denominator_*.csv (optional denominators; columns: date,price)
 """
 
-import os, io, glob, json, time
+import os, io, glob, json
 from datetime import datetime
 import numpy as np
 import pandas as pd
@@ -26,6 +26,9 @@ OUTPUT_HTML  = "docs/index.html"
 
 GENESIS_DATE = datetime(2009, 1, 3)
 END_PROJ     = datetime(2040, 12, 31)
+
+# Default future horizon (years beyond last data) to show rails without wasting half the plot
+FUTURE_YEARS = 3   # change to taste
 
 # Rails behaviour
 RESID_WINSOR     = 0.02   # clip 2% tails in residuals (robust ceiling/floor)
@@ -154,8 +157,9 @@ def year_ticks_log(first_dt, last_dt):
     return vals, labs
 
 def y_ticks():
-    vals = [1e-8] + [10**e for e in range(0,9)]
-    labs = ["0"] + [f"{int(10**e):,}" for e in range(0,9)]
+    # True log scale: no fake "0" tick
+    vals = [10**e for e in range(0,9)]
+    labs = [f"{int(10**e):,}" for e in range(0,9)]
     return vals, labs
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -172,13 +176,17 @@ for key, df in denoms.items():
 base["x_years"]   = years_since_genesis(base["date"])
 base["date_iso"]  = base["date"].dt.strftime("%Y-%m-%d")
 
-# x_grid for rails (log-spaced in x-years)
+# Horizon limited to FUTURE_YEARS past the last data date (but never beyond END_PROJ)
+last_dt = base["date"].iloc[-1]
+max_dt  = datetime(min(END_PROJ.year, last_dt.year + FUTURE_YEARS), 12, 31)
+
+# x_grid for rails (log-spaced in x-years) to the chosen horizon
 x_start = float(base["x_years"].iloc[0])
-x_end   = float(years_since_genesis(pd.Series([END_PROJ])).iloc[0])
+x_end   = float(years_since_genesis(pd.Series([max_dt])).iloc[0])
 x_grid  = np.logspace(np.log10(max(1e-6, x_start)), np.log10(x_end), 700)
 
-# x/y ticks
-xtickvals, xticktext = year_ticks_log(base["date"].iloc[0], END_PROJ)
+# x/y ticks (to horizon)
+xtickvals, xticktext = year_ticks_log(base["date"].iloc[0], max_dt)
 ytickvals, yticktext = y_ticks()
 
 def series_for_denom(df, key):
@@ -230,13 +238,31 @@ fig = go.Figure([
                line=dict(width=0), opacity=0.003, hoverinfo="x", showlegend=False, name="_cursor")
 ])
 
+# Set the default visible range to [first data .. horizon]
+x_min = float(base["x_years"].iloc[0])
+x_max = float(years_since_genesis(pd.Series([max_dt])).iloc[0])
+
 fig.update_layout(
     template="plotly_white",
-    hovermode="x",
+    hovermode="x unified",               # unified hover label (no persistent line)
     showlegend=True,
     title="BTC Purchase Indicator — Rails",
-    xaxis=dict(type="log", title=None, tickmode="array", tickvals=xtickvals, ticktext=xticktext),
-    yaxis=dict(type="log", title=P0["label"], tickmode="array", tickvals=ytickvals, ticktext=yticktext),
+    xaxis=dict(
+        type="log",
+        title=None,
+        tickmode="array",
+        tickvals=xtickvals,
+        ticktext=xticktext,
+        range=[np.log10(x_min), np.log10(x_max)],   # avoid big empty right half
+        showspikes=False
+    ),
+    yaxis=dict(
+        type="log",
+        title=P0["label"],
+        tickmode="array",
+        tickvals=ytickvals,
+        ticktext=yticktext
+    ),
     legend=dict(x=1.02, xanchor="left", y=1.0, yanchor="top"),
     margin=dict(l=70, r=420, t=70, b=70),
 )
@@ -245,7 +271,7 @@ plot_html = fig.to_html(full_html=False, include_plotlyjs="cdn",
                         config={"responsive":True,"displayModeBar":True,"modeBarButtonsToRemove":["toImage"]})
 
 # ──────────────────────────────────────────────────────────────────────────────
-# HTML + JS (responsive layout + width slider + ResizeObserver)
+# HTML + JS (responsive layout + pixel width control)
 # ──────────────────────────────────────────────────────────────────────────────
 HTML = f"""<!doctype html>
 <html lang="en"><head>
@@ -253,14 +279,14 @@ HTML = f"""<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>BTC Purchase Indicator</title>
 <style>
-:root{{--panelW:420px; --chartPct:74%;}}
+:root{{--panelW:420px;}}
 html,body{{height:100%}} body{{margin:0;font-family:Inter,system-ui,Segoe UI,Arial,sans-serif}}
 .layout{{display:flex;min-height:100vh;width:100vw}}
-.left{{flex:1 1 var(--chartPct);min-width:280px;padding:8px 0 8px 8px}}
+.left{{flex:0 0 auto;width:1100px;min-width:280px;padding:8px 0 8px 8px}}
 .left .js-plotly-plot,.left .plotly-graph-div{{width:100%!important}}
 .right{{flex:0 0 var(--panelW);border-left:1px solid #e5e7eb;padding:12px;display:flex;flex-direction:column;gap:12px;overflow:auto}}
 #controls{{display:flex;gap:8px;flex-wrap:wrap;align-items:center}}
-select,button,input[type=date],input[type=range]{{font-size:14px;padding:8px 10px;border-radius:8px;border:1px solid #d1d5db;background:#fff}}
+select,button,input[type=date],input[type=number]{{font-size:14px;padding:8px 10px;border-radius:8px;border:1px solid #d1d5db;background:#fff}}
 #readout{{border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#fafafa;font-size:14px}}
 #readout .date{{font-weight:700;margin-bottom:6px}}
 #readout .row{{display:grid;grid-template-columns:auto 1fr auto;column-gap:8px;align-items:baseline}}
@@ -272,12 +298,11 @@ select,button,input[type=date],input[type=range]{{font-size:14px;padding:8px 10p
   .left{{flex:0 0 auto;width:100%;padding:8px}}
 }}
 #chartWidthBox{{display:flex;align-items:center;gap:8px}}
-#chartW{{width:220px}}
-#chartWVal{{min-width:3ch;text-align:right}}
+#chartWpx{{width:120px}}
 </style>
 </head><body>
 <div id="capture" class="layout">
-  <div class="left">
+  <div class="left" id="leftCol">
     {plot_html}
   </div>
   <div class="right">
@@ -291,10 +316,9 @@ select,button,input[type=date],input[type=range]{{font-size:14px;padding:8px 10p
     </div>
 
     <div id="chartWidthBox">
-      <b>Chart Width:</b>
-      <input type="range" id="chartW" min="55" max="92" value="74"/>
-      <span id="chartWVal">74%</span>
-      <span style="color:#6b7280;font-size:12px;">(plot / panel ratio)</span>
+      <b>Chart Width (px):</b>
+      <input type="number" id="chartWpx" min="400" max="2400" step="10" value="1100"/>
+      <button id="fitBtn" title="Make chart fill remaining space">Fit</button>
     </div>
 
     <div style="font-size:12px;color:#6b7280;">Detected denominators: <span id="denomsDetected"></span></div>
@@ -340,22 +364,36 @@ function railsFromPercentiles(P){{
   }};
 }}
 
+const leftCol=document.getElementById('leftCol');
 const plotDiv=document.querySelector('.left .js-plotly-plot') || document.querySelector('.left .plotly-graph-div');
 const denomSel=document.getElementById('denomSel');
 const datePick=document.getElementById('datePick');
 const setBtn=document.getElementById('setDateBtn');
 const liveBtn=document.getElementById('liveBtn');
 const copyBtn=document.getElementById('copyBtn');
+const fitBtn=document.getElementById('fitBtn');
 const elDenoms=document.getElementById('denomsDetected');
 const elDate=document.querySelector('#readout .date');
 const elF=document.getElementById('vF'), el20=document.getElementById('v20'), el50=document.getElementById('v50'),
       el80=document.getElementById('v80'), elC=document.getElementById('vC'), elMain=document.getElementById('mainVal'),
       elP=document.getElementById('pPct');
-const chartW=document.getElementById('chartW'), chartWVal=document.getElementById('chartWVal');
+const chartWpx=document.getElementById('chartWpx');
 
-function applyChartWidth(pct){{ document.documentElement.style.setProperty('--chartPct', pct+'%'); chartWVal.textContent=pct+'%'; if(window.Plotly&&plotDiv) Plotly.Plots.resize(plotDiv); }}
-chartW.addEventListener('input',()=>applyChartWidth(chartW.value));
-if(window.ResizeObserver) new ResizeObserver(()=>{{ if(window.Plotly&&plotDiv) Plotly.Plots.resize(plotDiv); }}).observe(document.querySelector('.left'));
+function applyChartWidthPx(px){{ 
+  const v=Math.max(400, Math.min(2400, Number(px)||1100));
+  leftCol.style.flex='0 0 auto';
+  leftCol.style.width=v+'px';
+  if(window.Plotly&&plotDiv) Plotly.Plots.resize(plotDiv);
+}}
+chartWpx.addEventListener('change',()=>applyChartWidthPx(chartWpx.value));
+fitBtn.addEventListener('click',()=>{{ 
+  // Fill remaining space minus panel width & paddings
+  const total=document.documentElement.clientWidth || window.innerWidth;
+  const panel=420; const pad=32; 
+  const target=Math.max(400, total - panel - pad);
+  chartWpx.value=target; applyChartWidthPx(target);
+}});
+if(window.ResizeObserver) new ResizeObserver(()=>{{ if(window.Plotly&&plotDiv) Plotly.Plots.resize(plotDiv); }}).observe(leftCol);
 
 const denomKeys = Object.keys(PRECOMP);
 const extra = denomKeys.filter(k=>k!=='USD');
@@ -410,7 +448,7 @@ denomSel.onchange = ()=>{{
 
 // Init
 denomSel.value='USD';
-applyChartWidth(document.getElementById('chartW').value);
+applyChartWidthPx(document.getElementById('chartWpx').value);
 applyRails(PRECOMP['USD']);
 updatePanel(PRECOMP['USD'], PRECOMP['USD'].x_main[PRECOMP['USD'].x_main.length-1]);
 </script>
