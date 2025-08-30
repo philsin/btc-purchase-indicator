@@ -24,8 +24,8 @@ BTC_FILE     = os.path.join(DATA_DIR, "btc_usd.csv")
 OUTPUT_HTML  = "docs/index.html"
 
 GENESIS_DATE = datetime(2009, 1, 3)
-END_PROJ     = datetime(2040, 12, 31)      # fixed horizon
-X_START_DATE = datetime(2011, 1, 1)        # force chart start
+END_PROJ     = datetime(2040, 12, 31)
+X_START_DATE = datetime(2011, 1, 1)
 
 RESID_WINSOR     = 0.02   # clip 2% tails
 EPS_LOG_SPACING  = 0.010  # tiny spacing for extreme rails
@@ -37,8 +37,7 @@ COL_BTC          = "#000000"
 def years_since_genesis(dates):
     d = pd.to_datetime(dates)
     delta_days = (d - GENESIS_DATE) / np.timedelta64(1, "D")
-    # +1 day so log(x) > 0 at start
-    return (delta_days.astype(float) / 365.25) + (1.0/365.25)
+    return (delta_days.astype(float) / 365.25) + (1.0/365.25)  # +1 day => log(x)>0
 
 def fetch_btc_csv() -> pd.DataFrame:
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -97,7 +96,7 @@ def build_support_for_dynamic_rails(x_years, y_vals):
       - a0, b: midline parameters for log10(y) = a0 + b*log10(xyears)
       - q_grid: dense percentile grid in [0.001..0.999]
       - off_grid: quantile(resid, q_grid) - median(resid)
-    So offset(50%) == 0, <50% negative, >50% positive. Simple and robust.
+    offset(50%) == 0, <50% negative, >50% positive.
     """
     a0, b, resid = quantile_fit_loglog(x_years, y_vals, q=0.5)
     r = np.copy(resid)
@@ -109,7 +108,7 @@ def build_support_for_dynamic_rails(x_years, y_vals):
     q_grid = np.linspace(0.001, 0.999, 999)
     rq = np.quantile(r, q_grid)
     off_grid = rq - med
-    # Nudge extremes so they never touch midline on extrapolation
+    # keep extremes from touching midline on far extrapolation
     off_grid[0]  -= EPS_LOG_SPACING
     off_grid[-1] += EPS_LOG_SPACING
 
@@ -151,11 +150,9 @@ for key, df in denoms.items():
 base["x_years"]   = years_since_genesis(base["date"])
 base["date_iso"]  = base["date"].dt.strftime("%Y-%m-%d")
 
-# Horizon
 first_dt = max(base["date"].iloc[0], X_START_DATE)
 max_dt   = END_PROJ
 
-# x_grid to horizon
 x_start = float(years_since_genesis(pd.Series([first_dt])).iloc[0])
 x_end   = float(years_since_genesis(pd.Series([max_dt])).iloc[0])
 x_grid  = np.logspace(np.log10(max(1e-6, x_start)), np.log10(x_end), 700)
@@ -197,7 +194,8 @@ MAX_RAIL_SLOTS = 12
 def add_stub(idx):
     return go.Scatter(
         x=P0["x_grid"], y=[None]*len(P0["x_grid"]), mode="lines",
-        name=f"Rail {idx+1}", line=dict(width=1.6, color="#999"), visible=False, hoverinfo="skip"
+        name=f"Rail {idx+1}", line=dict(width=1.6, color="#999"),
+        visible=False, hoverinfo="skip"
     )
 
 traces = [add_stub(i) for i in range(MAX_RAIL_SLOTS)]
@@ -331,7 +329,6 @@ function shortDateFromYears(y){{ const ms=(y-(1.0/365.25))*365.25*86400000; cons
 function interp(xs, ys, x){{ let lo=0,hi=xs.length-1; if(x<=xs[0]) return ys[0]; if(x>=xs[hi]) return ys[hi];
   while(hi-lo>1){{ const m=(hi+lo)>>1; if(xs[m]<=x) lo=m; else hi=m; }}
   const t=(x-xs[lo])/(xs[hi]-xs[lo]); return ys[lo]+t*(ys[hi]-ys[lo]); }}
-function pctWithinLog(y,f,c){{ const ly=Math.log10(y), lf=Math.log10(f), lc=Math.log10(c); return Math.max(0,Math.min(100,100*(ly-lf)/Math.max(1e-12,lc-lf))); }}
 
 // Smooth red→yellow→green by percentile (0..100)
 function colorForPercent(p){{ 
@@ -460,13 +457,19 @@ function logMidline(P){{ const d=P.support; return P.x_grid.map(x=> (d.a0 + d.b*
 function offsetForPercent(P, percent){{
   const d=P.support;
   const p01 = Math.max(d.q_grid[0], Math.min(d.q_grid[d.q_grid.length-1], percent/100));
-  const off = interp(d.q_grid, d.off_grid, p01);
-  return off;
+  return interp(d.q_grid, d.off_grid, p01);
 }}
 function seriesForPercent(P, percent){{
   const logM = logMidline(P); const off = offsetForPercent(P, percent);
   const eps = (percent>=97.5 || percent<=2.5) ? EPS_LOG_SPACING : 0.0;
   return logM.map(v=> Math.pow(10, v + off + (percent>=50? eps : -eps)) );
+}}
+
+// Invert residual CDF: given offset -> percentile q (0..1)
+function percentFromOffset(P, off){{
+  const d=P.support;
+  const q = Math.max(d.q_grid[0], Math.min(d.q_grid[d.q_grid.length-1], interp(d.off_grid, d.q_grid, off)));
+  return q; // 0..1
 }}
 
 // Render into pre-allocated slots
@@ -498,22 +501,32 @@ let locked=false, lockedX=null;
 function updatePanel(P,xYears){{
   elDate.textContent=shortDateFromYears(xYears);
 
-  // p-value measured strictly within 2.5%..97.5% band
+  // 2.5% .. 97.5% envelope values (still used for context if you want)
   const floor = interp(P.x_grid, seriesForPercent(P, 2.5),  xYears);
   const ceil  = interp(P.x_grid, seriesForPercent(P, 97.5), xYears);
 
+  // Fill each selected rail’s readout
   rails.forEach(p=>{{
     const v = interp(P.x_grid, seriesForPercent(P,p), xYears);
     const el = document.getElementById(idFor(p));
     if (el) el.textContent = fmtUSD(v);
   }});
 
-  // snap to nearest price point for the main series
+  // Current price at nearest sample
   let idx=0,best=1e99; 
   for(let i=0;i<P.x_main.length;i++){{ const d=Math.abs(P.x_main[i]-xYears); if(d<best){{best=d; idx=i;}} }}
   const y=P.y_main[idx]; elMain.textContent=fmtUSD(y);
 
-  elP.textContent = `(p≈${{pctWithinLog(y, floor, ceil).toFixed(1)}}%)`;
+  // Compute empirical percentile of current price via residual CDF
+  const d=P.support;
+  const logx = Math.log10(xYears);
+  const ly   = Math.log10(y);
+  const mid  = d.a0 + d.b*logx;
+  const off  = ly - mid;             // residual offset from midline
+  const q    = percentFromOffset(P, off);  // 0..1
+  const pVal = Math.max(0, Math.min(100, 100*q));
+  elP.textContent = `(p≈${{pVal.toFixed(1)}}%)`;
+
   Plotly.relayout(plotDiv, {{"yaxis.title.text": P.label}});
 }}
 
