@@ -1,65 +1,38 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-BTC Purchase Indicator — Midline Percentiles (responsive with adjustable width)
+BTC Purchase Indicator — Power-law rails with a robust median midline,
+winsorized & symmetric percentile offsets, and a responsive UI.
 
-This script builds a static website that plots bitcoin’s price relative to various denominators
-(USD, gold, S&P 500, etc.) and overlays percentile rails derived from a robust power-law
-relationship between price and time. The UI includes a panel with statistics, a denominator
-drop‑down, a date lock, live hover, copy chart, and an adjustable width slider so you can
-change the chart-to-panel ratio on the fly.  Rails and percentiles follow a symmetric
-winsorized residual method, which produces midline and bands similar to well‑known
-power‑law charts (e.g., Porkopolis) while controlling early-cycle outliers.
-
-Key features:
-- Fits the median (q50) regression line in log–log space (price vs. years since Genesis block).
-- Computes 2.5/20/80/97.5 percentile rails as constant log offsets from that midline, using
-  winsorized (clipped) residuals and symmetric quantiles to avoid extreme early outliers.
-- All rails are parallel and straight in log–log space; p% is measured within the 2.5–97.5 band.
-- Responsive layout: left/right panes flex using CSS variables. A slider adjusts the chart’s
-  width percentage; a ResizeObserver ensures Plotly resizes properly on mobile and desktop.
-- Handles any number of additional denominators found in data/denominator_*.csv.
-- Outputs a standalone HTML file (docs/index.html) ready to publish on GitHub Pages.
-
-Adjustable constants (top of script):
-  EPS_LOG:     separates rails to avoid overlap (≈2.3% shift).
-  RESID_WINSOR: fraction of tails clipped when computing residual quantiles (0.02 = 2%).
-  SYMMETRIC_RAILS: if True, forces upper/lower percentiles to be equal distances from median.
-
-Run this script from the root of the repository. It assumes BTC data in data/btc_usd.csv
-and optional denominators in data/denominator_*.csv. If btc_usd.csv doesn’t exist, it
-downloads daily BTC prices from Blockchain.com. The output site writes to docs/index.html.
-
-Usage:
-  python build_static.py
-
+Generates docs/index.html from data in ./data:
+- data/btc_usd.csv (optional; otherwise fetched from Blockchain.info)
+- data/denominator_*.csv (optional denominators; columns: date,price)
 """
-import os
-import glob
-import json
-import io
-import requests
+
+import os, io, glob, json, time
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from datetime import datetime, timezone
+import requests
 from statsmodels.regression.quantile_regression import QuantReg
 
-# --------------------------------------------------
-# Configuration
-# --------------------------------------------------
-DATA_DIR = "data"
-BTC_FILE = os.path.join(DATA_DIR, "btc_usd.csv")
-OUTPUT_HTML = "docs/index.html"
+# ──────────────────────────────────────────────────────────────────────────────
+# Config
+# ──────────────────────────────────────────────────────────────────────────────
+DATA_DIR     = "data"
+BTC_FILE     = os.path.join(DATA_DIR, "btc_usd.csv")
+OUTPUT_HTML  = "docs/index.html"
 
 GENESIS_DATE = datetime(2009, 1, 3)
-END_PROJ = datetime(2040, 12, 31)
+END_PROJ     = datetime(2040, 12, 31)
 
-# Rails parameters
-EPS_LOG = 0.010      # small positive offset to prevent rails from touching
-RESID_WINSOR = 0.02  # winsorize top/bottom 2% of residuals
-SYMMETRIC_RAILS = True
+# Rails behaviour
+RESID_WINSOR     = 0.02   # clip 2% tails in residuals (robust ceiling/floor)
+SYMMETRIC_RAILS  = True   # mirror rails about median residual
+EPS_LOG_SPACING  = 0.010  # keep rails from touching (~2.3% in linear space)
 
-# Colour palette: Floor→20→50→80→Ceiling (red→orange→gold→green→darkgreen)
+# Colors (floor→ceiling red→green)
 COL_FLOOR   = "#D32F2F"
 COL_20      = "#F57C00"
 COL_50      = "#FBC02D"
@@ -67,184 +40,387 @@ COL_80      = "#66BB6A"
 COL_CEILING = "#2E7D32"
 COL_BTC     = "#000000"
 
-# --------------------------------------------------
-# Data loading and preparation
-# --------------------------------------------------
-def years_since_genesis(dates: pd.Series) -> pd.Series:
-    """Convert timestamps to fractional years since the Bitcoin genesis block.
-
-    We add 1 day to avoid zero in the log-x transform.
-    """
-    delta = (pd.to_datetime(dates) - GENESIS_DATE) / np.timedelta64(1, "D")
-    return (delta.astype(float) / 365.25) + (1.0 / 365.25)
+# ──────────────────────────────────────────────────────────────────────────────
+# Data helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def years_since_genesis(dates):
+    d = pd.to_datetime(dates)
+    delta_days = (d - GENESIS_DATE) / np.timedelta64(1, "D")
+    # +1 day so log(x) > 0 at start
+    return (delta_days.astype(float) / 365.25) + (1.0/365.25)
 
 def fetch_btc_csv() -> pd.DataFrame:
-    """Load BTC price data from BTC_FILE or download from Blockchain.com.
-
-    Returns a DataFrame with columns ["date","price"].
-    """
-    if os.path.exists(BTC_FILE):
-        return pd.read_csv(BTC_FILE, parse_dates=["date"])
+    """Load BTC (date, price). Use local file if present, else fetch."""
     os.makedirs(DATA_DIR, exist_ok=True)
-    # Use blockchain.info daily close data as fallback
+    if os.path.exists(BTC_FILE):
+        df = pd.read_csv(BTC_FILE, parse_dates=["date"])
+        return df.sort_values("date").dropna()
+
     url = "https://api.blockchain.info/charts/market-price?timespan=all&format=csv&sampled=false"
-    text = requests.get(url, timeout=30).text.strip()
-    lines = text.splitlines()
-    # Determine header presence
-    if lines[0].lower().startswith("timestamp"):
-        df = pd.read_csv(io.StringIO(text))
-        date_col, val_col = df.columns[0], df.columns[1]
-        df = df.rename(columns={date_col: "date", val_col: "price"})
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    raw = r.text.strip()
+    # header can be present or absent; handle both
+    if raw.splitlines()[0].lower().startswith("timestamp"):
+        df = pd.read_csv(io.StringIO(raw))
+        ts = [c for c in df.columns if c.lower().startswith("timestamp")][0]
+        val = [c for c in df.columns if c.lower().startswith("value")][0]
+        df = df.rename(columns={ts:"date", val:"price"})
     else:
-        df = pd.read_csv(io.StringIO(text), header=None, names=["date", "price"])
+        df = pd.read_csv(io.StringIO(raw), header=None, names=["date","price"])
     df["date"] = pd.to_datetime(df["date"], utc=True).dt.tz_localize(None)
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
-    df = df.dropna().sort_values("date")
+    df = df.sort_values("date").dropna()
     df.to_csv(BTC_FILE, index=False)
     return df
 
-def load_denominators() -> dict:
-    """Scan data/denominator_*.csv and load each as a DataFrame.
-
-    Returns a mapping from uppercase key to DataFrame with columns ["date","price"].
-    """
-    denoms = {}
-    pattern = os.path.join(DATA_DIR, "denominator_*.csv")
-    for path in glob.glob(pattern):
-        key = os.path.splitext(os.path.basename(path))[0].replace("denominator_", "").upper()
+def load_denominators():
+    """Return { KEY: DataFrame(date, price) } for ./data/denominator_*.csv"""
+    out={}
+    for p in glob.glob(os.path.join(DATA_DIR, "denominator_*.csv")):
+        key = os.path.splitext(os.path.basename(p))[0].replace("denominator_","").upper()
         try:
-            df = pd.read_csv(path, parse_dates=["date"])
-            price_col = [c for c in df.columns if c.lower() != "date"][0]
-            df = df.rename(columns={"date": "date", price_col: "price"})
+            df = pd.read_csv(p, parse_dates=["date"])
+            # tolerate arbitrary second column name
+            if len(df.columns) < 2:
+                continue
+            price_col = [c for c in df.columns if c.lower()!="date"][0]
+            df = df.rename(columns={price_col:"price"})[["date","price"]]
             df["price"] = pd.to_numeric(df["price"], errors="coerce")
-            df = df.dropna().sort_values("date")
-            denoms[key] = df
+            df = df.sort_values("date").dropna()
+            out[key]=df
         except Exception as e:
-            print(f"[warn] skipping {path}: {e}")
-    return denoms
+            print(f"[warn] skip {p}: {e}")
+    return out
 
-def quantile_fit(x: np.ndarray, y: np.ndarray, q: float = 0.5):
-    """Quantile regression (log–log) returning intercept, slope, residuals and mask."""
-    mask = (x > 0) & (y > 0) & np.isfinite(x) & np.isfinite(y)
-    xlog = np.log10(x[mask])
-    ylog = np.log10(y[mask])
-    X = pd.DataFrame({"const": 1.0, "logx": xlog})
+# ──────────────────────────────────────────────────────────────────────────────
+# Power-law fit & rails
+# ──────────────────────────────────────────────────────────────────────────────
+def quantile_fit_loglog(x_years, y_vals, q=0.5):
+    """Quantile regression of log10(y) on log10(x_years)."""
+    x_years = np.asarray(x_years); y_vals = np.asarray(y_vals)
+    mask = np.isfinite(x_years) & np.isfinite(y_vals) & (x_years>0) & (y_vals>0)
+    xlog = np.log10(x_years[mask]); ylog = np.log10(y_vals[mask])
+    X = pd.DataFrame({"const":1.0,"logx":xlog})
     res = QuantReg(ylog, X).fit(q=q)
-    a0, b = float(res.params["const"]), float(res.params["logx"])
-    resid = ylog - (a0 + b * xlog)
-    return a0, b, resid, mask
+    a0 = float(res.params["const"]); b = float(res.params["logx"])
+    resid = ylog - (a0 + b*xlog)
+    return a0, b, resid
 
-def winsorize(arr: np.ndarray, p: float) -> np.ndarray:
-    """Clip array tails at fraction p (both sides)."""
-    lo, hi = np.nanquantile(arr, p), np.nanquantile(arr, 1 - p)
+def winsorize(arr, p):
+    lo, hi = np.nanquantile(arr, p), np.nanquantile(arr, 1-p)
     return np.clip(arr, lo, hi)
 
-def symmetric_quantiles(resid: np.ndarray, q: float):
-    """Return symmetric residual offsets (lower, upper) such that ±d contains q.
+def symmetric_offsets(resid, q_upper):
+    """Return (low, high) symmetric about median residual."""
+    med = float(np.nanmedian(resid))
+    d_hi = float(np.nanquantile(resid - med, q_upper))
+    d_lo = float(np.nanquantile(med - resid, q_upper))
+    d = max(d_hi, d_lo)
+    return med - d, med + d
 
-    If SYMMETRIC_RAILS is True, ensures the distance from the median is the same
-    for the lower and upper quantiles.
-    """
-    median = float(np.nanmedian(resid))
-    d_up = float(np.nanquantile(resid - median, q))
-    d_down = float(np.nanquantile(median - resid, q))
-    d = max(d_up, d_down)
-    return median - d, median + d
-
-def defaults_for_series(x_years: pd.Series, y_vals: pd.Series) -> dict:
-    """Compute default midline and residual offsets for 2.5, 20, 80, 97.5 percentiles."""
-    a0, b, resid, _ = quantile_fit(x_years.values, y_vals.values, q=0.5)
-    r = resid.copy()
-    if RESID_WINSOR > 0:
-        r = winsorize(r, RESID_WINSOR)
+def compute_defaults(x_years, y_vals):
+    """Find midline (q50) and rail offsets at 2.5/97.5 and 20/80."""
+    a0, b, resid = quantile_fit_loglog(x_years, y_vals, q=0.5)
+    r = winsorize(resid, RESID_WINSOR) if RESID_WINSOR else resid
     if SYMMETRIC_RAILS:
-        c025, c975 = symmetric_quantiles(r, 0.975)
-        c200, c800 = symmetric_quantiles(r, 0.800)
+        c025, c975 = symmetric_offsets(r, 0.975)
+        c200, c800 = symmetric_offsets(r, 0.800)
     else:
         c025 = float(np.nanquantile(r, 0.025))
         c975 = float(np.nanquantile(r, 0.975))
         c200 = float(np.nanquantile(r, 0.200))
         c800 = float(np.nanquantile(r, 0.800))
-    # separate rails slightly
-    c025 -= EPS_LOG
-    c975 += EPS_LOG
-    return {"a0": a0, "b": b, "c025": c025, "c200": c200, "c800": c800, "c975": c975}
+    # keep floor/ceiling from touching on future extrapolation
+    c025 -= EPS_LOG_SPACING
+    c975 += EPS_LOG_SPACING
+    return {"a0":a0,"b":b,"c025":c025,"c200":c200,"c800":c800,"c975":c975}
 
-def build_payload(df: pd.DataFrame, denom_key: str | None) -> dict:
-    """Prepare series and defaults for a given denominator key."""
-    if denom_key is None:
-        y = df["btc"]
-        label = "BTC / USD"
-    else:
-        denom_col = denom_key.lower()
-        y = df["btc"] / df[denom_col]
-        label = f"BTC / {denom_key.upper()}"
-    d = defaults_for_series(df["x_years"], y)
+# ──────────────────────────────────────────────────────────────────────────────
+# Axis ticks
+# ──────────────────────────────────────────────────────────────────────────────
+def year_ticks_log(first_dt, last_dt):
+    """Whole-year ticks on log-x (years since genesis). Hide odd years after 2026."""
+    vals, labs = [], []
+    y0, y1 = first_dt.year, last_dt.year
+    for y in range(y0, y1+1):
+        d = datetime(y,1,1)
+        if d < first_dt or d > last_dt: continue
+        vy = float(years_since_genesis(pd.Series([d])).iloc[0])
+        if vy <= 0: continue
+        if y > 2026 and (y % 2 == 1):  # hide odd labels after 2026
+            continue
+        vals.append(vy); labs.append(str(y))
+    return vals, labs
+
+def y_ticks():
+    vals = [1e-8] + [10**e for e in range(0,9)]
+    labs = ["0"] + [f"{int(10**e):,}" for e in range(0,9)]
+    return vals, labs
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Build data model
+# ──────────────────────────────────────────────────────────────────────────────
+btc = fetch_btc_csv().rename(columns={"price":"btc"})
+denoms = load_denominators()
+
+# Merge denominators into base
+base = btc.sort_values("date").reset_index(drop=True)
+for key, df in denoms.items():
+    base = base.merge(df.rename(columns={"price": key.lower()}), on="date", how="left")
+
+base["x_years"]   = years_since_genesis(base["date"])
+base["date_iso"]  = base["date"].dt.strftime("%Y-%m-%d")
+
+# x_grid for rails (log-spaced in x-years)
+x_start = float(base["x_years"].iloc[0])
+x_end   = float(years_since_genesis(pd.Series([END_PROJ])).iloc[0])
+x_grid  = np.logspace(np.log10(max(1e-6, x_start)), np.log10(x_end), 700)
+
+# x/y ticks
+xtickvals, xticktext = year_ticks_log(base["date"].iloc[0], END_PROJ)
+ytickvals, yticktext = y_ticks()
+
+def series_for_denom(df, key):
+    """Return (series, label)."""
+    if not key or key.lower() in ("usd", "none"):
+        return df["btc"], "BTC / USD"
+    k = key.lower()
+    if k in df.columns:
+        return df["btc"]/df[k], f"BTC / {key.upper()}"
+    return df["btc"], "BTC / USD"
+
+def build_payload(df, denom_key=None):
+    y, label = series_for_denom(df, denom_key)
+    dft = compute_defaults(df["x_years"], y)
     return {
         "label": label,
         "x_main": df["x_years"].tolist(),
         "y_main": y.tolist(),
         "date_iso_main": df["date_iso"].tolist(),
         "x_grid": x_grid.tolist(),
-        "defaults": d,
+        "defaults": dft
     }
 
-def ensure_docs_dir():
-    docs = os.path.dirname(OUTPUT_HTML)
-    os.makedirs(docs, exist_ok=True)
-
-def write_html(html_content: str):
-    ensure_docs_dir()
-    with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
-        f.write(html_content)
-    print(f"Wrote {OUTPUT_HTML}")
-
-# Create x_grid globally for use in payloads
-x_start = float(base["x_years"].iloc[0])
-x_end   = float(years_since_genesis(pd.Series([END_PROJ])).iloc[0])
-x_grid = np.logspace(np.log10(max(1e-6, x_start)), np.log10(x_end), 700)
-
-# Build PRECOMP data
-btc_df = fetch_btc_csv()
-base_df = btc_df.rename(columns={"price": "btc"}).sort_values("date").reset_index(drop=True)
-denoms = load_denominators()
-for k, df in denoms.items():
-    base_df = base_df.merge(df.rename(columns={"price": k.lower()}), on="date", how="left")
-base_df["x_years"] = years_since_genesis(base_df["date"])
-base_df["date_iso"] = base_df["date"].dt.strftime("%Y-%m-%d")
-
-PRECOMP = {"USD": build_payload(base_df, None)}
+PRECOMP = {"USD": build_payload(base, None)}
 for k in sorted(denoms.keys()):
-    PRECOMP[k] = build_payload(base_df, k)
+    PRECOMP[k] = build_payload(base, k)
 
-# Define plotly figure and compute rails placeholders
+P0 = PRECOMP["USD"]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Base figure (rails are filled at runtime via JS)
+# ──────────────────────────────────────────────────────────────────────────────
+def add_stub(name, color, width=1.6, dash=None, bold=False):
+    line = dict(width=2.6 if bold else width, color=color)
+    if dash: line["dash"] = dash
+    return go.Scatter(x=P0["x_grid"], y=[None]*len(P0["x_grid"]), mode="lines",
+                      name=name, line=line, hoverinfo="skip")
+
 fig = go.Figure([
-    # placeholder rails; updated by JS
-    go.Scatter(x=x_grid, y=[None]*len(x_grid), mode="lines", name="Floor", line=dict(color=COL_FLOOR)),
-    go.Scatter(x=x_grid, y=[None]*len(x_grid), mode="lines", name="20%", line=dict(color=COL_20, dash="dot")),
-    go.Scatter(x=x_grid, y=[None]*len(x_grid), mode="lines", name="50%", line=dict(color=COL_50, width=3)),
-    go.Scatter(x=x_grid, y=[None]*len(x_grid), mode="lines", name="80%", line=dict(color=COL_80, dash="dot")),
-    go.Scatter(x=x_grid, y=[None]*len(x_grid), mode="lines", name="Ceiling", line=dict(color=COL_CEILING)),
-    go.Scatter(x=PRECOMP["USD"]["x_main"], y=PRECOMP["USD"]["y_main"], name="BTC / USD",
-               mode="lines", line=dict(color=COL_BTC)),
-    go.Scatter(x=PRECOMP["USD"]["x_main"], y=PRECOMP["USD"]["y_main"], mode="lines",
+    add_stub("Floor",   COL_FLOOR),
+    add_stub("20%",     COL_20, dash="dot"),
+    add_stub("50%",     COL_50, bold=True),
+    add_stub("80%",     COL_80, dash="dot"),
+    add_stub("Ceiling", COL_CEILING),
+    go.Scatter(x=P0["x_main"], y=P0["y_main"], mode="lines",
+               name="BTC / USD", line=dict(color=COL_BTC,width=2.0), hoverinfo="skip"),
+    # transparent cursor trace to keep x-hover alive
+    go.Scatter(x=P0["x_main"], y=P0["y_main"], mode="lines",
                line=dict(width=0), opacity=0.003, hoverinfo="x", showlegend=False, name="_cursor")
 ])
+
 fig.update_layout(
     template="plotly_white",
     hovermode="x",
     showlegend=True,
-    xaxis=dict(type="log", title=None),
-    yaxis=dict(type="log", title=PRECOMP["USD"]["label"]),
-    margin=dict(l=70, r=420, t=70, b=70)
+    title="BTC Purchase Indicator — Rails",
+    xaxis=dict(type="log", title=None, tickmode="array", tickvals=xtickvals, ticktext=xticktext),
+    yaxis=dict(type="log", title=P0["label"], tickmode="array", tickvals=ytickvals, ticktext=yticktext),
+    legend=dict(x=1.02, xanchor="left", y=1.0, yanchor="top"),
+    margin=dict(l=70, r=420, t=70, b=70),
 )
-plot_html = fig.to_html(full_html=False, include_plotlyjs="cdn", config={"responsive": True, "displayModeBar": True, "modeBarButtonsToRemove": ["toImage"]})
 
-# Generate final HTML
-html = html_template.safe_substitute(
-    plot_html=plot_html,
-    precomp_json=json.dumps(PRECOMP),
-    genesis_iso=GENESIS_DATE.strftime("%Y-%m-%d"),
-    COL_FLOOR=COL_FLOOR, COL_20=COL_20, COL_50=COL_50, COL_80=COL_80, COL_CEILING=COL_CEILING
-)
-write_html(html)
+plot_html = fig.to_html(full_html=False, include_plotlyjs="cdn",
+                        config={"responsive":True,"displayModeBar":True,"modeBarButtonsToRemove":["toImage"]})
+
+# ──────────────────────────────────────────────────────────────────────────────
+# HTML + JS (responsive layout + width slider + ResizeObserver)
+# ──────────────────────────────────────────────────────────────────────────────
+HTML = f"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>BTC Purchase Indicator</title>
+<style>
+:root{{--panelW:420px; --chartPct:74%}}
+html,body{{height:100%}} body{{margin:0;font-family:Inter,system-ui,Segoe UI,Arial,sans-serif}}
+.layout{{display:flex;min-height:100vh;width:100vw}}
+.left{{flex:1 1 var(--chartPct);min-width:280px;padding:8px 0 8px 8px}}
+.left .js-plotly-plot,.left .plotly-graph-div{{width:100%!important}}
+.right{{flex:0 0 var(--panelW);border-left:1px solid #e5e7eb;padding:12px;display:flex;flex-direction:column;gap:12px;overflow:auto}}
+#controls{{display:flex;gap:8px;flex-wrap:wrap;align-items:center}}
+select,button,input[type=date],input[type=range]{{font-size:14px;padding:8px 10px;border-radius:8px;border:1px solid #d1d5db;background:#fff}}
+#readout{{border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#fafafa;font-size:14px}}
+#readout .date{{font-weight:700;margin-bottom:6px}}
+#readout .row{{display:grid;grid-template-columns:auto 1fr auto;column-gap:8px;align-items:baseline}}
+#readout .num{{font-family:ui-monospace,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums;text-align:right;min-width:12ch;white-space:pre}}
+.hoverlayer{{opacity:0!important;pointer-events:none}}
+@media (max-width:900px){{
+  .layout{{flex-direction:column}}
+  .right{{flex:0 0 auto;border-left:none;border-top:1px solid #e5e7eb}}
+  .left{{flex:0 0 auto;width:100%;padding:8px}}
+}}
+#chartWidthBox{{display:flex;align-items:center;gap:8px}}
+#chartW{{width:220px}}
+#chartWVal{{min-width:3ch;text-align:right}}
+</style>
+</head><body>
+<div id="capture" class="layout">
+  <div class="left">
+    {plot_html}
+  </div>
+  <div class="right">
+    <div id="controls">
+      <label for="denomSel"><b>Denominator:</b></label>
+      <select id="denomSel"></select>
+      <input type="date" id="datePick"/>
+      <button id="setDateBtn">Set Date</button>
+      <button id="liveBtn">Live Hover</button>
+      <button id="copyBtn">Copy Chart</button>
+    </div>
+
+    <div id="chartWidthBox">
+      <b>Chart Width:</b>
+      <input type="range" id="chartW" min="55" max="92" value="74"/>
+      <span id="chartWVal">74%</span>
+      <span style="color:#6b7280;font-size:12px;">(plot / panel ratio)</span>
+    </div>
+
+    <div style="font-size:12px;color:#6b7280;">Detected denominators: <span id="denomsDetected"></span></div>
+
+    <div id="readout">
+      <div class="date">—</div>
+      <div class="row"><div><span style="color:{COL_FLOOR};">Floor</span></div><div id="vF"  class="num">$0.00</div><div></div></div>
+      <div class="row"><div><span style="color:{COL_20};">20%</span></div>  <div id="v20" class="num">$0.00</div><div></div></div>
+      <div class="row"><div><span style="color:{COL_50};font-weight:700;">50%</span></div><div id="v50" class="num" style="font-weight:700;">$0.00</div><div></div></div>
+      <div class="row"><div><span style="color:{COL_80};">80%</span></div>  <div id="v80" class="num">$0.00</div><div></div></div>
+      <div class="row"><div><span style="color:{COL_CEILING};">Ceiling</span></div><div id="vC"  class="num">$0.00</div><div></div></div>
+      <div style="margin-top:10px;"><b>BTC Price:</b> <span id="mainVal" class="num">$0.00</span></div>
+      <div><b>Position:</b> <span id="pPct" style="font-weight:600;">(p≈—)</span></div>
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/html-to-image@1.11.11/dist/html-to-image.umd.js"></script>
+<script>
+const PRECOMP = {json.dumps(PRECOMP)};
+
+function fmtUSD(v){{ return (isFinite(v)? '$'+Number(v).toLocaleString(undefined,{{minimumFractionDigits:2,maximumFractionDigits:2}}) : '$—'); }}
+const MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+const GENESIS = new Date('{GENESIS_DATE.strftime("%Y-%m-%d")}T00:00:00Z');
+
+function yearsFromISO(iso){{ const d=new Date(iso+'T00:00:00Z'); return ((d-GENESIS)/86400000)/365.25 + (1.0/365.25); }}
+function shortDateFromYears(y){{ const ms=(y-(1.0/365.25))*365.25*86400000; const d=new Date(GENESIS.getTime()+ms); return `${{MONTHS[d.getUTCMonth()]}}-${{String(d.getUTCDate()).padStart(2,'0')}}-${{String(d.getUTCFullYear()).slice(-2)}}`; }}
+function interp(xs, ys, x){{ let lo=0,hi=xs.length-1; if(x<=xs[0]) return ys[0]; if(x>=xs[hi]) return ys[hi];
+  while(hi-lo>1){{ const m=(hi+lo)>>1; if(xs[m]<=x) lo=m; else hi=m; }}
+  const t=(x-xs[lo])/(xs[hi]-xs[lo]); return ys[lo]+t*(ys[hi]-ys[lo]); }}
+function pctWithinLog(y,f,c){{ const ly=Math.log10(y), lf=Math.log10(f), lc=Math.log10(c); return Math.max(0,Math.min(100,100*(ly-lf)/Math.max(1e-12,lc-lf))); }}
+
+function railsFromPercentiles(P){{
+  const d=P.defaults, lx=P.x_grid.map(v=>Math.log10(v));
+  const logM=lx.map(v=>d.a0 + d.b*v);
+  const exp=a=>a.map(v=>Math.pow(10,v));
+  return {{
+    FLOOR:   exp(logM.map(v=>v+d.c025)),
+    P20:     exp(logM.map(v=>v+d.c200)),
+    P50:     exp(logM),
+    P80:     exp(logM.map(v=>v+d.c800)),
+    CEILING: exp(logM.map(v=>v+d.c975))
+  }};
+}}
+
+const plotDiv=document.querySelector('.left .js-plotly-plot') || document.querySelector('.left .plotly-graph-div');
+const denomSel=document.getElementById('denomSel');
+const datePick=document.getElementById('datePick');
+const setBtn=document.getElementById('setDateBtn');
+const liveBtn=document.getElementById('liveBtn');
+const copyBtn=document.getElementById('copyBtn');
+const elDenoms=document.getElementById('denomsDetected');
+const elDate=document.querySelector('#readout .date');
+const elF=document.getElementById('vF'), el20=document.getElementById('v20'), el50=document.getElementById('v50'),
+      el80=document.getElementById('v80'), elC=document.getElementById('vC'), elMain=document.getElementById('mainVal'),
+      elP=document.getElementById('pPct');
+const chartW=document.getElementById('chartW'), chartWVal=document.getElementById('chartWVal');
+
+function applyChartWidth(pct){{ document.documentElement.style.setProperty('--chartPct', pct+'%'); chartWVal.textContent=pct+'%'; if(window.Plotly&&plotDiv) Plotly.Plots.resize(plotDiv); }}
+chartW.addEventListener('input',()=>applyChartWidth(chartW.value));
+if(window.ResizeObserver) new ResizeObserver(()=>{{ if(window.Plotly&&plotDiv) Plotly.Plots.resize(plotDiv); }}).observe(document.querySelector('.left'));
+
+const denomKeys = Object.keys(PRECOMP);
+const extra = denomKeys.filter(k=>k!=='USD');
+elDenoms.textContent = extra.length ? extra.join(', ') : '(none)';
+['USD', ...extra].forEach(k=>{ const o=document.createElement('option'); o.value=k; o.textContent=(k==='USD')?'USD/None':k; denomSel.appendChild(o); });
+
+let CURRENT_RAILS=null, locked=false, lockedX=null;
+
+function applyRails(P){{
+  CURRENT_RAILS = railsFromPercentiles(P);
+  Plotly.restyle(plotDiv, {{x:[P.x_grid], y:[CURRENT_RAILS.FLOOR]}},   [0]);
+  Plotly.restyle(plotDiv, {{x:[P.x_grid], y:[CURRENT_RAILS.P20]}},     [1]);
+  Plotly.restyle(plotDiv, {{x:[P.x_grid], y:[CURRENT_RAILS.P50]}},     [2]);
+  Plotly.restyle(plotDiv, {{x:[P.x_grid], y:[CURRENT_RAILS.P80]}},     [3]);
+  Plotly.restyle(plotDiv, {{x:[P.x_grid], y:[CURRENT_RAILS.CEILING]}}, [4]);
+}}
+
+function updatePanel(P,xYears){{
+  elDate.textContent=shortDateFromYears(xYears);
+  const F=interp(P.x_grid,CURRENT_RAILS.FLOOR,xYears);
+  const v20=interp(P.x_grid,CURRENT_RAILS.P20,xYears);
+  const v50=interp(P.x_grid,CURRENT_RAILS.P50,xYears);
+  const v80=interp(P.x_grid,CURRENT_RAILS.P80,xYears);
+  const C=interp(P.x_grid,CURRENT_RAILS.CEILING,xYears);
+  elF.textContent=fmtUSD(F); el20.textContent=fmtUSD(v20); el50.textContent=fmtUSD(v50); el80.textContent=fmtUSD(v80); elC.textContent=fmtUSD(C);
+
+  let idx=0,best=1e99; for(let i=0;i<P.x_main.length;i++){{ const d=Math.abs(P.x_main[i]-xYears); if(d<best){{best=d; idx=i;}} }}
+  const y=P.y_main[idx]; elMain.textContent=fmtUSD(y);
+  elP.textContent = `(p≈${{pctWithinLog(y,F,C).toFixed(1)}}%)`;
+  Plotly.relayout(plotDiv, {{"yaxis.title.text": P.label}});
+}}
+
+plotDiv.on('plotly_hover', ev=>{{ if(ev.points && ev.points.length && !locked) updatePanel(PRECOMP[denomSel.value], ev.points[0].x); }});
+setBtn.onclick = ()=>{{ if(!datePick.value) return; locked=true; lockedX=yearsFromISO(datePick.value); updatePanel(PRECOMP[denomSel.value], lockedX); }};
+liveBtn.onclick = ()=>{{ locked=false; lockedX=null; }};
+copyBtn.onclick = async ()=>{{
+  const node=document.getElementById('capture');
+  try{{
+    const url=await htmlToImage.toPng(node,{{pixelRatio:2}});
+    try{{ if(navigator.clipboard && window.ClipboardItem){{ const blob=await (await fetch(url)).blob(); await navigator.clipboard.write([new ClipboardItem({{'image/png':blob}})]); return; }} }}catch(e){{}}
+    const a=document.createElement('a'); a.href=url; a.download='btc-indicator.png'; document.body.appendChild(a); a.click(); a.remove();
+  }}catch(e){{ console.error(e); }}
+}};
+
+denomSel.onchange = ()=>{{
+  const key=denomSel.value, P=PRECOMP[key];
+  Plotly.restyle(plotDiv, {{x:[P.x_main], y:[P.y_main], name:[P.label]}}, [5]);
+  Plotly.restyle(plotDiv, {{x:[P.x_main], y:[P.y_main]}}, [6]);
+  applyRails(P);
+  updatePanel(P,(typeof lockedX==='number')?lockedX:P.x_main[P.x_main.length-1]);
+}};
+
+// Init
+denomSel.value='USD';
+applyChartWidth(document.getElementById('chartW').value);
+applyRails(PRECOMP['USD']);
+updatePanel(PRECOMP['USD'], PRECOMP['USD'].x_main[PRECOMP['USD'].x_main.length-1]);
+</script>
+</body></html>
+"""
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Write site
+# ──────────────────────────────────────────────────────────────────────────────
+os.makedirs(os.path.dirname(OUTPUT_HTML), exist_ok=True)
+with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
+    f.write(HTML)
+print(f"Wrote {OUTPUT_HTML}")
