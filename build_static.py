@@ -109,7 +109,7 @@ def build_support_for_dynamic_rails(x_years, y_vals):
     q_grid = np.linspace(0.001, 0.999, 999)
     rq = np.quantile(r, q_grid)
     off_grid = rq - med
-    # Nudge the very top/bottom so extremes don't touch midline on extrapolation
+    # Nudge extremes so they never touch midline on extrapolation
     off_grid[0]  -= EPS_LOG_SPACING
     off_grid[-1] += EPS_LOG_SPACING
 
@@ -301,7 +301,7 @@ legend{{padding:0 6px;color:#374151;font-weight:600;font-size:13px}}
         <div class="rail-row" style="margin-top:6px;">
           <input type="number" id="addPct" placeholder="Add % (e.g. 92.5)" step="0.1" min="0.1" max="99.9"/>
           <button id="addBtn">Add</button>
-          <span class="smallnote">Valid range: 0.1–99.9. Midline is 50.</span>
+          <span class="smallnote">Valid range: 0.1–99.9. 50 is midline.</span>
         </div>
       </div>
     </fieldset>
@@ -377,6 +377,69 @@ const railItems=document.getElementById('railItems');
 const addPct=document.getElementById('addPct');
 const addBtn=document.getElementById('addBtn');
 
+// Denominators
+const denomKeys = Object.keys(PRECOMP);
+const extra = denomKeys.filter(k=>k!=='USD');
+elDenoms.textContent = extra.length ? extra.join(', ') : '(none)';
+['USD', ...extra].forEach(k=>{{ const o=document.createElement('option'); o.value=k; o.textContent=(k==='USD')?'USD/None':k; denomSel.appendChild(o); }});
+
+// Rails state (sorted high→low). Lowest default is 2.5%.
+let rails = [97.5, 90, 75, 50, 25, 2.5];
+
+function sortRails(){{
+  rails = rails
+    .filter(p=>isFinite(p))
+    .map(p=>Math.max(0.1, Math.min(99.9, Number(p))))
+    .filter((p,i,arr)=>arr.indexOf(p)===i)
+    .sort((a,b)=>b-a);
+}}
+function railsText(){{
+  return rails.map(p=>String(p).replace(/\.0$/, '')+'%').join(', ');
+}}
+// Safe id for readout rows (avoid '.' in ids)
+function idFor(p){{ return 'v'+String(p).replace('.', '_'); }}
+
+// Readout rows to match rails (Floor label for 2.5, Ceiling for 97.5)
+function rebuildReadoutRows(){{
+  elRows.innerHTML='';
+  rails.forEach(p=>{{
+    const row=document.createElement('div'); row.className='row';
+    const lab=document.createElement('div');
+    const val=document.createElement('div'); val.className='num'; val.id=idFor(p);
+    const color = colorForPercent(p);
+    const isMid = Math.abs(p-50)<1e-9;
+    const name  = Math.abs(p-2.5)<1e-9 ? 'Floor'
+                 : Math.abs(p-97.5)<1e-9 ? 'Ceiling'
+                 : (p+'%');
+    lab.innerHTML = `<span style="color:${{color}};">${{isMid?'<b>':''}}${{name}}${{isMid?'</b>':''}}</span>`;
+    row.appendChild(lab); row.appendChild(val); row.appendChild(document.createElement('div'));
+    elRows.appendChild(row);
+  }});
+}}
+
+// Editor labels
+function rebuildEditor(){{
+  railItems.innerHTML='';
+  rails.forEach((p,idx)=>{{
+    const row=document.createElement('div'); row.className='rail-row';
+    const color=colorForPercent(p);
+    const labelTxt = Math.abs(p-2.5)<1e-9 ? 'Floor'
+                    : Math.abs(p-97.5)<1e-9 ? 'Ceiling'
+                    : (p+'%');
+    const lab=document.createElement('span'); lab.style.minWidth='48px'; lab.style.color=color; lab.textContent=labelTxt;
+    const inp=document.createElement('input'); inp.type='number'; inp.step='0.1'; inp.min='0.1'; inp.max='99.9'; inp.value=String(p);
+    const rm=document.createElement('button'); rm.textContent='Remove';
+    inp.addEventListener('change',()=>{{ const v=Number(inp.value); rails[idx]=isFinite(v)?v:p; sortRails(); syncAll(); }});
+    rm.addEventListener('click',()=>{{ rails.splice(idx,1); syncAll(); }});
+    row.appendChild(lab); row.appendChild(inp); row.appendChild(rm);
+    railItems.appendChild(row);
+  }});
+  railsListText.textContent = railsText();
+}}
+addBtn.addEventListener('click',()=>{{ const v=Number(addPct.value); if(!isFinite(v)) return; rails.push(v); addPct.value=''; sortRails(); syncAll(); }});
+editBtn.addEventListener('click',()=>{{ railsEditor.classList.toggle('hidden'); railsView.classList.toggle('hidden'); editBtn.textContent = railsEditor.classList.contains('hidden') ? 'Edit Rails' : 'Done'; }});
+
+// Layout sizing
 function applyChartWidthPx(px){{ 
   const v=Math.max(400, Math.min(2400, Number(px)||1100));
   leftCol.style.flex='0 0 auto';
@@ -392,63 +455,7 @@ fitBtn.addEventListener('click',()=>{{
 }});
 if(window.ResizeObserver) new ResizeObserver(()=>{{ if(window.Plotly&&plotDiv) Plotly.Plots.resize(plotDiv); }}).observe(leftCol);
 
-// Denominators
-const denomKeys = Object.keys(PRECOMP);
-const extra = denomKeys.filter(k=>k!=='USD');
-elDenoms.textContent = extra.length ? extra.join(', ') : '(none)';
-['USD', ...extra].forEach(k=>{{ const o=document.createElement('option'); o.value=k; o.textContent=(k==='USD')?'USD/None':k; denomSel.appendChild(o); }});
-
-// Rails state (sorted high→low)
-let rails = [97.5, 90, 75, 50, 25, 20];
-
-function sortRails(){{
-  rails = rails
-    .filter(p=>isFinite(p))
-    .map(p=>Math.max(0.1, Math.min(99.9, Number(p))))
-    .filter((p,i,arr)=>arr.indexOf(p)===i)
-    .sort((a,b)=>b-a);
-}}
-function railsText(){{
-  return rails.map(p=>String(p).replace(/\.0$/, '')+'%').join(', ');
-}}
-// Safe id for readout rows (avoid '.' in ids)
-function idFor(p){{ return 'v'+String(p).replace('.', '_'); }}
-
-// Readout rows to match rails
-function rebuildReadoutRows(){{
-  elRows.innerHTML='';
-  rails.forEach(p=>{{
-    const row=document.createElement('div'); row.className='row';
-    const lab=document.createElement('div');
-    const val=document.createElement('div'); val.className='num'; val.id=idFor(p);
-    const color = colorForPercent(p);
-    const isMid = Math.abs(p-50)<1e-9;
-    lab.innerHTML = `<span style="color:${{color}};">${{isMid?'<b>':''}}${{p}}%${{isMid?'</b>':''}}</span>`;
-    row.appendChild(lab); row.appendChild(val); row.appendChild(document.createElement('div'));
-    elRows.appendChild(row);
-  }});
-}}
-
-// Editor
-function rebuildEditor(){{
-  railItems.innerHTML='';
-  rails.forEach((p,idx)=>{{
-    const row=document.createElement('div'); row.className='rail-row';
-    const color=colorForPercent(p);
-    const lab=document.createElement('span'); lab.style.minWidth='38px'; lab.style.color=color; lab.textContent=p+'%';
-    const inp=document.createElement('input'); inp.type='number'; inp.step='0.1'; inp.min='0.1'; inp.max='99.9'; inp.value=String(p);
-    const rm=document.createElement('button'); rm.textContent='Remove';
-    inp.addEventListener('change',()=>{{ const v=Number(inp.value); rails[idx]=isFinite(v)?v:p; sortRails(); syncAll(); }});
-    rm.addEventListener('click',()=>{{ rails.splice(idx,1); syncAll(); }});
-    row.appendChild(lab); row.appendChild(inp); row.appendChild(rm);
-    railItems.appendChild(row);
-  }});
-  railsListText.textContent = railsText();
-}}
-addBtn.addEventListener('click',()=>{{ const v=Number(addPct.value); if(!isFinite(v)) return; rails.push(v); addPct.value=''; sortRails(); syncAll(); }});
-editBtn.addEventListener('click',()=>{{ railsEditor.classList.toggle('hidden'); railsView.classList.toggle('hidden'); editBtn.textContent = railsEditor.classList.contains('hidden') ? 'Edit Rails' : 'Done'; }});
-
-// Midline + offset helpers
+// Midline + offset helpers (from residual quantiles)
 function logMidline(P){{ const d=P.support; return P.x_grid.map(x=> (d.a0 + d.b*Math.log10(x)) ); }}
 function offsetForPercent(P, percent){{
   const d=P.support;
@@ -458,7 +465,7 @@ function offsetForPercent(P, percent){{
 }}
 function seriesForPercent(P, percent){{
   const logM = logMidline(P); const off = offsetForPercent(P, percent);
-  const eps = (percent>=99.0||percent<=1.0)? EPS_LOG_SPACING : 0.0;
+  const eps = (percent>=97.5 || percent<=2.5) ? EPS_LOG_SPACING : 0.0;
   return logM.map(v=> Math.pow(10, v + off + (percent>=50? eps : -eps)) );
 }}
 
@@ -476,7 +483,7 @@ function renderRails(P){{
       restyle = Object.assign(restyle, {{
         x: [P.x_grid],
         y: [seriesForPercent(P, p)],
-        name: p+'%',
+        name: (Math.abs(p-2.5)<1e-9?'Floor':(Math.abs(p-97.5)<1e-9?'Ceiling':(p+'%'))),
         line: {{color: color, width: width, dash: dash}}
       }});
     }}
@@ -491,12 +498,9 @@ let locked=false, lockedX=null;
 function updatePanel(P,xYears){{
   elDate.textContent=shortDateFromYears(xYears);
 
-  // Use min/max rails for band position (or 20/97.5 if present)
-  const pFloor = rails.find(p=>Math.abs(p-20)<1e-9) ?? Math.min(...rails);
-  const pCeil  = rails.find(p=>Math.abs(p-97.5)<1e-9) ?? Math.max(...rails);
-
-  const floor = interp(P.x_grid, seriesForPercent(P,pFloor), xYears);
-  const ceil  = interp(P.x_grid, seriesForPercent(P,pCeil),  xYears);
+  // p-value measured strictly within 2.5%..97.5% band
+  const floor = interp(P.x_grid, seriesForPercent(P, 2.5),  xYears);
+  const ceil  = interp(P.x_grid, seriesForPercent(P, 97.5), xYears);
 
   rails.forEach(p=>{{
     const v = interp(P.x_grid, seriesForPercent(P,p), xYears);
@@ -504,10 +508,11 @@ function updatePanel(P,xYears){{
     if (el) el.textContent = fmtUSD(v);
   }});
 
-  // snap price to nearest x_main
+  // snap to nearest price point for the main series
   let idx=0,best=1e99; 
   for(let i=0;i<P.x_main.length;i++){{ const d=Math.abs(P.x_main[i]-xYears); if(d<best){{best=d; idx=i;}} }}
   const y=P.y_main[idx]; elMain.textContent=fmtUSD(y);
+
   elP.textContent = `(p≈${{pctWithinLog(y, floor, ceil).toFixed(1)}}%)`;
   Plotly.relayout(plotDiv, {{"yaxis.title.text": P.label}});
 }}
