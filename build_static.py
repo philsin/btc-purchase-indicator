@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
 """
-BTC Purchase Indicator — Years-on-X, Quantile Defaults, Date-Range Anchors
-Midlines at 20%, 50%, 80% (log-space between floor & ceiling)
-
-Key features
+BTC Purchase Indicator — Years-on-X, Independent Midline Fit, Parallel Rails
 - X-axis: log10(years since Genesis).
-- Defaults per denominator: robust q50 slope; residual rails: CEILING=Q97.5%+eps, FLOOR=Q2.5%-eps.
-- Midlines at 20%, 50% (bold), 80% (parallel & straight in log–log).
-- Anchors override via DATE RANGES (two ceiling ranges → max in each; one floor range → min),
-  with floor kept PARALLEL to ceiling.
-- Right panel follows cursor; lock by date; copy chart (clipboard or PNG fallback).
-- BTC line black; y-axis title updates with denominator; odd years after 2026 hidden;
-  x-axis has no title.
+- Midline (50%): robust median (q50) regression on log(price) ~ log(years) — independent of envelope.
+- Auto rails: residual ceiling=floor via quantiles (97.5% / 2.5%) ± epsilon.
+- Date-Ranges rails: ceiling from two ranges (local maxima), floor from one range (local minima),
+  both parallel; midline still from independent fit.
+- 20%/80% rails are 60% of the (log) distance between the midline and floor/ceiling.
+- Color ramp red→green; mobile responsive; legend/panel kept.
 
 Data
-- BTC from data/btc_usd.csv if present; else tries CoinGecko Pro (API key) then Blockchain.com CSV.
+- BTC from data/btc_usd.csv if present; else CoinGecko Pro (API key) then Blockchain.com CSV.
 - Denominators as data/denominator_*.csv (columns: date, price).
 """
 
@@ -38,18 +34,18 @@ BTC_FILE      = os.path.join(DATA_DIR, "btc_usd.csv")
 GENESIS_DATE  = datetime(2009, 1, 3)
 END_PROJ      = datetime(2040, 12, 31)
 
-# Default residual quantiles for Auto rails (per denom)
+# Auto envelope quantiles (residuals around midline)
 CEIL_Q  = 0.975
 FLOOR_Q = 0.025
-EPS_LOG = 0.015  # small pad in log10 units (~3–4%); tune 0.01–0.03
+EPS_LOG = 0.015  # pad in log10 units (~3–4%)
 
-# Colors
-LINE_FLOOR   = "#D32F2F"
-LINE_20      = "#1E88E5"   # 20%
-LINE_50      = "#111111"   # 50% (bold)
-LINE_80      = "#43A047"   # 80%
-LINE_CEILING = "#6A1B9A"
-BTC_COLOR    = "#000000"
+# Colors (red -> green ramp)
+COL_FLOOR   = "#D32F2F"  # red
+COL_20      = "#F57C00"  # orange
+COL_50      = "#FBC02D"  # gold (bold)
+COL_80      = "#66BB6A"  # green
+COL_CEILING = "#2E7D32"  # dark green
+COL_BTC     = "#000000"  # black
 
 # ---------------------------- UTILS -----------------------------
 
@@ -145,9 +141,10 @@ def collect_denominators() -> Dict[str, pd.DataFrame]:
         except Exception as e: print(f"[warn] bad denom {p}: {e}")
     return opts
 
-# ---------------------- ROBUST DEFAULTS (per denom) ------------
+# ---------------------- FITTING / DEFAULTS ----------------------
 
-def robust_slope_q50(x_years: np.ndarray, y_series: np.ndarray):
+def robust_q50_fit(x_years: np.ndarray, y_series: np.ndarray):
+    """Median (q50) regression for midline; returns a0, b, resid, mask."""
     m = (x_years > 0) & (y_series > 0) & np.isfinite(x_years) & np.isfinite(y_series)
     x = np.log10(x_years[m]); y = np.log10(y_series[m])
     X = pd.DataFrame({"const": 1.0, "logx": x})
@@ -161,7 +158,8 @@ def suggest_defaults_for_series(
     dates: pd.Series, x_years: pd.Series, y_series: pd.Series,
     ceil_q=CEIL_Q, floor_q=FLOOR_Q, eps=EPS_LOG, half_window_days=90
 ):
-    a0, b, resid, mask = robust_slope_q50(x_years.values, y_series.values)
+    """Auto defaults: q50 midline; residual quantiles define cF/cC; suggest date windows."""
+    a0, b, resid, mask = robust_q50_fit(x_years.values, y_series.values)
     cC = float(np.nanquantile(resid, ceil_q)) + eps
     cF = float(np.nanquantile(resid, floor_q)) - eps
 
@@ -264,43 +262,43 @@ for k in sorted(denoms.keys()):
     PRECOMP[k] = build_payload(k)
 init = PRECOMP["USD"]
 
-# -------------------------- FIGURE (rails drawn via JS) ----------
+# -------------------------- FIGURE (rails via JS) ---------------
 
 traces=[]
 
-def add_line_on_grid(name, color, width=1.2, dash=None, bold=False):
-    line=dict(width=2.2 if bold else width, color=color)
+def add_line_on_grid(name, color, width=1.3, dash=None, bold=False):
+    line=dict(width=2.4 if bold else width, color=color)
     if dash: line["dash"]=dash
     traces.append(go.Scatter(
         x=init["x_grid"], y=[None]*len(init["x_grid"]), mode="lines", name=name,
         line=line, hoverinfo="skip", showlegend=True
     ))
 
-# Order: Floor, 20%, 50%(bold), 80%, Ceiling
-add_line_on_grid("Floor",   LINE_FLOOR)
-add_line_on_grid("20%",     LINE_20, dash="dot")
-add_line_on_grid("50%",     LINE_50, bold=True)
-add_line_on_grid("80%",     LINE_80, dash="dot")
-add_line_on_grid("Ceiling", LINE_CEILING)
+# Order: Floor, 20%, 50%(bold), 80%, Ceiling (red→green)
+add_line_on_grid("Floor",   COL_FLOOR)
+add_line_on_grid("20%",     COL_20, dash="dot")
+add_line_on_grid("50%",     COL_50, bold=True)
+add_line_on_grid("80%",     COL_80, dash="dot")
+add_line_on_grid("Ceiling", COL_CEILING)
 
 # BTC price (black)
 traces.append(go.Scatter(x=init["x_main"], y=init["y_main"], mode="lines",
-                         name="BTC / USD", line=dict(width=1.9, color=BTC_COLOR),
+                         name="BTC / USD", line=dict(width=1.9, color=COL_BTC),
                          hoverinfo="skip"))
 
-# Transparent cursor trace
+# Transparent cursor line for hover
 traces.append(go.Scatter(
     x=init["x_main"], y=init["y_main"], mode="lines",
     line=dict(width=0), opacity=0.003, hoverinfo="x", showlegend=False, name="_cursor"
 ))
 
-# Compare placeholders (hidden)
+# Hidden compare placeholders (kept for future)
 traces.append(go.Scatter(x=init["x_main"], y=init["main_rebased"], name="Main (rebased)",
-                         mode="lines", hoverinfo="skip", visible=False, line=dict(color=BTC_COLOR)))
+                         mode="lines", hoverinfo="skip", visible=False, line=dict(color=COL_BTC)))
 traces.append(go.Scatter(x=init["x_main"], y=init["denom_rebased"], name="Denominator (rebased)",
                          mode="lines", line=dict(dash="dash"), hoverinfo="skip", visible=False))
 
-# y ticks: 0 then powers of 10 with commas
+# y ticks: 0 then powers of 10 (with commas)
 def make_y_ticks():
     vals=[1e-8] + [10**e for e in range(0, 9)]
     texts=["0"] + [f"{int(10**e):,}" for e in range(0, 9)]
@@ -320,11 +318,13 @@ fig.update_layout(
     margin=dict(l=70, r=520, t=70, b=70),
 )
 
-# ---------------------- HTML + JS (Auto + Date Ranges) ----------
+# ---------------------- HTML + JS (logic & UI) ------------------
 
 ensure_dir(os.path.dirname(OUTPUT_HTML))
-plot_html = fig.to_html(full_html=False, include_plotlyjs="cdn",
-                        config={"displayModeBar": True, "modeBarButtonsToRemove": ["toImage"]})
+plot_html = fig.to_html(
+    full_html=False, include_plotlyjs="cdn",
+    config={"responsive": True, "displayModeBar": True, "modeBarButtonsToRemove": ["toImage"]}
+)
 
 precomp_json = json.dumps(PRECOMP)
 genesis_iso  = GENESIS_DATE.strftime("%Y-%m-%d")
@@ -337,9 +337,11 @@ html_tpl = Template(r"""<!DOCTYPE html>
 <title>BTC Purchase Indicator</title>
 <style>
   :root { --panelW: 520px; }
+  html, body { height: 100%; }
   body { font-family: Inter, Roboto, -apple-system, Segoe UI, Arial, sans-serif; margin: 0; }
-  .layout { display: grid; grid-template-columns: 1fr var(--panelW); height: 100vh; }
+  .layout { display: grid; grid-template-columns: 1fr var(--panelW); min-height: 100vh; width: 100vw; }
   .left { padding: 8px 0 8px 8px; }
+  .left .js-plotly-plot, .left .plotly-graph-div { width: 100% !important; }
   .right { border-left: 1px solid #e5e7eb; padding: 12px; display: flex; flex-direction: column; gap: 12px; overflow:auto; }
 
   #controls, #anchors { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
@@ -354,12 +356,13 @@ html_tpl = Template(r"""<!DOCTYPE html>
   #readout .row { display:grid; grid-template-columns: auto 1fr auto; column-gap:8px; align-items:baseline; }
   #readout .num { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
                   font-variant-numeric: tabular-nums; text-align:right; min-width: 12ch; white-space:pre; }
+
   .hoverlayer { opacity: 0 !important; pointer-events: none; } /* hide default tooltip */
 
   @media (max-width: 900px) {
-    .layout { grid-template-columns: 1fr; height: auto; }
+    .layout { grid-template-columns: 1fr; }
     .right { border-left:none; border-top:1px solid #e5e7eb; }
-    .left .js-plotly-plot { max-width: 100vw; }
+    .left { padding: 8px; }
   }
 </style>
 </head>
@@ -394,12 +397,12 @@ html_tpl = Template(r"""<!DOCTYPE html>
         <div style="font-weight:700; margin:10px 0 4px;">Floor (ONE range; uses LOW):</div>
         <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
           <label>Range: <input type="date" id="fs"/> — <input type="date" id="fe"/></label>
-          <span style="font-size:12px;color:#6b7280;">Floor is parallel to ceiling.</span>
+          <span style="font-size:12px;color:#6b7280;">Floor is parallel to ceiling. (One range = start & end)</span>
         </div>
 
         <div style="display:flex; gap:10px; margin-top:10px;">
           <button id="applyRanges">Apply Date Ranges</button>
-          <span style="font-size:12px;color:#6b7280;">All rails straight & parallel. Midlines: 20% / 50% / 80%.</span>
+          <span style="font-size:12px;color:#6b7280;">All rails straight & parallel. 20%/80% are 60% of distance from midline to outer rails.</span>
         </div>
       </div>
     </fieldset>
@@ -513,19 +516,35 @@ function restyleRails(P){
   Plotly.restyle(plotDiv, {x:[P.x_grid], y:[CURRENT_RAILS.CEILING]}, [4]);
 }
 
+function railsFromMidAndEnvelope(logx, a_mid, b_mid, a_floor=None, a_ceil=None):
+    # Build lines on x_grid using midline + envelope (either quantiles or ranges)
+    logM = [a_mid + b_mid*v for v in logx]
+    if a_floor is None or a_ceil is None:
+        raise ValueError("a_floor and a_ceil required")
+    logF = [a_floor + b_mid*v for v in logx]  # floor parallel to midline slope
+    logC = [a_ceil  + b_mid*v for v in logx]  # ceiling parallel to midline slope
+    # 20/80 are 60% of distance from midline to outer rails (in log space)
+    logP20 = [m - 0.6*(m - f) for m,f in zip(logM, logF)]
+    logP80 = [m + 0.6*(c - m) for m,c in zip(logM, logC)]
+    def exp10(A): return [10**v for v in A]
+    return {
+        "FLOOR":   exp10(logF),
+        "P20":     exp10(logP20),
+        "P50":     exp10(logM),
+        "P80":     exp10(logP80),
+        "CEILING": exp10(logC),
+    }
+
 function railsFromQuantiles(P){
-  const a0 = P.defaults.a0, b = P.defaults.b;
-  const cF = P.defaults.cF, cC = P.defaults.cC;
+  // Independent midline fit from server defaults
+  const aMid = P.defaults.a0, bMid = P.defaults.b;
+  const cF   = P.defaults.cF, cC   = P.defaults.cC;
   const lx = P.x_grid.map(v => Math.log10(v));
-  const logF = lx.map(v => a0 + b*v + cF);
-  const logC = lx.map(v => a0 + b*v + cC);
-  function exp10(arr){ return arr.map(v => Math.pow(10, v)); }
-  const FLOOR   = exp10(logF);
-  const CEILING = exp10(logC);
-  const P20     = logF.map((lf,i)=> Math.pow(10, lf + 0.20*(logC[i]-lf)));
-  const P50     = logF.map((lf,i)=> Math.pow(10, lf + 0.50*(logC[i]-lf)));
-  const P80     = logF.map((lf,i)=> Math.pow(10, lf + 0.80*(logC[i]-lf)));
-  return {FLOOR, P20, P50, P80, CEILING};
+  // Convert residual offsets (cF/cC) to absolute intercepts in log space
+  // floor: a_floor = aMid + cF ; ceiling: a_ceil = aMid + cC
+  const a_floor = aMid + cF;
+  const a_ceil  = aMid + cC;
+  return railsFromMidAndEnvelope(lx, aMid, bMid, a_floor, a_ceil);
 }
 
 function capToRange(iso, startISO, endISO){
@@ -563,22 +582,26 @@ function railsFromRanges(P, c1s, c1e, c2s, c2e, fs, fe){
   // Ceiling from two ranges -> max in each
   const C1 = maxInRange(P.date_iso_main, P.y_main, P.x_main, c1s, c1e);
   const C2 = maxInRange(P.date_iso_main, P.y_main, P.x_main, c2s, c2e);
-  const {a:aC, b} = lineFromTwoPointsLog(C1.x, C1.y, C2.x, C2.y);
+  const {a:aC, b:bC} = lineFromTwoPointsLog(C1.x, C1.y, C2.x, C2.y);
 
-  // Floor from one range -> min; floor parallel to ceiling
+  // Floor from one range -> min; floor parallel to ceiling slope
   const F0 = minInRange(P.date_iso_main, P.y_main, P.x_main, fs, fe);
-  const aF = Math.log10(F0.y) - b*Math.log10(F0.x);
+  const aF = Math.log10(F0.y) - bC*Math.log10(F0.x);
 
+  // Midline: independent server-side median fit (aMid,bMid)
+  const aMid = P.defaults.a0, bMid = P.defaults.b;
+
+  // Build rails on x_grid using independent midline + parallel outer rails (slope = bC for envelope)
   const lx = P.x_grid.map(v => Math.log10(v));
-  const logF = lx.map(v => aF + b*v);
-  const logC = lx.map(v => aC + b*v);
-  function exp10(arr){ return arr.map(v => Math.pow(10, v)); }
-  const FLOOR   = exp10(logF);
-  const CEILING = exp10(logC);
-  const P20     = logF.map((lf,i)=> Math.pow(10, lf + 0.20*(logC[i]-lf)));
-  const P50     = logF.map((lf,i)=> Math.pow(10, lf + 0.50*(logC[i]-lf)));
-  const P80     = logF.map((lf,i)=> Math.pow(10, lf + 0.80*(logC[i]-lf)));
-  return {FLOOR, P20, P50, P80, CEILING};
+  // compute with envelope slope bC but midline slope bMid
+  // floor/ceiling are with slope bC; midline with bMid
+  const logM = lx.map(v => aMid + bMid*v);
+  const logF = lx.map(v => aF   + bC *v);
+  const logC = lx.map(v => aC   + bC *v);
+  const logP20 = logM.map((m,i)=> m - 0.6*(m - logF[i]));
+  const logP80 = logM.map((m,i)=> m + 0.6*(logC[i] - m));
+  function exp10(A){ return A.map(v => Math.pow(10, v)); }
+  return {FLOOR:exp10(logF), P20:exp10(logP20), P50:exp10(logM), P80:exp10(logP80), CEILING:exp10(logC)};
 }
 
 function prefillRangesForDenom(P){
@@ -677,8 +700,8 @@ document.addEventListener('DOMContentLoaded', function(){
 html = html_tpl.safe_substitute(
     PLOT_HTML=plot_html,
     PRECOMP_JSON=precomp_json,
-    GENESIS_ISO=GENESIS_DATE.strftime("%Y-%m-%d"),
-    COL_F=LINE_FLOOR, COL_20=LINE_20, COL_50=LINE_50, COL_80=LINE_80, COL_C=LINE_CEILING,
+    GENESIS_ISO=genesis_iso,
+    COL_F=COL_FLOOR, COL_20=COL_20, COL_50=COL_50, COL_80=COL_80, COL_C=COL_CEILING,
 )
 
 with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
