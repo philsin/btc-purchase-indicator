@@ -6,7 +6,9 @@ BTC Purchase Indicator — dynamic percentile rails with an editable dashboard.
 Adds GOLD (XAUUSD) and S&P 500 (SPX) denominators (auto-fetched if missing).
 - USD view shows $.
 - GOLD/SPX views show BTC-per-unit ratios (no $).
-- p≈ value and “BTC Price” update with the selected denominator.
+- p≈ value and “BTC Price / Ratio” update with the selected denominator.
+- Title shows indicator status derived from p≈.
+- Click/tap on the chart to place a date/value annotation just above the BTC line.
 
 Generates docs/index.html from data in ./data:
 - data/btc_usd.csv (optional; otherwise fetched from Blockchain.info)
@@ -97,7 +99,7 @@ def ensure_auto_denominators():
     os.makedirs(DATA_DIR, exist_ok=True)
     for key, info in AUTO_DENOMS.items():
         path = info["path"]
-        if os.path.exists(path):  # already have it
+        if os.path.exists(path):
             continue
         try:
             if info["parser"] == "stooq":
@@ -147,7 +149,6 @@ def build_support_for_dynamic_rails(x_years, y_vals):
       - a0, b: midline parameters for log10(y) = a0 + b*log10(xyears)
       - q_grid: dense percentile grid in [0.001..0.999]
       - off_grid: quantile(resid, q_grid) - median(resid)
-    offset(50%) == 0, <50% negative, >50% positive.
     """
     a0, b, resid = quantile_fit_loglog(x_years, y_vals, q=0.5)
     r = np.copy(resid)
@@ -215,26 +216,23 @@ xtickvals, xticktext = year_ticks_log(first_dt, max_dt)
 ytickvals, yticktext = y_ticks()
 
 def series_for_denom(df, key):
-    """Return series and label."""
+    """Return series, label, unit, decimals."""
     if not key or key.lower() in ("usd", "none"):
-        return df["btc"], "BTC / USD", "$", 2  # unit symbol, decimals for USD
+        return df["btc"], "BTC / USD", "$", 2
     k = key.lower()
     if k in df.columns:
-        # BTC divided by denominator price -> BTC per unit of denom
         return df["btc"]/df[k], f"BTC / {key.upper()}", "", 6
     return df["btc"], "BTC / USD", "$", 2
 
 def build_payload(df, denom_key=None):
-    # Build series for this denom
     y, label, unit, decimals = series_for_denom(df, denom_key)
 
-    # Keep only overlapping finite rows so we don't propagate NaNs
+    # finite overlap only
     mask = np.isfinite(df["x_years"].values) & np.isfinite(y.values)
     xs = df["x_years"].values[mask]
     ys = y.values[mask]
     dates = df["date_iso"].values[mask]
 
-    # Support for dynamic rails from the filtered slice
     support = build_support_for_dynamic_rails(xs, ys)
 
     return {
@@ -283,7 +281,7 @@ fig.update_layout(
     template="plotly_white",
     hovermode="x unified",
     showlegend=True,
-    title="BTC Purchase Indicator — Rails",
+    title="BTC Purchase Indicator — ",
     xaxis=dict(type="log", title=None, tickmode="array",
                tickvals=xtickvals, ticktext=xticktext,
                range=[np.log10(x_min), np.log10(x_max)], showspikes=False),
@@ -404,7 +402,6 @@ function fmtVal(P, v){{
   if (P.unit === '$') {{
     return '$'+Number(v).toLocaleString(undefined, {{minimumFractionDigits: dec, maximumFractionDigits: dec}});
   }} else {{
-    // ratios can be tiny; give more precision by default
     const maxd = Math.max(dec, 6);
     return Number(v).toLocaleString(undefined, {{minimumFractionDigits: Math.min(6, maxd), maximumFractionDigits: maxd}});
   }}
@@ -428,6 +425,17 @@ function colorForPercent(p){{
     const b=0x2D + (0x32-0x2D)*u;
     return toHex(r,g,b);
   }}
+}}
+
+// Indicator label from percentile
+function indicatorFromP(p){{
+  if (p < 2.5) return 'SELL THE HOUSE';
+  if (p < 25)  return 'Strong Buy';
+  if (p < 50)  return 'Buy';
+  if (p < 75)  return 'DCA';
+  if (p < 90)  return 'Hold On';
+  if (p <= 97.5) return 'Frothy';
+  return 'Top Inbound';
 }}
 
 // DOM handles
@@ -455,7 +463,7 @@ const railItems=document.getElementById('railItems');
 const addPct=document.getElementById('addPct');
 const addBtn=document.getElementById('addBtn');
 
-// Denominators list
+// Denominators list (USD labeled with /None as requested)
 const denomKeys = Object.keys(PRECOMP);
 const extra = denomKeys.filter(k=>k!=='USD');
 elDenoms.textContent = extra.length ? extra.join(', ') : '(none)';
@@ -572,6 +580,12 @@ function renderRails(P){{
 }}
 
 let locked=false, lockedX=null;
+let clickAnnotation=null; // holds the single click/tap annotation
+
+function setTitleForP(p){{
+  const label = indicatorFromP(p);
+  Plotly.relayout(plotDiv, {{'title.text': 'BTC Purchase Indicator — ' + label}});
+}}
 
 function updatePanel(P,xYears){{
   elDate.textContent=shortDateFromYears(xYears);
@@ -586,8 +600,6 @@ function updatePanel(P,xYears){{
   for(let i=0;i<P.x_main.length;i++){{ const d=Math.abs(P.x_main[i]-xYears); if(d<best){{best=d; idx=i;}} }}
   const y=P.y_main[idx];
   elMain.textContent = fmtVal(P, y);
-
-  // Label adjusts with unit
   elMainLabel.textContent = (P.unit==='$' ? 'BTC Price:' : 'BTC Ratio:');
 
   // Empirical percentile via residual CDF
@@ -599,9 +611,37 @@ function updatePanel(P,xYears){{
   const q    = percentFromOffset(P, off);  // 0..1
   const pVal = Math.max(0, Math.min(100, 100*q));
   elP.textContent = `(p≈${{pVal.toFixed(1)}}%)`;
+  setTitleForP(pVal);
 
   Plotly.relayout(plotDiv, {{"yaxis.title.text": P.label}});
 }}
+
+// Click/tap -> place annotation above BTC line with short date + value
+plotDiv.on('plotly_click', ev=>{{
+  if(!(ev.points && ev.points.length)) return;
+  const xYears = ev.points[0].x;
+  const P = PRECOMP[denomSel.value];
+
+  // nearest y on main series
+  let idx=0,best=1e99; 
+  for(let i=0;i<P.x_main.length;i++){{ const d=Math.abs(P.x_main[i]-xYears); if(d<best){{best=d; idx=i;}} }}
+  const y = P.y_main[idx];
+
+  // position a bit above (log space -> multiply)
+  const yAbove = y * 1.2;
+
+  const text = shortDateFromYears(xYears) + "<br>" + fmtVal(P, y);
+
+  const ann = {{
+    x: xYears, y: yAbove, xref:'x', yref:'y',
+    text: text, showarrow: true, arrowhead: 2, ax: 0, ay: -20,
+    bgcolor: 'rgba(255,255,255,0.95)', bordercolor: '#94a3b8',
+    font: {{size: 12}}
+  }};
+
+  clickAnnotation = ann;
+  Plotly.relayout(plotDiv, {{annotations: [ann]}});
+}});
 
 // Hover & controls
 plotDiv.on('plotly_hover', ev=>{{ if(ev.points && ev.points.length && !locked) updatePanel(PRECOMP[denomSel.value], ev.points[0].x); }});
@@ -622,7 +662,10 @@ denomSel.onchange = ()=>{{
   // Main series + cursor
   Plotly.restyle(plotDiv, {{x:[P.x_main], y:[P.y_main], name:[P.label]}}, [{MAX_RAIL_SLOTS}]);
   Plotly.restyle(plotDiv, {{x:[P.x_main], y:[P.y_main]}},              [{MAX_RAIL_SLOTS}+1]);
-  // Rails & panel
+  // Clear previous annotation (scale changed)
+  Plotly.relayout(plotDiv, {{annotations: []}});
+  clickAnnotation = null;
+
   renderRails(P);
   updatePanel(P,(typeof lockedX==='number')?lockedX:P.x_main[P.x_main.length-1]);
 }};
@@ -637,6 +680,7 @@ function syncAll(){{
 }}
 
 // Init
+// USD should display in menu as "USD/None"
 denomSel.value='USD';
 applyChartWidthPx(document.getElementById('chartWpx').value);
 rebuildReadoutRows();
