@@ -3,16 +3,10 @@
 """
 BTC Purchase Indicator — dynamic percentile rails with an editable dashboard.
 
-Adds GOLD (XAUUSD) and S&P 500 (SPX) denominators (auto-fetched if missing).
-- USD view shows $.
-- GOLD/SPX views show BTC-per-unit ratios (no $).
-- p≈ value and “BTC Price / Ratio” update with the selected denominator.
-- Title shows indicator status derived from p≈.
-- Click/tap on the chart to place a date/value annotation just above the BTC line.
-
-Generates docs/index.html from data in ./data:
-- data/btc_usd.csv (optional; otherwise fetched from Blockchain.info)
-- data/denominator_*.csv (optional denominators; columns: date,price)
+- USD, GOLD (XAUUSD), SPX denominators (GOLD/SPX auto-fetched from Stooq if missing)
+- Tap/click to drop a two-line annotation (short date + value) above the BTC line
+- Title shows indicator label based on p≈ (percentile) bands
+- Copy Chart grabs the CURRENT zoom/pan view and copies to clipboard
 """
 
 import os, io, glob, json
@@ -31,25 +25,18 @@ BTC_FILE     = os.path.join(DATA_DIR, "btc_usd.csv")
 OUTPUT_HTML  = "docs/index.html"
 
 GENESIS_DATE = datetime(2009, 1, 3)
-END_PROJ     = datetime(2040, 12, 31)      # fixed horizon
-X_START_DATE = datetime(2011, 1, 1)        # force chart start
+END_PROJ     = datetime(2040, 12, 31)
+X_START_DATE = datetime(2011, 1, 1)
 
-RESID_WINSOR     = 0.02   # clip 2% tails
-EPS_LOG_SPACING  = 0.010  # tiny spacing for extreme rails
+RESID_WINSOR     = 0.02
+EPS_LOG_SPACING  = 0.010
 COL_BTC          = "#000000"
 
-# Built-in denominator targets to auto-fetch if missing (Stooq CSVs)
 AUTO_DENOMS = {
-    "GOLD": {
-        "path": os.path.join(DATA_DIR, "denominator_gold.csv"),
-        "url":  "https://stooq.com/q/d/l/?s=xauusd&i=d",   # XAUUSD Close
-        "parser": "stooq"
-    },
-    "SPX": {
-        "path": os.path.join(DATA_DIR, "denominator_spx.csv"),
-        "url":  "https://stooq.com/q/d/l/?s=%5Espx&i=d",   # ^spx Close
-        "parser": "stooq"
-    },
+    "GOLD": {"path": os.path.join(DATA_DIR, "denominator_gold.csv"),
+             "url":  "https://stooq.com/q/d/l/?s=xauusd&i=d", "parser":"stooq"},
+    "SPX":  {"path": os.path.join(DATA_DIR, "denominator_spx.csv"),
+             "url":  "https://stooq.com/q/d/l/?s=%5Espx&i=d", "parser":"stooq"},
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -58,14 +45,13 @@ AUTO_DENOMS = {
 def years_since_genesis(dates):
     d = pd.to_datetime(dates)
     delta_days = (d - GENESIS_DATE) / np.timedelta64(1, "D")
-    return (delta_days.astype(float) / 365.25) + (1.0/365.25)  # +1 day => log(x)>0
+    return (delta_days.astype(float) / 365.25) + (1.0/365.25)
 
 def fetch_btc_csv() -> pd.DataFrame:
     os.makedirs(DATA_DIR, exist_ok=True)
     if os.path.exists(BTC_FILE):
         df = pd.read_csv(BTC_FILE, parse_dates=["date"])
         return df.sort_values("date").dropna()
-
     url = "https://api.blockchain.info/charts/market-price?timespan=all&format=csv&sampled=false"
     r = requests.get(url, timeout=30); r.raise_for_status()
     raw = r.text.strip()
@@ -83,55 +69,43 @@ def fetch_btc_csv() -> pd.DataFrame:
     return df
 
 def _fetch_stooq_csv(url: str) -> pd.DataFrame:
-    """Fetch a Stooq daily CSV and return DataFrame(date, price=Close)."""
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
+    r = requests.get(url, timeout=30); r.raise_for_status()
     df = pd.read_csv(io.StringIO(r.text))
     if "Date" not in df.columns or "Close" not in df.columns or df.empty:
         raise ValueError("stooq returned no data")
     out = df[["Date","Close"]].rename(columns={"Date":"date","Close":"price"})
     out["date"] = pd.to_datetime(out["date"], errors="coerce")
     out["price"] = pd.to_numeric(out["price"], errors="coerce")
-    out = out.sort_values("date").dropna()
-    return out
+    return out.sort_values("date").dropna()
 
 def ensure_auto_denominators():
     os.makedirs(DATA_DIR, exist_ok=True)
     for key, info in AUTO_DENOMS.items():
-        path = info["path"]
-        if os.path.exists(path):
-            continue
+        if os.path.exists(info["path"]): continue
         try:
-            if info["parser"] == "stooq":
-                df = _fetch_stooq_csv(info["url"])
-            else:
-                continue
-            df.to_csv(path, index=False)
-            print(f"[auto-denom] wrote {path} ({len(df)} rows)")
+            df = _fetch_stooq_csv(info["url"]) if info["parser"]=="stooq" else None
+            if df is not None: df.to_csv(info["path"], index=False)
+            print(f"[auto-denom] wrote {info['path']}")
         except Exception as e:
-            print(f"[warn] could not fetch {key} from {info['url']}: {e}")
+            print(f"[warn] could not fetch {key}: {e}")
 
 def load_denominators():
-    """Return { KEY: DataFrame(date, price) } for ./data/denominator_*.csv."""
     ensure_auto_denominators()
     out={}
     for p in glob.glob(os.path.join(DATA_DIR, "denominator_*.csv")):
         key = os.path.splitext(os.path.basename(p))[0].replace("denominator_","").upper()
         try:
             df = pd.read_csv(p, parse_dates=["date"])
-            if len(df.columns) < 2:
-                continue
             price_col = [c for c in df.columns if c.lower()!="date"][0]
             df = df.rename(columns={price_col:"price"})[["date","price"]]
             df["price"] = pd.to_numeric(df["price"], errors="coerce")
-            df = df.sort_values("date").dropna()
-            out[key]=df
+            out[key]=df.sort_values("date").dropna()
         except Exception as e:
             print(f"[warn] skip {p}: {e}")
     return out
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Fit support for dynamic rails
+# Fitting / rails support
 # ──────────────────────────────────────────────────────────────────────────────
 def quantile_fit_loglog(x_years, y_vals, q=0.5):
     x_years = np.asarray(x_years); y_vals = np.asarray(y_vals)
@@ -144,37 +118,27 @@ def quantile_fit_loglog(x_years, y_vals, q=0.5):
     return a0, b, resid
 
 def build_support_for_dynamic_rails(x_years, y_vals):
-    """
-    Provide everything JS needs to draw any percentile rail via interpolation:
-      - a0, b: midline parameters for log10(y) = a0 + b*log10(xyears)
-      - q_grid: dense percentile grid in [0.001..0.999]
-      - off_grid: quantile(resid, q_grid) - median(resid)
-    """
     a0, b, resid = quantile_fit_loglog(x_years, y_vals, q=0.5)
     r = np.copy(resid)
     if RESID_WINSOR:
         lo, hi = np.nanquantile(r, RESID_WINSOR), np.nanquantile(r, 1-RESID_WINSOR)
         r = np.clip(r, lo, hi)
-
     med = float(np.nanmedian(r))
     q_grid = np.linspace(0.001, 0.999, 999)
     rq = np.quantile(r, q_grid)
     off_grid = rq - med
-    # keep extremes from touching midline on far extrapolation
     off_grid[0]  -= EPS_LOG_SPACING
     off_grid[-1] += EPS_LOG_SPACING
-
     return {"a0":a0, "b":b,
             "q_grid":[float(q) for q in q_grid],
             "off_grid":[float(v) for v in off_grid]}
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Ticks
+# Axis ticks
 # ──────────────────────────────────────────────────────────────────────────────
 def year_ticks_log(first_dt, last_dt):
     vals, labs = [], []
-    y0, y1 = first_dt.year, last_dt.year
-    for y in range(y0, y1+1):
+    for y in range(first_dt.year, last_dt.year+1):
         d = datetime(y,1,1)
         if d < first_dt or d > last_dt: continue
         vy = float(years_since_genesis(pd.Series([d])).iloc[0])
@@ -190,12 +154,11 @@ def y_ticks():
     return vals, labs
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Build data model
+# Build model
 # ──────────────────────────────────────────────────────────────────────────────
 btc = fetch_btc_csv().rename(columns={"price":"btc"})
 denoms = load_denominators()
 
-# Merge denominators into base
 base = btc.sort_values("date").reset_index(drop=True)
 for key, df in denoms.items():
     base = base.merge(df.rename(columns={"price": key.lower()}), on="date", how="left")
@@ -203,11 +166,9 @@ for key, df in denoms.items():
 base["x_years"]   = years_since_genesis(base["date"])
 base["date_iso"]  = base["date"].dt.strftime("%Y-%m-%d")
 
-# Horizon
 first_dt = max(base["date"].iloc[0], X_START_DATE)
 max_dt   = END_PROJ
 
-# x_grid to horizon
 x_start = float(years_since_genesis(pd.Series([first_dt])).iloc[0])
 x_end   = float(years_since_genesis(pd.Series([max_dt])).iloc[0])
 x_grid  = np.logspace(np.log10(max(1e-6, x_start)), np.log10(x_end), 700)
@@ -216,7 +177,6 @@ xtickvals, xticktext = year_ticks_log(first_dt, max_dt)
 ytickvals, yticktext = y_ticks()
 
 def series_for_denom(df, key):
-    """Return series, label, unit, decimals."""
     if not key or key.lower() in ("usd", "none"):
         return df["btc"], "BTC / USD", "$", 2
     k = key.lower()
@@ -226,57 +186,45 @@ def series_for_denom(df, key):
 
 def build_payload(df, denom_key=None):
     y, label, unit, decimals = series_for_denom(df, denom_key)
-
-    # finite overlap only
     mask = np.isfinite(df["x_years"].values) & np.isfinite(y.values)
     xs = df["x_years"].values[mask]
     ys = y.values[mask]
     dates = df["date_iso"].values[mask]
-
     support = build_support_for_dynamic_rails(xs, ys)
-
     return {
-        "label": label,
-        "unit": unit,               # "$" for USD else ""
-        "decimals": decimals,       # 2 for USD; 6 for ratios
-        "x_main": xs.tolist(),
-        "y_main": ys.tolist(),
-        "date_iso_main": dates.tolist(),
-        "x_grid": x_grid.tolist(),
+        "label": label, "unit": unit, "decimals": decimals,
+        "x_main": xs.tolist(), "y_main": ys.tolist(),
+        "date_iso_main": dates.tolist(), "x_grid": x_grid.tolist(),
         "support": support
     }
 
 PRECOMP = {"USD": build_payload(base, None)}
 for k in sorted(denoms.keys()):
     PRECOMP[k] = build_payload(base, k)
-
 P0 = PRECOMP["USD"]
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Figure with pre-allocated rail slots
+# Base figure
 # ──────────────────────────────────────────────────────────────────────────────
 MAX_RAIL_SLOTS = 12
 
 def add_stub(idx):
-    return go.Scatter(
-        x=P0["x_grid"], y=[None]*len(P0["x_grid"]), mode="lines",
-        name=f"Rail {idx+1}", line=dict(width=1.6, color="#999"),
-        visible=False, hoverinfo="skip"
-    )
+    return go.Scatter(x=P0["x_grid"], y=[None]*len(P0["x_grid"]), mode="lines",
+                      name=f"Rail {idx+1}", line=dict(width=1.6, color="#999"),
+                      visible=False, hoverinfo="skip")
 
 traces = [add_stub(i) for i in range(MAX_RAIL_SLOTS)]
+# BTC visible line
 traces += [
     go.Scatter(x=P0["x_main"], y=P0["y_main"], mode="lines",
                name="BTC / USD", line=dict(color=COL_BTC,width=2.0), hoverinfo="skip"),
+    # Click-catcher trace: wide, ultra-transparent, sits on top of BTC line to catch taps
     go.Scatter(x=P0["x_main"], y=P0["y_main"], mode="lines",
-               line=dict(width=0), opacity=0.003, hoverinfo="x", showlegend=False, name="_cursor")
+               name="_click", showlegend=False, hoverinfo="skip",
+               line=dict(width=18, color="rgba(0,0,0,0.001)")),
 ]
 
 fig = go.Figure(traces)
-
-x_min = float(years_since_genesis(pd.Series([first_dt])).iloc[0])
-x_max = float(years_since_genesis(pd.Series([max_dt])).iloc[0])
-
 fig.update_layout(
     template="plotly_white",
     hovermode="x unified",
@@ -284,7 +232,7 @@ fig.update_layout(
     title="BTC Purchase Indicator — ",
     xaxis=dict(type="log", title=None, tickmode="array",
                tickvals=xtickvals, ticktext=xticktext,
-               range=[np.log10(x_min), np.log10(x_max)], showspikes=False),
+               range=[np.log10(x_start), np.log10(x_end)], showspikes=False),
     yaxis=dict(type="log", title=P0["label"],
                tickmode="array", tickvals=ytickvals, ticktext=yticktext),
     legend=dict(x=1.02, xanchor="left", y=1.0, yanchor="top"),
@@ -342,7 +290,6 @@ legend{{padding:0 6px;color:#374151;font-weight:600;font-size:13px}}
       <select id="denomSel"></select>
       <input type="date" id="datePick"/>
       <button id="setDateBtn">Set Date</button>
-      <button id="liveBtn">Live Hover</button>
       <button id="copyBtn">Copy Chart</button>
     </div>
 
@@ -395,7 +342,7 @@ function interp(xs, ys, x){{ let lo=0,hi=xs.length-1; if(x<=xs[0]) return ys[0];
   while(hi-lo>1){{ const m=(hi+lo)>>1; if(xs[m]<=x) lo=m; else hi=m; }}
   const t=(x-xs[lo])/(xs[hi]-xs[lo]); return ys[lo]+t*(ys[hi]-ys[lo]); }}
 
-// Unit-aware number formatting
+// Units
 function fmtVal(P, v){{
   if(!isFinite(v)) return '—';
   const dec = Math.max(0, Math.min(10, P.decimals||2));
@@ -407,27 +354,13 @@ function fmtVal(P, v){{
   }}
 }}
 
-// Smooth red→yellow→green by percentile (0..100)
-function colorForPercent(p){{
-  const t = Math.max(0, Math.min(1, p/100));
-  function hex(c){{ return Math.max(0, Math.min(255, Math.round(c))); }}
-  function toHex(r,g,b){{ return '#' + [r,g,b].map(v=>hex(v).toString(16).padStart(2,'0')).join(''); }}
-  if (t<=0.5) {{
-    const u=t/0.5;
-    const r=0xD3 + (0xFB-0xD3)*u;
-    const g=0x2F + (0xC0-0x2F)*u;
-    const b=0x2F + (0x2D-0x2F)*u;
-    return toHex(r,g,b);
-  }} else {{
-    const u=(t-0.5)/0.5;
-    const r=0xFB + (0x2E-0xFB)*u;
-    const g=0xC0 + (0x7D-0xC0)*u;
-    const b=0x2D + (0x32-0x2D)*u;
-    return toHex(r,g,b);
-  }}
+// Color scale and indicator
+function colorForPercent(p){{ const t=Math.max(0,Math.min(1,p/100));
+  function hx(v){{return Math.max(0,Math.min(255,Math.round(v)));}}
+  function toHex(r,g,b){{return '#'+[r,g,b].map(v=>hx(v).toString(16).padStart(2,'0')).join('');}}
+  if(t<=0.5){{const u=t/0.5;return toHex(0xD3+(0xFB-0xD3)*u,0x2F+(0xC0-0x2F)*u,0x2F+(0x2D-0x2F)*u);}}
+  const u=(t-0.5)/0.5; return toHex(0xFB+(0x2E-0xFB)*u,0xC0+(0x7D-0xC0)*u,0x2D+(0x32-0x2D)*u);
 }}
-
-// Indicator label from percentile
 function indicatorFromP(p){{
   if (p < 2.5) return 'SELL THE HOUSE';
   if (p < 25)  return 'Strong Buy';
@@ -438,13 +371,12 @@ function indicatorFromP(p){{
   return 'Top Inbound';
 }}
 
-// DOM handles
+// DOM
 const leftCol=document.getElementById('leftCol');
 const plotDiv=document.querySelector('.left .js-plotly-plot') || document.querySelector('.left .plotly-graph-div');
 const denomSel=document.getElementById('denomSel');
 const datePick=document.getElementById('datePick');
 const setBtn=document.getElementById('setDateBtn');
-const liveBtn=document.getElementById('liveBtn');
 const copyBtn=document.getElementById('copyBtn');
 const fitBtn=document.getElementById('fitBtn');
 const elDenoms=document.getElementById('denomsDetected');
@@ -463,228 +395,181 @@ const railItems=document.getElementById('railItems');
 const addPct=document.getElementById('addPct');
 const addBtn=document.getElementById('addBtn');
 
-// Denominators list (USD labeled with /None as requested)
+// Denominator dropdown: show USD label as "USD"
 const denomKeys = Object.keys(PRECOMP);
 const extra = denomKeys.filter(k=>k!=='USD');
-elDenoms.textContent = extra.length ? extra.join(', ') : '(none)';
-['USD', ...extra].forEach(k=>{{ const o=document.createElement('option'); o.value=k; o.textContent=(k==='USD')?'USD/None':k; denomSel.appendChild(o); }});
+['USD', ...extra].forEach(k=>{ const o=document.createElement('option'); o.value=k; o.textContent=(k==='USD')?'USD':k; denomSel.appendChild(o); });
+document.getElementById('denomsDetected').textContent = extra.length ? extra.join(', ') : '(none)';
 
-// Rails state (sorted high→low). Lowest default is 2.5%.
+// Rails state
 let rails = [97.5, 90, 75, 50, 25, 2.5];
-function sortRails(){{
-  rails = rails.filter(p=>isFinite(p)).map(Number)
-               .map(p=>Math.max(0.1, Math.min(99.9, p)))
-               .filter((p,i,a)=>a.indexOf(p)===i)
-               .sort((a,b)=>b-a);
-}}
-function railsText(){{
-  return rails.map(p=>String(p).replace(/\.0$/, '')+'%').join(', ');
-}}
-function idFor(p){{ return 'v'+String(p).replace('.', '_'); }}
+function sortRails(){ rails = rails.filter(p=>isFinite(p)).map(Number).map(p=>Math.max(0.1,Math.min(99.9,p))).filter((p,i,a)=>a.indexOf(p)===i).sort((a,b)=>b-a); }
+function railsText(){ return rails.map(p=>String(p).replace(/\.0$/,'')+'%').join(', '); }
+function idFor(p){ return 'v'+String(p).replace('.','_'); }
 
-function rebuildReadoutRows(){{
+function rebuildReadoutRows(){
   elRows.innerHTML='';
-  rails.forEach(p=>{{
+  rails.forEach(p=>{
     const row=document.createElement('div'); row.className='row';
     const lab=document.createElement('div');
     const val=document.createElement('div'); val.className='num'; val.id=idFor(p);
-    const color = colorForPercent(p);
-    const isMid = Math.abs(p-50)<1e-9;
-    const name  = Math.abs(p-2.5)<1e-9 ? 'Floor'
-                 : Math.abs(p-97.5)<1e-9 ? 'Ceiling'
-                 : (p+'%');
-    lab.innerHTML = `<span style="color:${{color}};">${{isMid?'<b>':''}}${{name}}${{isMid?'</b>':''}}</span>`;
+    const color=colorForPercent(p);
+    const isMid=Math.abs(p-50)<1e-9;
+    const name=Math.abs(p-2.5)<1e-9?'Floor':Math.abs(p-97.5)<1e-9?'Ceiling':(p+'%');
+    lab.innerHTML=`<span style="color:${color};">${isMid?'<b>':''}${name}${isMid?'</b>':''}</span>`;
     row.appendChild(lab); row.appendChild(val); row.appendChild(document.createElement('div'));
     elRows.appendChild(row);
-  }});
-}}
-
-function rebuildEditor(){{
+  });
+}
+function rebuildEditor(){
   railItems.innerHTML='';
-  rails.forEach((p,idx)=>{{
+  rails.forEach((p,idx)=>{
     const row=document.createElement('div'); row.className='rail-row';
     const color=colorForPercent(p);
-    const labelTxt = Math.abs(p-2.5)<1e-9 ? 'Floor'
-                    : Math.abs(p-97.5)<1e-9 ? 'Ceiling'
-                    : (p+'%');
+    const labelTxt=Math.abs(p-2.5)<1e-9?'Floor':Math.abs(p-97.5)<1e-9?'Ceiling':(p+'%');
     const lab=document.createElement('span'); lab.style.minWidth='48px'; lab.style.color=color; lab.textContent=labelTxt;
     const inp=document.createElement('input'); inp.type='number'; inp.step='0.1'; inp.min='0.1'; inp.max='99.9'; inp.value=String(p);
     const rm=document.createElement('button'); rm.textContent='Remove';
-    inp.addEventListener('change',()=>{{ const v=Number(inp.value); rails[idx]=isFinite(v)?v:p; sortRails(); syncAll(); }});
-    rm.addEventListener('click',()=>{{ rails.splice(idx,1); syncAll(); }});
-    row.appendChild(lab); row.appendChild(inp); row.appendChild(rm);
-    railItems.appendChild(row);
-  }});
-  railsListText.textContent = railsText();
-}}
-addBtn.addEventListener('click',()=>{{ const v=Number(addPct.value); if(!isFinite(v)) return; rails.push(v); addPct.value=''; sortRails(); syncAll(); }});
-editBtn.addEventListener('click',()=>{{ railsEditor.classList.toggle('hidden'); railsView.classList.toggle('hidden'); editBtn.textContent = railsEditor.classList.contains('hidden') ? 'Edit Rails' : 'Done'; }});
+    inp.addEventListener('change',()=>{ const v=Number(inp.value); rails[idx]=isFinite(v)?v:p; sortRails(); syncAll(); });
+    rm.addEventListener('click',()=>{ rails.splice(idx,1); syncAll(); });
+    row.appendChild(lab); row.appendChild(inp); row.appendChild(rm); railItems.appendChild(row);
+  });
+  railsListText.textContent=railsText();
+}
+addBtn.addEventListener('click',()=>{ const v=Number(addPct.value); if(!isFinite(v)) return; rails.push(v); addPct.value=''; sortRails(); syncAll(); });
+editBtn.addEventListener('click',()=>{ railsEditor.classList.toggle('hidden'); railsView.classList.toggle('hidden'); editBtn.textContent = railsEditor.classList.contains('hidden') ? 'Edit Rails' : 'Done'; });
 
-// Layout sizing
-function applyChartWidthPx(px){{
+// Sizing
+function applyChartWidthPx(px){
   const v=Math.max(400, Math.min(2400, Number(px)||1100));
-  leftCol.style.flex='0 0 auto';
-  leftCol.style.width=v+'px';
+  leftCol.style.flex='0 0 auto'; leftCol.style.width=v+'px';
   if(window.Plotly&&plotDiv) Plotly.Plots.resize(plotDiv);
-}}
+}
 chartWpx.addEventListener('change',()=>applyChartWidthPx(chartWpx.value));
-fitBtn.addEventListener('click',()=>{{
-  const total=document.documentElement.clientWidth || window.innerWidth;
-  const panel=420; const pad=32; 
-  const target=Math.max(400, total - panel - pad);
-  chartWpx.value=target; applyChartWidthPx(target);
-}});
-if(window.ResizeObserver) new ResizeObserver(()=>{{ if(window.Plotly&&plotDiv) Plotly.Plots.resize(plotDiv); }}).observe(leftCol);
+fitBtn.addEventListener('click',()=>{
+  const total=document.documentElement.clientWidth||window.innerWidth, panel=420, pad=32;
+  const target=Math.max(400, total-panel-pad); chartWpx.value=target; applyChartWidthPx(target);
+});
+if(window.ResizeObserver) new ResizeObserver(()=>{ if(window.Plotly&&plotDiv) Plotly.Plots.resize(plotDiv); }).observe(leftCol);
 
-// Midline + offsets from residual quantiles
-function logMidline(P){{ const d=P.support; return P.x_grid.map(x=> (d.a0 + d.b*Math.log10(x)) ); }}
-function offsetForPercent(P, percent){{
-  const d=P.support;
-  const p01 = Math.max(d.q_grid[0], Math.min(d.q_grid[d.q_grid.length-1], percent/100));
+// Rails math
+function logMidline(P){ const d=P.support; return P.x_grid.map(x=> (d.a0 + d.b*Math.log10(x)) ); }
+function offsetForPercent(P, percent){
+  const d=P.support; const p01=Math.max(d.q_grid[0], Math.min(d.q_grid[d.q_grid.length-1], percent/100));
   return interp(d.q_grid, d.off_grid, p01);
-}}
-function seriesForPercent(P, percent){{
-  const logM = logMidline(P); const off = offsetForPercent(P, percent);
-  const eps = (percent>=97.5 || percent<=2.5) ? EPS_LOG_SPACING : 0.0;
-  return logM.map(v=> Math.pow(10, v + off + (percent>=50? eps : -eps)) );
-}}
-// Invert residual CDF: offset -> percentile
-function percentFromOffset(P, off){{
+}
+function seriesForPercent(P, percent){
+  const logM=logMidline(P), off=offsetForPercent(P,percent);
+  const eps=(percent>=97.5||percent<=2.5)?EPS_LOG_SPACING:0.0;
+  return logM.map(v=>Math.pow(10, v+off+(percent>=50?eps:-eps)));
+}
+function percentFromOffset(P, off){
   const d=P.support;
-  const q = Math.max(d.q_grid[0], Math.min(d.q_grid[d.q_grid.length-1], interp(d.off_grid, d.q_grid, off)));
-  return q; // 0..1
-}}
+  const q=Math.max(d.q_grid[0], Math.min(d.q_grid[d.q_grid.length-1], interp(d.off_grid, d.q_grid, off)));
+  return q;
+}
 
-// Render rails
-function renderRails(P){{
-  const n = Math.min(rails.length, MAX_SLOTS);
-  for (let i=0;i<MAX_SLOTS;i++){{
-    const visible = (i<n);
-    let restyle = {{visible: visible}};
-    if (visible) {{
-      const p = rails[i];
-      const color = colorForPercent(p);
-      const dash  = (Math.abs(p-50)<1e-9)? 'solid' : 'dot';
-      const width = (Math.abs(p-50)<1e-9)? 2.6 : 1.6;
-      restyle = Object.assign(restyle, {{
-        x: [P.x_grid],
-        y: [seriesForPercent(P, p)],
-        name: (Math.abs(p-2.5)<1e-9?'Floor':(Math.abs(p-97.5)<1e-9?'Ceiling':(p+'%'))),
-        line: {{color: color, width: width, dash: dash}}
-      }});
-    }}
+// Render rails into slots
+function renderRails(P){
+  const n=Math.min(rails.length, MAX_SLOTS);
+  for(let i=0;i<MAX_SLOTS;i++){
+    const visible=(i<n); let restyle={visible};
+    if(visible){
+      const p=rails[i], color=colorForPercent(p), dash=(Math.abs(p-50)<1e-9)?'solid':'dot', width=(Math.abs(p-50)<1e-9)?2.6:1.6;
+      restyle=Object.assign(restyle,{
+        x:[P.x_grid], y:[seriesForPercent(P,p)],
+        name:(Math.abs(p-2.5)<1e-9?'Floor':(Math.abs(p-97.5)<1e-9?'Ceiling':(p+'%'))),
+        line:{color,width,dash}
+      });
+    }
     Plotly.restyle(plotDiv, restyle, [i]);
-  }}
-  railsListText.textContent = railsText();
+  }
+  railsListText.textContent=railsText();
   rebuildReadoutRows();
-}}
+}
 
 let locked=false, lockedX=null;
-let clickAnnotation=null; // holds the single click/tap annotation
+let clickAnnotation=null;
 
-function setTitleForP(p){{
-  const label = indicatorFromP(p);
-  Plotly.relayout(plotDiv, {{'title.text': 'BTC Purchase Indicator — ' + label}});
-}}
+function setTitleForP(p){ Plotly.relayout(plotDiv, {'title.text': 'BTC Purchase Indicator — '+indicatorFromP(p)}); }
 
-function updatePanel(P,xYears){{
+function updatePanel(P,xYears){
   elDate.textContent=shortDateFromYears(xYears);
-  // Fill each selected rail’s readout with the proper unit
-  rails.forEach(p=>{{
-    const v = interp(P.x_grid, seriesForPercent(P,p), xYears);
-    const el = document.getElementById(idFor(p));
-    if (el) el.textContent = fmtVal(P, v);
-  }});
-  // Current price at nearest sample
-  let idx=0,best=1e99; 
-  for(let i=0;i<P.x_main.length;i++){{ const d=Math.abs(P.x_main[i]-xYears); if(d<best){{best=d; idx=i;}} }}
+  rails.forEach(p=>{
+    const v=interp(P.x_grid, seriesForPercent(P,p), xYears);
+    const el=document.getElementById(idFor(p)); if(el) el.textContent=fmtVal(P, v);
+  });
+  // current point on main series
+  let idx=0,best=1e99; for(let i=0;i<P.x_main.length;i++){ const d=Math.abs(P.x_main[i]-xYears); if(d<best){best=d; idx=i;} }
   const y=P.y_main[idx];
-  elMain.textContent = fmtVal(P, y);
-  elMainLabel.textContent = (P.unit==='$' ? 'BTC Price:' : 'BTC Ratio:');
+  elMain.textContent=fmtVal(P,y);
+  elMainLabel.textContent=(P.unit==='$'?'BTC Price:':'BTC Ratio:');
 
-  // Empirical percentile via residual CDF
-  const d=P.support;
-  const logx = Math.log10(xYears);
-  const ly   = Math.log10(y);
-  const mid  = d.a0 + d.b*logx;
-  const off  = ly - mid;
-  const q    = percentFromOffset(P, off);  // 0..1
-  const pVal = Math.max(0, Math.min(100, 100*q));
-  elP.textContent = `(p≈${{pVal.toFixed(1)}}%)`;
-  setTitleForP(pVal);
+  // percentile
+  const d=P.support, logx=Math.log10(xYears), ly=Math.log10(y), mid=d.a0+d.b*logx, off=ly-mid;
+  const pVal=Math.max(0, Math.min(100, 100*percentFromOffset(P, off)));
+  elP.textContent=`(p≈${pVal.toFixed(1)}%)`; setTitleForP(pVal);
 
-  Plotly.relayout(plotDiv, {{"yaxis.title.text": P.label}});
-}}
+  Plotly.relayout(plotDiv, {"yaxis.title.text": P.label});
+}
 
-// Click/tap -> place annotation above BTC line with short date + value
-plotDiv.on('plotly_click', ev=>{{
+// Place annotation on click (uses the wide transparent click-catcher trace)
+plotDiv.on('plotly_click', ev=>{
   if(!(ev.points && ev.points.length)) return;
   const xYears = ev.points[0].x;
   const P = PRECOMP[denomSel.value];
-
   // nearest y on main series
-  let idx=0,best=1e99; 
-  for(let i=0;i<P.x_main.length;i++){{ const d=Math.abs(P.x_main[i]-xYears); if(d<best){{best=d; idx=i;}} }}
-  const y = P.y_main[idx];
+  let idx=0,best=1e99; for(let i=0;i<P.x_main.length;i++){ const d=Math.abs(P.x_main[i]-xYears); if(d<best){best=d; idx=i;} }
+  const y=P.y_main[idx], yAbove=y*1.2;
+  const text=shortDateFromYears(xYears)+"<br>"+fmtVal(P,y);
 
-  // position a bit above (log space -> multiply)
-  const yAbove = y * 1.2;
+  clickAnnotation = { x:xYears, y:yAbove, xref:'x', yref:'y', text, showarrow:true, arrowhead:2, ax:0, ay:-20,
+                      bgcolor:'rgba(255,255,255,0.95)', bordercolor:'#94a3b8', font:{size:12}};
+  Plotly.relayout(plotDiv, {annotations:[clickAnnotation]});
+});
 
-  const text = shortDateFromYears(xYears) + "<br>" + fmtVal(P, y);
+// Date set
+setBtn.onclick = ()=>{ if(!datePick.value) return; locked=true; lockedX=yearsFromISO(datePick.value); updatePanel(PRECOMP[denomSel.value], lockedX); };
 
-  const ann = {{
-    x: xYears, y: yAbove, xref:'x', yref:'y',
-    text: text, showarrow: true, arrowhead: 2, ax: 0, ay: -20,
-    bgcolor: 'rgba(255,255,255,0.95)', bordercolor: '#94a3b8',
-    font: {{size: 12}}
-  }};
-
-  clickAnnotation = ann;
-  Plotly.relayout(plotDiv, {{annotations: [ann]}});
-}});
-
-// Hover & controls
-plotDiv.on('plotly_hover', ev=>{{ if(ev.points && ev.points.length && !locked) updatePanel(PRECOMP[denomSel.value], ev.points[0].x); }});
-setBtn.onclick = ()=>{{ if(!datePick.value) return; locked=true; lockedX=yearsFromISO(datePick.value); updatePanel(PRECOMP[denomSel.value], lockedX); }};
-liveBtn.onclick = ()=>{{ locked=false; lockedX=null; }};
-copyBtn.onclick = async ()=>{{
-  const node=document.getElementById('capture');
-  try{{
-    const url=await htmlToImage.toPng(node,{{pixelRatio:2}});
-    try{{ if(navigator.clipboard && window.ClipboardItem){{ const blob=await (await fetch(url)).blob(); await navigator.clipboard.write([new ClipboardItem({{'image/png':blob}})]); return; }} }}catch(e){{}}
+// Copy current chart view (respects zoom/pan) to clipboard, with download fallback
+copyBtn.onclick = async ()=>{
+  try{
+    const url = await Plotly.toImage(plotDiv, {format:'png', scale:2}); // respects current viewbox
+    try{
+      if(navigator.clipboard && window.ClipboardItem){
+        const blob = await (await fetch(url)).blob();
+        await navigator.clipboard.write([new ClipboardItem({'image/png': blob})]);
+        return;
+      }
+    }catch(e){}
     const a=document.createElement('a'); a.href=url; a.download='btc-indicator.png'; document.body.appendChild(a); a.click(); a.remove();
-  }}catch(e){{ console.error(e); }}
-}};
+  }catch(e){ console.error(e); }
+};
 
 // Denominator change
-denomSel.onchange = ()=>{{
+denomSel.onchange = ()=>{
   const key=denomSel.value, P=PRECOMP[key];
-  // Main series + cursor
-  Plotly.restyle(plotDiv, {{x:[P.x_main], y:[P.y_main], name:[P.label]}}, [{MAX_RAIL_SLOTS}]);
-  Plotly.restyle(plotDiv, {{x:[P.x_main], y:[P.y_main]}},              [{MAX_RAIL_SLOTS}+1]);
-  // Clear previous annotation (scale changed)
-  Plotly.relayout(plotDiv, {{annotations: []}});
-  clickAnnotation = null;
-
+  // main line + click catcher update (two traces at the end)
+  Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main], name:[P.label]}, [MAX_RAIL_SLOTS]);
+  Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main]},                [MAX_RAIL_SLOTS+1]);
+  // clear any previous annotation
+  Plotly.relayout(plotDiv, {annotations: []}); clickAnnotation=null;
   renderRails(P);
-  updatePanel(P,(typeof lockedX==='number')?lockedX:P.x_main[P.x_main.length-1]);
-}};
+  updatePanel(P, P.x_main[P.x_main.length-1]);
+};
 
-// Sync everything
-function syncAll(){{
-  sortRails();
-  rebuildEditor();
+// Sync
+function syncAll(){
+  sortRails(); rebuildEditor();
   const P = PRECOMP[denomSel.value];
   renderRails(P);
-  updatePanel(P,(typeof lockedX==='number')?lockedX:P.x_main[P.x_main.length-1]);
-}}
+  updatePanel(P, P.x_main[P.x_main.length-1]);
+}
 
 // Init
-// USD should display in menu as "USD/None"
 denomSel.value='USD';
 applyChartWidthPx(document.getElementById('chartWpx').value);
-rebuildReadoutRows();
-rebuildEditor();
+rebuildReadoutRows(); rebuildEditor();
 renderRails(PRECOMP['USD']);
 updatePanel(PRECOMP['USD'], PRECOMP['USD'].x_main[PRECOMP['USD'].x_main.length-1]);
 </script>
