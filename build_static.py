@@ -319,10 +319,10 @@ html,body{height:100%} body{margin:0;font-family:Inter,system-ui,Segoe UI,Arial,
 .left .js-plotly-plot,.left .plotly-graph-div{width:100%!important}
 .right{flex:0 0 var(--panelW);border-left:1px solid #e5e7eb;padding:12px;display:flex;flex-direction:column;gap:12px;overflow:auto}
 #controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-select,button,input[type=date],input[type=number]{font-size:14px;padding:8px 10px;border-radius:8px;border:1px solid #d1d5db;background:#fff}
-button{cursor:pointer; transition: background-color .15s ease, transform .05s ease;}
-button:hover{background:#f3f4f6;}
-button:active{transform: translateY(1px);}
+select,input[type=date],input[type=number]{font-size:14px;padding:8px 10px;border-radius:8px;border:1px solid #d1d5db;background:#fff}
+.btn{font-size:14px;padding:8px 10px;border-radius:8px;border:1px solid #d1d5db;background:#fff;cursor:pointer;transition:background 120ms, box-shadow 120ms}
+.btn:hover{background:#f3f4f6}
+.btn:active{background:#e5e7eb; box-shadow:inset 0 1px 2px rgba(0,0,0,0.08)}
 #readout{border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#fafafa;font-size:14px}
 #readout .date{font-weight:700;margin-bottom:6px}
 #readout .row{display:grid;grid-template-columns:auto 1fr auto;column-gap:8px;align-items:baseline}
@@ -344,7 +344,9 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
 
 /* Indicator multi-select (checkbox dropdown) */
 .indicator-wrap{position:relative; display:inline-block;}
-.indicator-btn{padding:8px 10px; border:1px solid #d1d5db; border-radius:8px; background:#fff; cursor:pointer; font-size:14px;}
+.indicator-btn{padding:8px 10px; border:1px solid #d1d5db; border-radius:8px; background:#fff; cursor:pointer; font-size:14px; transition:background 120ms}
+.indicator-btn:hover{background:#f3f4f6}
+.indicator-btn:active{background:#e5e7eb}
 .indicator-menu{position:absolute; top:100%; left:0; z-index:50; min-width:220px; background:white; border:1px solid #e5e7eb; border-radius:10px; box-shadow:0 8px 24px rgba(0,0,0,0.08); padding:8px; display:none;}
 .indicator-menu.open{display:block;}
 .indicator-item{display:flex; align-items:center; gap:8px; padding:4px 6px; border-radius:6px; cursor:pointer;}
@@ -362,8 +364,8 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
       <label for="denomSel"><b>Denominator:</b></label>
       <select id="denomSel"></select>
       <input type="date" id="datePick"/>
-      <button id="setDateBtn">Set Date</button>
-      <button id="todayBtn">Today</button>
+      <button id="setDateBtn" class="btn">Set Date</button>
+      <button id="todayBtn" class="btn">Today</button>
 
       <div class="indicator-wrap">
         <button id="indicatorBtn" class="indicator-btn">Indicator: All</button>
@@ -376,26 +378,26 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
           <label class="indicator-item"><input type="checkbox" value="Frothy"> Frothy</label>
           <label class="indicator-item"><input type="checkbox" value="Top Inbound"> Top Inbound</label>
           <div class="indicator-actions">
-            <button id="indicatorClear">Clear</button>
-            <button id="indicatorApply">Apply</button>
+            <button id="indicatorClear" class="btn">Clear</button>
+            <button id="indicatorApply" class="btn">Apply</button>
           </div>
         </div>
       </div>
 
-      <button id="copyBtn">Copy Chart</button>
+      <button id="copyBtn" class="btn" title="Copy current view to clipboard">Copy Chart</button>
     </div>
 
     <div id="chartWidthBox">
       <b>Chart Width (px):</b>
       <input type="number" id="chartWpx" min="400" max="2400" step="10" value="1100"/>
-      <button id="fitBtn" title="Make chart fill remaining space">Fit</button>
+      <button id="fitBtn" class="btn" title="Make chart fill remaining space">Fit</button>
     </div>
 
     <fieldset id="railsBox">
       <legend>Rails</legend>
       <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
-        <button id="editBtn">Edit Rails</button>
-        <span class="smallnote">Add/remove/change percents. Sorted automatically (high→low). All dashed.</span>
+        <button id="editBtn" class="btn">Edit Rails</button>
+        <span class="smallnote">Add/remove/change percents. Sorted automatically (high→low). 50% is dashed.</span>
       </div>
       <div id="railsView" class="smallnote">Current: <span id="railsListText"></span></div>
 
@@ -403,7 +405,7 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
         <div id="railItems"></div>
         <div class="rail-row" style="margin-top:6px;">
           <input type="number" id="addPct" placeholder="Add % (e.g. 92.5)" step="0.1" min="0.1" max="99.9"/>
-          <button id="addBtn">Add</button>
+          <button id="addBtn" class="btn">Add</button>
         </div>
       </div>
     </fieldset>
@@ -423,11 +425,9 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
 const PRECOMP = __PRECOMP__;
 const GENESIS = new Date('__GENESIS__T00:00:00Z');
 const MAX_SLOTS = __MAX_RAIL_SLOTS__;
-const IDX_MAIN   = __IDX_MAIN__;
-const IDX_CLICK1 = __IDX_CLICK1__;
-const IDX_CURSR  = __IDX_CURSR__;
-const IDX_CLICK2 = __IDX_CLICK2__;
-const IDX_HOVR   = __IDX_HOVR__;
+const IDX_MAIN  = __IDX_MAIN__;
+const IDX_CLICK = __IDX_CLICK__;
+const IDX_CURSR = __IDX_CURSR__;
 const EPS_LOG_SPACING = __EPS_LOG_SPACING__;
 
 const MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -527,19 +527,17 @@ indicatorBtn.addEventListener('click', (e)=>{
   indicatorMenu.classList.toggle('open');
 });
 indicatorClear.addEventListener('click', (e)=>{
-  e.preventDefault(); e.stopPropagation();
-  setCheckedIndicators([]); // clear
+  e.preventDefault();
+  setCheckedIndicators([]);
 });
-let selectedIndicators = []; // none => All
 indicatorApply.addEventListener('click', (e)=>{
-  e.preventDefault(); e.stopPropagation();
+  e.preventDefault();
   indicatorMenu.classList.remove('open');
   selectedIndicators = getCheckedIndicators();
   indicatorBtn.textContent = labelForIndicatorBtn(selectedIndicators);
   const P = PRECOMP[denomSel.value];
   applyIndicatorMask(P);
 });
-// Close menu if clicking outside
 document.addEventListener('click', (e)=>{
   if (!indicatorMenu.contains(e.target) && !indicatorBtn.contains(e.target)){
     indicatorMenu.classList.remove('open');
@@ -551,7 +549,7 @@ const denomKeys = Object.keys(PRECOMP);
 ['USD', ...denomKeys.filter(k=>k!=='USD')].forEach(k=>{ const o=document.createElement('option'); o.value=k; o.textContent=k; denomSel.appendChild(o); });
 document.getElementById('denomsDetected').textContent = denomKeys.filter(k=>k!=='USD').join(', ') || '(none)';
 
-// Rails state (all dashed)
+// Rails state
 let rails = [97.5, 90, 75, 50, 25, 2.5];
 function sortRails(){ rails = rails.filter(p=>isFinite(p)).map(Number).map(p=>Math.max(0.1,Math.min(99.9,p))).filter((p,i,a)=>a.indexOf(p)===i).sort((a,b)=>b-a); }
 function railsText(){ return rails.map(p=>String(p).replace(/\.0$/,'')+'%').join(', '); }
@@ -578,7 +576,7 @@ function rebuildEditor(){
     const labelTxt=Math.abs(p-2.5)<1e-9?'Floor':Math.abs(p-97.5)<1e-9?'Ceiling':(p+'%');
     const lab=document.createElement('span'); lab.style.minWidth='48px'; lab.style.color=color; lab.textContent=labelTxt;
     const inp=document.createElement('input'); inp.type='number'; inp.step='0.1'; inp.min='0.1'; inp.max='99.9'; inp.value=String(p);
-    const rm=document.createElement('button'); rm.textContent='Remove';
+    const rm=document.createElement('button'); rm.textContent='Remove'; rm.className='btn';
     inp.addEventListener('change',()=>{ const v=Number(inp.value); rails[idx]=isFinite(v)?v:p; sortRails(); syncAll(); });
     rm.addEventListener('click',()=>{ rails.splice(idx,1); syncAll(); });
     row.appendChild(lab); row.appendChild(inp); row.appendChild(rm); railItems.appendChild(row);
@@ -604,4 +602,184 @@ if(window.ResizeObserver) new ResizeObserver(()=>{ if(window.Plotly&&plotDiv) Pl
 // Rails math
 function logMidline(P){ const d=P.support; return P.x_grid.map(x=> (d.a0 + d.b*Math.log10(x)) ); }
 function offsetForPercent(P, percent){
-  const d=P.support; const p01=Math.max(d.q_grid[0], Math.min(d.q_grid[d
+  const d=P.support; const p01=Math.max(d.q_grid[0], Math.min(d.q_grid[d.q_grid.length-1], percent/100));
+  return interp(d.q_grid, d.off_grid, p01);
+}
+function seriesForPercent(P, percent){
+  const logM=logMidline(P), off=offsetForPercent(P,percent);
+  const eps=(percent>=97.5||percent<=2.5)?EPS_LOG_SPACING:0.0;
+  return logM.map(v=>Math.pow(10, v+off+(percent>=50?eps:-eps)));
+}
+function percentFromOffset(P, off){
+  const d=P.support;
+  const q=Math.max(d.q_grid[0], Math.min(d.q_grid[d.q_grid.length-1], interp(d.off_grid, d.q_grid, off)));
+  return q;
+}
+
+// Render rails (all dashed)
+function renderRails(P){
+  const n=Math.min(rails.length, MAX_SLOTS);
+  for(let i=0;i<MAX_SLOTS;i++){
+    const visible=(i<n); let restyle={visible};
+    if(visible){
+      const p=rails[i], color=colorForPercent(p);
+      restyle=Object.assign(restyle,{
+        x:[P.x_grid], y:[seriesForPercent(P,p)],
+        name:(Math.abs(p-2.5)<1e-9?'Floor':(Math.abs(p-97.5)<1e-9?'Ceiling':(p+'%'))),
+        line:{color:color, width:1.6, dash:'dot'}
+      });
+    }
+    Plotly.restyle(plotDiv, restyle, [i]);
+  }
+  railsListText.textContent=railsText();
+  rebuildReadoutRows();
+}
+
+let locked=false, lockedX=null;
+
+function setTitleForP(p){ Plotly.relayout(plotDiv, {'title.text': 'BTC Purchase Indicator — '+indicatorFromP(p)}); }
+
+// Cache p-series per payload
+function computePSeries(P){
+  const d=P.support;
+  const out = new Array(P.x_main.length);
+  for (let i=0;i<P.x_main.length;i++){
+    const logx=Math.log10(P.x_main[i]);
+    const ly=Math.log10(P.y_main[i]);
+    const mid=d.a0 + d.b*logx;
+    const off=ly-mid;
+    const q = percentFromOffset(P, off);
+    out[i] = Math.max(0, Math.min(100, 100*q));
+  }
+  P._pSeries = out;
+}
+
+// MULTI-SELECT INDICATOR MASK (union)
+let selectedIndicators = []; // none => All
+function applyIndicatorMask(P){
+  // For hover into the future, ensure cursor spans full domain using midline
+  Plotly.restyle(plotDiv, {x:[P.x_grid], y:[seriesForPercent(P,50)]}, [IDX_CURSR]);
+
+  if (!selectedIndicators || selectedIndicators.length===0){
+    Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main], name:[P.label]}, [IDX_MAIN]);
+    Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main]},                [IDX_CLICK]);
+    return;
+  }
+  if (!P._pSeries) computePSeries(P);
+  const ranges = selectedIndicators.map(rangeForIndicator);
+  const ym = P.y_main.map((v,i)=>{
+    const p = P._pSeries[i];
+    for (let r of ranges){ if (p>=r[0] && p<r[1]) return v; }
+    return null;
+  });
+  Plotly.restyle(plotDiv, {x:[P.x_main], y:[ym], name:[P.label+' — '+selectedIndicators.join(' + ')]}, [IDX_MAIN]);
+  Plotly.restyle(plotDiv, {x:[P.x_main], y:[ym]},                                                           [IDX_CLICK]);
+}
+
+function updatePanel(P,xYears){
+  // Always update date — even in the future
+  elDate.textContent=shortDateFromYears(xYears);
+
+  // Rails readout (exists for future dates via x_grid)
+  rails.forEach(p=>{
+    const v=interp(P.x_grid, seriesForPercent(P,p), xYears);
+    const el=document.getElementById(idFor(p)); if(el) el.textContent=fmtVal(P, v);
+  });
+
+  // If xYears beyond last BTC point, hide main price & p
+  const lastX = P.x_main[P.x_main.length-1];
+  if (xYears > lastX){
+    elMain.textContent='—';
+    elP.textContent='(p≈—)';
+  } else {
+    // nearest main point
+    let idx=0,best=1e99; for(let i=0;i<P.x_main.length;i++){ const d=Math.abs(P.x_main[i]-xYears); if(d<best){best=d; idx=i;} }
+    const y=P.y_main[idx];
+    elMain.textContent=fmtVal(P,y);
+    elMainLabel.textContent=(P.unit==='$'?'BTC Price:':'BTC Ratio:');
+
+    const d=P.support, logx=Math.log10(xYears), ly=Math.log10(y), mid=d.a0+d.b*logx, off=ly-mid;
+    const pVal=Math.max(0, Math.min(100, 100*percentFromOffset(P, off)));
+    elP.textContent=`(p≈${pVal.toFixed(1)}%)`; setTitleForP(pVal);
+  }
+
+  Plotly.relayout(plotDiv, {"yaxis.title.text": P.label});
+}
+
+// Click annotation (ignored if locked)
+plotDiv.on('plotly_click', ev=>{
+  if(!(ev.points && ev.points.length)) return;
+  if (locked) return;
+  const xYears = ev.points[0].x;
+  const P = PRECOMP[denomSel.value];
+  // For annotation y position use midline at that x (works in future)
+  const yMid = interp(P.x_grid, seriesForPercent(P,50), xYears);
+  const yAbove = yMid * 1.2;
+  const text=shortDateFromYears(xYears);
+  const ann = { x:xYears, y:yAbove, xref:'x', yref:'y', text, showarrow:true, arrowhead:2, ax:0, ay:-20,
+                bgcolor:'rgba(255,255,255,0.95)', bordercolor:'#94a3b8', font:{size:12}};
+  Plotly.relayout(plotDiv, {annotations:[ann]});
+  updatePanel(P, xYears);
+});
+
+// Hover drives panel when unlocked — works into future via cursor trace on x_grid
+plotDiv.on('plotly_hover', ev=>{
+  if(!(ev.points && ev.points.length)) return;
+  if (locked) return;
+  updatePanel(PRECOMP[denomSel.value], ev.points[0].x);
+});
+
+// Tilt year labels to 45°
+function tiltYearLabels(){ Plotly.relayout(plotDiv, {'xaxis.tickangle':45}); }
+tiltYearLabels();
+
+// Date buttons
+btnSet.onclick = ()=>{ if(!datePick.value) return; locked=true; lockedX=yearsFromISO(datePick.value); updatePanel(PRECOMP[denomSel.value], lockedX); };
+btnToday.onclick = ()=>{ const P = PRECOMP[denomSel.value]; locked=true; lockedX=P.x_main[P.x_main.length-1]; updatePanel(P, lockedX); };
+
+// Copy current view
+btnCopy.onclick = async ()=>{
+  try{
+    const url = await Plotly.toImage(plotDiv, {format:'png', scale:2});
+    if (navigator.clipboard && window.ClipboardItem){
+      const blob = await (await fetch(url)).blob();
+      await navigator.clipboard.write([new ClipboardItem({'image/png': blob})]);
+    } else {
+      const a=document.createElement('a'); a.href=url; a.download='btc-indicator.png'; document.body.appendChild(a); a.click(); a.remove();
+    }
+  }catch(e){ console.error('Copy Chart failed:', e); alert('Copy failed. Try again or use the downloaded image.'); }
+};
+
+// Denominator change
+denomSel.onchange = ()=>{
+  const key=denomSel.value, P=PRECOMP[key];
+  Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main], name:[P.label]}, [IDX_MAIN]);
+  Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main]},                [IDX_CLICK]);
+  // Cursor spans full domain using midline so hover works into future
+  Plotly.restyle(plotDiv, {x:[P.x_grid], y:[seriesForPercent(P,50)]},  [IDX_CURSR]);
+  Plotly.relayout(plotDiv, {annotations: []});
+  renderRails(P);
+  applyIndicatorMask(P);
+  const x = locked ? lockedX : P.x_main[P.x_main.length-1];
+  updatePanel(P, x);
+};
+
+// Sync
+function syncAll(){
+  sortRails(); rebuildEditor();
+  const P = PRECOMP[denomSel.value];
+  renderRails(P);
+  applyIndicatorMask(P);
+  const x = locked ? lockedX : P.x_main[P.x_main.length-1];
+  updatePanel(P, x);
+}
+
+// Init
+denomSel.value='USD';
+rebuildReadoutRows(); rebuildEditor();
+renderRails(PRECOMP['USD']);
+applyIndicatorMask(PRECOMP['USD']);
+updatePanel(PRECOMP['USD'], PRECOMP['USD'].x_main[PRECOMP['USD'].x_main.length-1]);
+</script>
+</body></html>
+"""
