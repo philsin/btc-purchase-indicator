@@ -3,14 +3,15 @@
 """
 BTC Purchase Indicator — dynamic percentile rails with editable dashboard.
 
-What's new:
-- Hover/click drives the readout unless locked by Today / Set Date.
-- Denominators: USD, GOLD (XAUUSD), SPX (^SPX), ETH (ETHUSD).
-- 50% line is dashed (same style as others).
-- Indicator filter dropdown to show only periods matching a band (SELL THE HOUSE…Top Inbound).
-- Tap/click places a small two-line annotation above the BTC line.
+What's in here:
+- Hover/click drives the panel unless locked via Set Date / Today.
+- Denominators: USD, GOLD (XAUUSD), SPX (^SPX), ETH (ETHUSD with CoinGecko fallback).
+- 50% rail is dashed like the others.
+- Indicator multi-select dropdown with checkboxes: show any combination of
+  SELL THE HOUSE / Strong Buy / Buy / DCA / Hold On / Frothy / Top Inbound.
+- Tap/click adds a two-line annotation (short date + value) above the BTC line.
 - Copy Chart grabs the CURRENT zoom/pan via Plotly.toImage() (clipboard + fallback).
-- No f-strings in HTML (placeholders replaced after).
+- Avoids f-strings in HTML (uses placeholders replaced after).
 """
 
 import os, io, glob, json
@@ -36,14 +37,14 @@ RESID_WINSOR     = 0.02
 EPS_LOG_SPACING  = 0.010
 COL_BTC          = "#000000"
 
-# Auto-fetch denominators if not present (Stooq daily CSVs)
+# Auto-fetch denominators; ETH has robust fallback
 AUTO_DENOMS = {
     "GOLD": {"path": os.path.join(DATA_DIR, "denominator_gold.csv"),
              "url":  "https://stooq.com/q/d/l/?s=xauusd&i=d", "parser":"stooq"},
     "SPX":  {"path": os.path.join(DATA_DIR, "denominator_spx.csv"),
              "url":  "https://stooq.com/q/d/l/?s=%5Espx&i=d", "parser":"stooq"},
     "ETH":  {"path": os.path.join(DATA_DIR, "denominator_eth.csv"),
-             "url":  "https://stooq.com/q/d/l/?s=ethusd&i=d", "parser":"stooq"},
+             "url":  "https://stooq.com/q/d/l/?s=ethusd&i=d", "parser":"stooq"},  # try stooq first
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -76,23 +77,55 @@ def fetch_btc_csv() -> pd.DataFrame:
     return df
 
 def _fetch_stooq_csv(url: str) -> pd.DataFrame:
-    r = requests.get(url, timeout=30); r.raise_for_status()
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
     df = pd.read_csv(io.StringIO(r.text))
-    if "Date" not in df.columns or "Close" not in df.columns or df.empty:
-        raise ValueError("stooq returned no data")
-    out = df[["Date","Close"]].rename(columns={"Date":"date","Close":"price"})
+    # tolerant to schema shifts
+    lower = {c: c.lower() for c in df.columns}
+    df = df.rename(columns=lower)
+    if "date" not in df.columns or "close" not in df.columns or df.empty:
+        raise ValueError("stooq returned no usable columns")
+    out = df[["date","close"]].rename(columns={"date":"date","close":"price"})
     out["date"] = pd.to_datetime(out["date"], errors="coerce")
     out["price"] = pd.to_numeric(out["price"], errors="coerce")
     return out.sort_values("date").dropna()
 
+def _fetch_eth_from_stooq() -> pd.DataFrame:
+    return _fetch_stooq_csv("https://stooq.com/q/d/l/?s=ethusd&i=d")
+
+def _fetch_eth_from_coingecko() -> pd.DataFrame:
+    url = "https://api.coingecko.com/api/v3/coins/ethereum/market_chart?vs_currency=usd&days=max"
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    js = r.json()
+    if "prices" not in js or not js["prices"]:
+        raise ValueError("coingecko empty payload for ETH")
+    rows = js["prices"]  # [[ms, price], ...]
+    df = pd.DataFrame(rows, columns=["ms", "price"])
+    df["date"] = pd.to_datetime(df["ms"], unit="ms").dt.normalize()
+    out = df[["date", "price"]].sort_values("date").dropna()
+    # keep last point per day if duplicates
+    out = out.groupby("date", as_index=False).last()
+    return out
+
 def ensure_auto_denominators():
     os.makedirs(DATA_DIR, exist_ok=True)
     for key, info in AUTO_DENOMS.items():
-        if os.path.exists(info["path"]): continue
+        path = info["path"]
+        if os.path.exists(path):
+            continue
         try:
-            df = _fetch_stooq_csv(info["url"]) if info["parser"]=="stooq" else None
-            if df is not None: df.to_csv(info["path"], index=False)
-            print(f"[auto-denom] wrote {info['path']}")
+            if key == "ETH":
+                try:
+                    df = _fetch_eth_from_stooq()
+                except Exception:
+                    df = _fetch_eth_from_coingecko()
+            else:
+                df = _fetch_stooq_csv(info["url"]) if info["parser"]=="stooq" else None
+            if df is None or df.empty:
+                raise ValueError(f"{key} returned no data")
+            df.to_csv(path, index=False)
+            print(f"[auto-denom] wrote {path} ({len(df)} rows)")
         except Exception as e:
             print(f"[warn] could not fetch {key}: {e}")
 
@@ -150,7 +183,7 @@ def year_ticks_log(first_dt, last_dt):
         if d < first_dt or d > last_dt: continue
         vy = float(years_since_genesis(pd.Series([d])).iloc[0])
         if vy <= 0: continue
-        if y > 2026 and (y % 2 == 1):  # hide odd after 2026
+        if y > 2026 and (y % 2 == 1):  # hide odd labels after 2026
             continue
         vals.append(vy); labs.append(str(y))
     return vals, labs
@@ -165,6 +198,7 @@ def y_ticks():
 # ──────────────────────────────────────────────────────────────────────────────
 btc = fetch_btc_csv().rename(columns={"price":"btc"})
 denoms = load_denominators()
+print("[denoms]", list(denoms.keys()))
 
 base = btc.sort_values("date").reset_index(drop=True)
 for key, df in denoms.items():
@@ -219,20 +253,21 @@ IDX_CLICK = MAX_RAIL_SLOTS + 1
 IDX_CURSR = MAX_RAIL_SLOTS + 2  # invisible hover cursor
 
 def add_stub(idx):
+    # dashed for all rails, including 50%
     return go.Scatter(x=P0["x_grid"], y=[None]*len(P0["x_grid"]), mode="lines",
                       name=f"Rail {idx+1}", line=dict(width=1.6, color="#999", dash="dot"),
                       visible=False, hoverinfo="skip")
 
 traces = [add_stub(i) for i in range(MAX_RAIL_SLOTS)]
 traces += [
-    # visible BTC line
+    # visible main BTC series
     go.Scatter(x=P0["x_main"], y=P0["y_main"], mode="lines",
                name="BTC / USD", line=dict(color=COL_BTC,width=2.0), hoverinfo="skip"),
-    # wide transparent click-catcher overlay (for taps)
+    # click catcher: wide transparent
     go.Scatter(x=P0["x_main"], y=P0["y_main"], mode="lines",
                name="_click", showlegend=False, hoverinfo="skip",
                line=dict(width=18, color="rgba(0,0,0,0.001)")),
-    # ultra-thin almost invisible cursor trace to make hover work everywhere
+    # thin cursor to keep hover active
     go.Scatter(x=P0["x_main"], y=P0["y_main"], mode="lines",
                name="_cursor", showlegend=False, hoverinfo="x",
                line=dict(width=0.1, color="rgba(0,0,0,0.001)")),
@@ -291,6 +326,16 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
 #chartWidthBox{display:flex;align-items:center;gap:8px}
 #chartWpx{width:120px}
 .hidden{display:none}
+
+/* Indicator multi-select (checkbox dropdown) */
+.indicator-wrap{position:relative; display:inline-block;}
+.indicator-btn{padding:8px 10px; border:1px solid #d1d5db; border-radius:8px; background:#fff; cursor:pointer; font-size:14px;}
+.indicator-menu{position:absolute; top:100%; left:0; z-index:50; min-width:220px; background:white; border:1px solid #e5e7eb; border-radius:10px; box-shadow:0 8px 24px rgba(0,0,0,0.08); padding:8px; display:none;}
+.indicator-menu.open{display:block;}
+.indicator-item{display:flex; align-items:center; gap:8px; padding:4px 6px; border-radius:6px; cursor:pointer;}
+.indicator-item:hover{background:#f3f4f6;}
+.indicator-actions{display:flex; justify-content:space-between; gap:8px; padding-top:6px;}
+.indicator-actions button{padding:6px 10px; font-size:12px;}
 </style>
 </head><body>
 <div id="capture" class="layout">
@@ -305,17 +350,22 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
       <button id="setDateBtn">Set Date</button>
       <button id="todayBtn">Today</button>
 
-      <label for="indicatorSel"><b>Indicator:</b></label>
-      <select id="indicatorSel">
-        <option value="ALL">All</option>
-        <option value="SELL THE HOUSE">SELL THE HOUSE</option>
-        <option value="Strong Buy">Strong Buy</option>
-        <option value="Buy">Buy</option>
-        <option value="DCA">DCA</option>
-        <option value="Hold On">Hold On</option>
-        <option value="Frothy">Frothy</option>
-        <option value="Top Inbound">Top Inbound</option>
-      </select>
+      <div class="indicator-wrap">
+        <button id="indicatorBtn" class="indicator-btn">Indicator: All</button>
+        <div id="indicatorMenu" class="indicator-menu">
+          <label class="indicator-item"><input type="checkbox" value="SELL THE HOUSE"> SELL THE HOUSE</label>
+          <label class="indicator-item"><input type="checkbox" value="Strong Buy"> Strong Buy</label>
+          <label class="indicator-item"><input type="checkbox" value="Buy"> Buy</label>
+          <label class="indicator-item"><input type="checkbox" value="DCA"> DCA</label>
+          <label class="indicator-item"><input type="checkbox" value="Hold On"> Hold On</label>
+          <label class="indicator-item"><input type="checkbox" value="Frothy"> Frothy</label>
+          <label class="indicator-item"><input type="checkbox" value="Top Inbound"> Top Inbound</label>
+          <div class="indicator-actions">
+            <button id="indicatorClear">Clear</button>
+            <button id="indicatorApply">Apply</button>
+          </div>
+        </div>
+      </div>
 
       <button id="copyBtn">Copy Chart</button>
     </div>
@@ -415,7 +465,6 @@ function rangeForIndicator(name){
 const leftCol=document.getElementById('leftCol');
 const plotDiv=document.querySelector('.left .js-plotly-plot') || document.querySelector('.left .plotly-graph-div');
 const denomSel=document.getElementById('denomSel');
-const indicatorSel=document.getElementById('indicatorSel');
 const datePick=document.getElementById('datePick');
 const btnSet=document.getElementById('setDateBtn');
 const btnToday=document.getElementById('todayBtn');
@@ -428,7 +477,6 @@ const elMain=document.getElementById('mainVal');
 const elMainLabel=document.getElementById('mainLabel');
 const elP=document.getElementById('pPct');
 const chartWpx=document.getElementById('chartWpx');
-
 const editBtn=document.getElementById('editBtn');
 const railsView=document.getElementById('railsView');
 const railsListText=document.getElementById('railsListText');
@@ -437,12 +485,53 @@ const railItems=document.getElementById('railItems');
 const addPct=document.getElementById('addPct');
 const addBtn=document.getElementById('addBtn');
 
-// Denominator dropdown (USD, GOLD, SPX, ETH)
+// Indicator multi-select UI
+const indicatorBtn = document.getElementById('indicatorBtn');
+const indicatorMenu = document.getElementById('indicatorMenu');
+const indicatorClear = document.getElementById('indicatorClear');
+const indicatorApply = document.getElementById('indicatorApply');
+function getCheckedIndicators(){
+  const boxes = indicatorMenu.querySelectorAll('input[type=checkbox]');
+  const out=[]; boxes.forEach(b=>{ if(b.checked) out.push(b.value); });
+  return out;
+}
+function setCheckedIndicators(arr){
+  const set=new Set(arr);
+  const boxes = indicatorMenu.querySelectorAll('input[type=checkbox]');
+  boxes.forEach(b=>{ b.checked = set.has(b.value); });
+}
+function labelForIndicatorBtn(arr){
+  return (arr.length===0) ? 'Indicator: All' :
+         (arr.length===1) ? 'Indicator: '+arr[0] :
+                            'Indicator: '+arr.length+' selected';
+}
+indicatorBtn.addEventListener('click', ()=>{
+  indicatorMenu.classList.toggle('open');
+});
+indicatorClear.addEventListener('click', ()=>{
+  setCheckedIndicators([]); // clear
+});
+indicatorApply.addEventListener('click', ()=>{
+  indicatorMenu.classList.remove('open');
+  selectedIndicators = getCheckedIndicators();
+  indicatorBtn.textContent = labelForIndicatorBtn(selectedIndicators);
+  const P = PRECOMP[denomSel.value];
+  applyIndicatorMask(P);
+});
+
+// Close menu if clicking outside
+document.addEventListener('click', (e)=>{
+  if (!indicatorMenu.contains(e.target) && !indicatorBtn.contains(e.target)){
+    indicatorMenu.classList.remove('open');
+  }
+});
+
+// Denominator dropdown (USD first)
 const denomKeys = Object.keys(PRECOMP);
 ['USD', ...denomKeys.filter(k=>k!=='USD')].forEach(k=>{ const o=document.createElement('option'); o.value=k; o.textContent=k; denomSel.appendChild(o); });
 document.getElementById('denomsDetected').textContent = denomKeys.filter(k=>k!=='USD').join(', ') || '(none)';
 
-// Rails state (50% stays dashed like others)
+// Rails state (50% dashed like others)
 let rails = [97.5, 90, 75, 50, 25, 2.5];
 function sortRails(){ rails = rails.filter(p=>isFinite(p)).map(Number).map(p=>Math.max(0.1,Math.min(99.9,p))).filter((p,i,a)=>a.indexOf(p)===i).sort((a,b)=>b-a); }
 function railsText(){ return rails.map(p=>String(p).replace(/\.0$/,'')+'%').join(', '); }
@@ -509,17 +598,17 @@ function percentFromOffset(P, off){
   return q;
 }
 
-// Render rails (50% dashed)
+// Render rails (all dashed)
 function renderRails(P){
   const n=Math.min(rails.length, MAX_SLOTS);
   for(let i=0;i<MAX_SLOTS;i++){
     const visible=(i<n); let restyle={visible};
     if(visible){
-      const p=rails[i], color=colorForPercent(p), dash='dot', width=1.6;
+      const p=rails[i], color=colorForPercent(p);
       restyle=Object.assign(restyle,{
         x:[P.x_grid], y:[seriesForPercent(P,p)],
         name:(Math.abs(p-2.5)<1e-9?'Floor':(Math.abs(p-97.5)<1e-9?'Ceiling':(p+'%'))),
-        line:{color,width,dash}
+        line:{color:color, width:1.6, dash:'dot'}
       });
     }
     Plotly.restyle(plotDiv, restyle, [i]);
@@ -532,6 +621,7 @@ let locked=false, lockedX=null;
 
 function setTitleForP(p){ Plotly.relayout(plotDiv, {'title.text': 'BTC Purchase Indicator — '+indicatorFromP(p)}); }
 
+// Cache p-series per payload
 function computePSeries(P){
   const d=P.support;
   const out = new Array(P.x_main.length);
@@ -546,18 +636,28 @@ function computePSeries(P){
   P._pSeries = out;
 }
 
+// MULTI-SELECT INDICATOR MASK (union of chosen bands)
+let selectedIndicators = []; // none => All
 function applyIndicatorMask(P){
-  const mode = indicatorSel.value || 'ALL';
-  if (mode === 'ALL'){
+  if (!selectedIndicators || selectedIndicators.length===0){
     Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main], name:[P.label]}, [IDX_MAIN]);
     Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main]},                [IDX_CLICK]);
+    // cursor stays full to allow hover across timeline
+    Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main]},                [IDX_CURSR]);
     return;
   }
   if (!P._pSeries) computePSeries(P);
-  const [lo,hi] = rangeForIndicator(mode);
-  const ym = P.y_main.map((v,i)=> (P._pSeries[i]>=lo && P._pSeries[i]<hi) ? v : null);
-  Plotly.restyle(plotDiv, {x:[P.x_main], y:[ym], name:[P.label+' — '+mode]}, [IDX_MAIN]);
-  Plotly.restyle(plotDiv, {x:[P.x_main], y:[ym]},                            [IDX_CLICK]);
+  // build union mask
+  const ranges = selectedIndicators.map(rangeForIndicator);
+  const ym = P.y_main.map((v,i)=>{
+    const p = P._pSeries[i];
+    for (let r of ranges){ if (p>=r[0] && p<r[1]) return v; }
+    return null;
+  });
+  Plotly.restyle(plotDiv, {x:[P.x_main], y:[ym], name:[P.label+' — '+selectedIndicators.join(' + ')]}, [IDX_MAIN]);
+  Plotly.restyle(plotDiv, {x:[P.x_main], y:[ym]},                                                           [IDX_CLICK]);
+  // keep cursor full for smooth hover/readouts
+  Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main]},                                                     [IDX_CURSR]);
 }
 
 function updatePanel(P,xYears){
@@ -566,7 +666,7 @@ function updatePanel(P,xYears){
     const v=interp(P.x_grid, seriesForPercent(P,p), xYears);
     const el=document.getElementById(idFor(p)); if(el) el.textContent=fmtVal(P, v);
   });
-  // nearest main point (unfiltered, so readouts always available)
+  // nearest main (unfiltered, for stable values)
   let idx=0,best=1e99; for(let i=0;i<P.x_main.length;i++){ const d=Math.abs(P.x_main[i]-xYears); if(d<best){best=d; idx=i;} }
   const y=P.y_main[idx];
   elMain.textContent=fmtVal(P,y);
@@ -579,10 +679,10 @@ function updatePanel(P,xYears){
   Plotly.relayout(plotDiv, {"yaxis.title.text": P.label});
 }
 
-// Click annotation (above line)
+// Click annotation (ignored if locked)
 plotDiv.on('plotly_click', ev=>{
   if(!(ev.points && ev.points.length)) return;
-  if (locked) return; // ignore clicks when locked to Today/Set Date
+  if (locked) return;
   const xYears = ev.points[0].x;
   const P = PRECOMP[denomSel.value];
   let idx=0,best=1e99; for(let i=0;i<P.x_main.length;i++){ const d=Math.abs(P.x_main[i]-xYears); if(d<best){best=d; idx=i;} }
@@ -623,7 +723,6 @@ btnCopy.onclick = async ()=>{
 // Denominator change
 denomSel.onchange = ()=>{
   const key=denomSel.value, P=PRECOMP[key];
-  // main, click-catcher, cursor (cursor always full series to keep hover working across timeline)
   Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main], name:[P.label]}, [IDX_MAIN]);
   Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main]},                [IDX_CLICK]);
   Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main]},                [IDX_CURSR]);
@@ -632,12 +731,6 @@ denomSel.onchange = ()=>{
   applyIndicatorMask(P);
   const x = locked ? lockedX : P.x_main[P.x_main.length-1];
   updatePanel(P, x);
-};
-
-// Indicator filter change
-indicatorSel.onchange = ()=>{
-  const P = PRECOMP[denomSel.value];
-  applyIndicatorMask(P);
 };
 
 // Sync
@@ -660,7 +753,9 @@ updatePanel(PRECOMP['USD'], PRECOMP['USD'].x_main[PRECOMP['USD'].x_main.length-1
 </body></html>
 """
 
-# Fill placeholders safely
+# ──────────────────────────────────────────────────────────────────────────────
+# Fill placeholders safely (no f-strings in HTML)
+# ──────────────────────────────────────────────────────────────────────────────
 HTML = (HTML
     .replace("__PLOT_HTML__", plot_html)
     .replace("__PRECOMP__", json.dumps(PRECOMP))
@@ -672,7 +767,9 @@ HTML = (HTML
     .replace("__EPS_LOG_SPACING__", str(EPS_LOG_SPACING))
 )
 
-# Write
+# ──────────────────────────────────────────────────────────────────────────────
+# Write site
+# ──────────────────────────────────────────────────────────────────────────────
 os.makedirs(os.path.dirname(OUTPUT_HTML), exist_ok=True)
 with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
     f.write(HTML)
