@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BTC Purchase Indicator — dynamic percentile rails with an editable dashboard.
+BTC Purchase Indicator — dynamic percentile rails with editable dashboard.
 
-- Denominators: USD, GOLD (XAUUSD), SPX (^SPX) — GOLD/SPX auto-fetched from Stooq if missing
-- Tap/click anywhere along the BTC curve to place a two-line box (short date on top, value on bottom) above the line
-- Title shows indicator label from p≈ bands (SELL THE HOUSE … Top Inbound)
-- Copy Chart captures the **current** zoom/pan via Plotly.toImage() and copies to clipboard (with download fallback)
-- Dropdown shows "USD" (not "USD/None")
+What's new:
+- Hover/click drives the readout unless locked by Today / Set Date.
+- Denominators: USD, GOLD (XAUUSD), SPX (^SPX), ETH (ETHUSD).
+- 50% line is dashed (same style as others).
+- Indicator filter dropdown to show only periods matching a band (SELL THE HOUSE…Top Inbound).
+- Tap/click places a small two-line annotation above the BTC line.
+- Copy Chart grabs the CURRENT zoom/pan via Plotly.toImage() (clipboard + fallback).
+- No f-strings in HTML (placeholders replaced after).
 """
 
 import os, io, glob, json
@@ -33,11 +36,14 @@ RESID_WINSOR     = 0.02
 EPS_LOG_SPACING  = 0.010
 COL_BTC          = "#000000"
 
+# Auto-fetch denominators if not present (Stooq daily CSVs)
 AUTO_DENOMS = {
     "GOLD": {"path": os.path.join(DATA_DIR, "denominator_gold.csv"),
              "url":  "https://stooq.com/q/d/l/?s=xauusd&i=d", "parser":"stooq"},
     "SPX":  {"path": os.path.join(DATA_DIR, "denominator_spx.csv"),
              "url":  "https://stooq.com/q/d/l/?s=%5Espx&i=d", "parser":"stooq"},
+    "ETH":  {"path": os.path.join(DATA_DIR, "denominator_eth.csv"),
+             "url":  "https://stooq.com/q/d/l/?s=ethusd&i=d", "parser":"stooq"},
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -144,7 +150,7 @@ def year_ticks_log(first_dt, last_dt):
         if d < first_dt or d > last_dt: continue
         vy = float(years_since_genesis(pd.Series([d])).iloc[0])
         if vy <= 0: continue
-        if y > 2026 and (y % 2 == 1):
+        if y > 2026 and (y % 2 == 1):  # hide odd after 2026
             continue
         vals.append(vy); labs.append(str(y))
     return vals, labs
@@ -205,22 +211,31 @@ for k in sorted(denoms.keys()):
 P0 = PRECOMP["USD"]
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Base figure (includes a wide transparent click-catcher trace)
+# Base figure (rails + main + click catcher + cursor)
 # ──────────────────────────────────────────────────────────────────────────────
 MAX_RAIL_SLOTS = 12
+IDX_MAIN  = MAX_RAIL_SLOTS
+IDX_CLICK = MAX_RAIL_SLOTS + 1
+IDX_CURSR = MAX_RAIL_SLOTS + 2  # invisible hover cursor
 
 def add_stub(idx):
     return go.Scatter(x=P0["x_grid"], y=[None]*len(P0["x_grid"]), mode="lines",
-                      name=f"Rail {idx+1}", line=dict(width=1.6, color="#999"),
+                      name=f"Rail {idx+1}", line=dict(width=1.6, color="#999", dash="dot"),
                       visible=False, hoverinfo="skip")
 
 traces = [add_stub(i) for i in range(MAX_RAIL_SLOTS)]
 traces += [
+    # visible BTC line
     go.Scatter(x=P0["x_main"], y=P0["y_main"], mode="lines",
                name="BTC / USD", line=dict(color=COL_BTC,width=2.0), hoverinfo="skip"),
+    # wide transparent click-catcher overlay (for taps)
     go.Scatter(x=P0["x_main"], y=P0["y_main"], mode="lines",
                name="_click", showlegend=False, hoverinfo="skip",
                line=dict(width=18, color="rgba(0,0,0,0.001)")),
+    # ultra-thin almost invisible cursor trace to make hover work everywhere
+    go.Scatter(x=P0["x_main"], y=P0["y_main"], mode="lines",
+               name="_cursor", showlegend=False, hoverinfo="x",
+               line=dict(width=0.1, color="rgba(0,0,0,0.001)")),
 ]
 
 fig = go.Figure(traces)
@@ -242,7 +257,7 @@ plot_html = fig.to_html(full_html=False, include_plotlyjs="cdn",
                         config={"responsive":True,"displayModeBar":True,"modeBarButtonsToRemove":["toImage"]})
 
 # ──────────────────────────────────────────────────────────────────────────────
-# HTML (no f-strings; placeholders replaced below)
+# HTML (placeholders; NO f-strings)
 # ──────────────────────────────────────────────────────────────────────────────
 HTML = """<!doctype html>
 <html lang="en"><head>
@@ -257,12 +272,11 @@ html,body{height:100%} body{margin:0;font-family:Inter,system-ui,Segoe UI,Arial,
 .left .js-plotly-plot,.left .plotly-graph-div{width:100%!important}
 .right{flex:0 0 var(--panelW);border-left:1px solid #e5e7eb;padding:12px;display:flex;flex-direction:column;gap:12px;overflow:auto}
 #controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-select,button,input[type=date],input[type=number],input[type=text]{font-size:14px;padding:8px 10px;border-radius:8px;border:1px solid #d1d5db;background:#fff}
+select,button,input[type=date],input[type=number]{font-size:14px;padding:8px 10px;border-radius:8px;border:1px solid #d1d5db;background:#fff}
 #readout{border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#fafafa;font-size:14px}
 #readout .date{font-weight:700;margin-bottom:6px}
 #readout .row{display:grid;grid-template-columns:auto 1fr auto;column-gap:8px;align-items:baseline}
 #readout .num{font-family:ui-monospace,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums;text-align:right;min-width:12ch;white-space:pre}
-.hoverlayer{opacity:0!important;pointer-events:none}
 fieldset{border:1px solid #e5e7eb;border-radius:8px;padding:8px 10px}
 legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
 .rail-row{display:flex;align-items:center;gap:8px;margin:2px 0}
@@ -289,6 +303,20 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
       <select id="denomSel"></select>
       <input type="date" id="datePick"/>
       <button id="setDateBtn">Set Date</button>
+      <button id="todayBtn">Today</button>
+
+      <label for="indicatorSel"><b>Indicator:</b></label>
+      <select id="indicatorSel">
+        <option value="ALL">All</option>
+        <option value="SELL THE HOUSE">SELL THE HOUSE</option>
+        <option value="Strong Buy">Strong Buy</option>
+        <option value="Buy">Buy</option>
+        <option value="DCA">DCA</option>
+        <option value="Hold On">Hold On</option>
+        <option value="Frothy">Frothy</option>
+        <option value="Top Inbound">Top Inbound</option>
+      </select>
+
       <button id="copyBtn">Copy Chart</button>
     </div>
 
@@ -302,7 +330,7 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
       <legend>Rails</legend>
       <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
         <button id="editBtn">Edit Rails</button>
-        <span class="smallnote">Add/remove/change percents. Sorted automatically (high→low).</span>
+        <span class="smallnote">Add/remove/change percents. Sorted automatically (high→low). 50% is dashed.</span>
       </div>
       <div id="railsView" class="smallnote">Current: <span id="railsListText"></span></div>
 
@@ -311,7 +339,6 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
         <div class="rail-row" style="margin-top:6px;">
           <input type="number" id="addPct" placeholder="Add % (e.g. 92.5)" step="0.1" min="0.1" max="99.9"/>
           <button id="addBtn">Add</button>
-          <span class="smallnote">Valid range: 0.1–99.9. 50 is midline.</span>
         </div>
       </div>
     </fieldset>
@@ -331,6 +358,9 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
 const PRECOMP = __PRECOMP__;
 const GENESIS = new Date('__GENESIS__T00:00:00Z');
 const MAX_SLOTS = __MAX_RAIL_SLOTS__;
+const IDX_MAIN  = __IDX_MAIN__;
+const IDX_CLICK = __IDX_CLICK__;
+const IDX_CURSR = __IDX_CURSR__;
 const EPS_LOG_SPACING = __EPS_LOG_SPACING__;
 
 const MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -352,7 +382,7 @@ function fmtVal(P, v){
   }
 }
 
-// Color scale and indicator
+// Color + indicator mapping
 function colorForPercent(p){ const t=Math.max(0,Math.min(1,p/100));
   function hx(v){return Math.max(0,Math.min(255,Math.round(v))); }
   function toHex(r,g,b){return '#'+[r,g,b].map(v=>hx(v).toString(16).padStart(2,'0')).join('');}
@@ -368,15 +398,29 @@ function indicatorFromP(p){
   if (p <= 97.5) return 'Frothy';
   return 'Top Inbound';
 }
+function rangeForIndicator(name){
+  switch(name){
+    case 'SELL THE HOUSE': return [-Infinity, 2.5];
+    case 'Strong Buy':     return [2.5, 25];
+    case 'Buy':            return [25, 50];
+    case 'DCA':            return [50, 75];
+    case 'Hold On':        return [75, 90];
+    case 'Frothy':         return [90, 97.5];
+    case 'Top Inbound':    return [97.5, Infinity];
+    default:               return [-Infinity, Infinity];
+  }
+}
 
 // DOM
 const leftCol=document.getElementById('leftCol');
 const plotDiv=document.querySelector('.left .js-plotly-plot') || document.querySelector('.left .plotly-graph-div');
 const denomSel=document.getElementById('denomSel');
+const indicatorSel=document.getElementById('indicatorSel');
 const datePick=document.getElementById('datePick');
-const setBtn=document.getElementById('setDateBtn');
-const copyBtn=document.getElementById('copyBtn');
-const fitBtn=document.getElementById('fitBtn');
+const btnSet=document.getElementById('setDateBtn');
+const btnToday=document.getElementById('todayBtn');
+const btnCopy=document.getElementById('copyBtn');
+const btnFit=document.getElementById('fitBtn');
 const elDenoms=document.getElementById('denomsDetected');
 const elDate=document.querySelector('#readout .date');
 const elRows=document.getElementById('readoutRows');
@@ -393,13 +437,12 @@ const railItems=document.getElementById('railItems');
 const addPct=document.getElementById('addPct');
 const addBtn=document.getElementById('addBtn');
 
-// Denominator dropdown (USD label is "USD")
+// Denominator dropdown (USD, GOLD, SPX, ETH)
 const denomKeys = Object.keys(PRECOMP);
-const extra = denomKeys.filter(k=>k!=='USD');
-['USD', ...extra].forEach(k=>{ const o=document.createElement('option'); o.value=k; o.textContent=(k==='USD')?'USD':k; denomSel.appendChild(o); });
-elDenoms.textContent = extra.length ? extra.join(', ') : '(none)';
+['USD', ...denomKeys.filter(k=>k!=='USD')].forEach(k=>{ const o=document.createElement('option'); o.value=k; o.textContent=k; denomSel.appendChild(o); });
+document.getElementById('denomsDetected').textContent = denomKeys.filter(k=>k!=='USD').join(', ') || '(none)';
 
-// Rails state
+// Rails state (50% stays dashed like others)
 let rails = [97.5, 90, 75, 50, 25, 2.5];
 function sortRails(){ rails = rails.filter(p=>isFinite(p)).map(Number).map(p=>Math.max(0.1,Math.min(99.9,p))).filter((p,i,a)=>a.indexOf(p)===i).sort((a,b)=>b-a); }
 function railsText(){ return rails.map(p=>String(p).replace(/\.0$/,'')+'%').join(', '); }
@@ -412,9 +455,8 @@ function rebuildReadoutRows(){
     const lab=document.createElement('div');
     const val=document.createElement('div'); val.className='num'; val.id=idFor(p);
     const color=colorForPercent(p);
-    const isMid=Math.abs(p-50)<1e-9;
     const name=Math.abs(p-2.5)<1e-9?'Floor':Math.abs(p-97.5)<1e-9?'Ceiling':(p+'%');
-    lab.innerHTML=`<span style="color:${color};">${isMid?'<b>':''}${name}${isMid?'</b>':''}</span>`;
+    lab.innerHTML=`<span style="color:${color};">${name}</span>`;
     row.appendChild(lab); row.appendChild(val); row.appendChild(document.createElement('div'));
     elRows.appendChild(row);
   });
@@ -444,7 +486,7 @@ function applyChartWidthPx(px){
   if(window.Plotly&&plotDiv) Plotly.Plots.resize(plotDiv);
 }
 chartWpx.addEventListener('change',()=>applyChartWidthPx(chartWpx.value));
-fitBtn.addEventListener('click',()=>{
+btnFit.addEventListener('click',()=>{
   const total=document.documentElement.clientWidth||window.innerWidth, panel=420, pad=32;
   const target=Math.max(400, total-panel-pad); chartWpx.value=target; applyChartWidthPx(target);
 });
@@ -467,13 +509,13 @@ function percentFromOffset(P, off){
   return q;
 }
 
-// Render rails
+// Render rails (50% dashed)
 function renderRails(P){
   const n=Math.min(rails.length, MAX_SLOTS);
   for(let i=0;i<MAX_SLOTS;i++){
     const visible=(i<n); let restyle={visible};
     if(visible){
-      const p=rails[i], color=colorForPercent(p), dash=(Math.abs(p-50)<1e-9)?'solid':'dot', width=(Math.abs(p-50)<1e-9)?2.6:1.6;
+      const p=rails[i], color=colorForPercent(p), dash='dot', width=1.6;
       restyle=Object.assign(restyle,{
         x:[P.x_grid], y:[seriesForPercent(P,p)],
         name:(Math.abs(p-2.5)<1e-9?'Floor':(Math.abs(p-97.5)<1e-9?'Ceiling':(p+'%'))),
@@ -487,7 +529,36 @@ function renderRails(P){
 }
 
 let locked=false, lockedX=null;
+
 function setTitleForP(p){ Plotly.relayout(plotDiv, {'title.text': 'BTC Purchase Indicator — '+indicatorFromP(p)}); }
+
+function computePSeries(P){
+  const d=P.support;
+  const out = new Array(P.x_main.length);
+  for (let i=0;i<P.x_main.length;i++){
+    const logx=Math.log10(P.x_main[i]);
+    const ly=Math.log10(P.y_main[i]);
+    const mid=d.a0 + d.b*logx;
+    const off=ly-mid;
+    const q = percentFromOffset(P, off);
+    out[i] = Math.max(0, Math.min(100, 100*q));
+  }
+  P._pSeries = out;
+}
+
+function applyIndicatorMask(P){
+  const mode = indicatorSel.value || 'ALL';
+  if (mode === 'ALL'){
+    Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main], name:[P.label]}, [IDX_MAIN]);
+    Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main]},                [IDX_CLICK]);
+    return;
+  }
+  if (!P._pSeries) computePSeries(P);
+  const [lo,hi] = rangeForIndicator(mode);
+  const ym = P.y_main.map((v,i)=> (P._pSeries[i]>=lo && P._pSeries[i]<hi) ? v : null);
+  Plotly.restyle(plotDiv, {x:[P.x_main], y:[ym], name:[P.label+' — '+mode]}, [IDX_MAIN]);
+  Plotly.restyle(plotDiv, {x:[P.x_main], y:[ym]},                            [IDX_CLICK]);
+}
 
 function updatePanel(P,xYears){
   elDate.textContent=shortDateFromYears(xYears);
@@ -495,7 +566,7 @@ function updatePanel(P,xYears){
     const v=interp(P.x_grid, seriesForPercent(P,p), xYears);
     const el=document.getElementById(idFor(p)); if(el) el.textContent=fmtVal(P, v);
   });
-  // nearest main point
+  // nearest main point (unfiltered, so readouts always available)
   let idx=0,best=1e99; for(let i=0;i<P.x_main.length;i++){ const d=Math.abs(P.x_main[i]-xYears); if(d<best){best=d; idx=i;} }
   const y=P.y_main[idx];
   elMain.textContent=fmtVal(P,y);
@@ -508,9 +579,10 @@ function updatePanel(P,xYears){
   Plotly.relayout(plotDiv, {"yaxis.title.text": P.label});
 }
 
-// Place annotation on click (wide transparent click-catcher trace ensures hits)
+// Click annotation (above line)
 plotDiv.on('plotly_click', ev=>{
   if(!(ev.points && ev.points.length)) return;
+  if (locked) return; // ignore clicks when locked to Today/Set Date
   const xYears = ev.points[0].x;
   const P = PRECOMP[denomSel.value];
   let idx=0,best=1e99; for(let i=0;i<P.x_main.length;i++){ const d=Math.abs(P.x_main[i]-xYears); if(d<best){best=d; idx=i;} }
@@ -519,15 +591,24 @@ plotDiv.on('plotly_click', ev=>{
   const ann = { x:xYears, y:yAbove, xref:'x', yref:'y', text, showarrow:true, arrowhead:2, ax:0, ay:-20,
                 bgcolor:'rgba(255,255,255,0.95)', bordercolor:'#94a3b8', font:{size:12}};
   Plotly.relayout(plotDiv, {annotations:[ann]});
+  updatePanel(P, xYears);
 });
 
-// Date set
-document.getElementById('setDateBtn').onclick = ()=>{ if(!datePick.value) return; locked=true; lockedX=yearsFromISO(datePick.value); updatePanel(PRECOMP[denomSel.value], lockedX); };
+// Hover drives panel when unlocked
+plotDiv.on('plotly_hover', ev=>{
+  if(!(ev.points && ev.points.length)) return;
+  if (locked) return;
+  updatePanel(PRECOMP[denomSel.value], ev.points[0].x);
+});
 
-// Copy current zoom/pan to clipboard (fallback: download)
-document.getElementById('copyBtn').onclick = async ()=>{
+// Date buttons
+btnSet.onclick = ()=>{ if(!datePick.value) return; locked=true; lockedX=yearsFromISO(datePick.value); updatePanel(PRECOMP[denomSel.value], lockedX); };
+btnToday.onclick = ()=>{ const P = PRECOMP[denomSel.value]; locked=true; lockedX=P.x_main[P.x_main.length-1]; updatePanel(P, lockedX); };
+
+// Copy current view
+btnCopy.onclick = async ()=>{
   try{
-    const url = await Plotly.toImage(plotDiv, {format:'png', scale:2}); // respects viewbox
+    const url = await Plotly.toImage(plotDiv, {format:'png', scale:2});
     try{
       if(navigator.clipboard && window.ClipboardItem){
         const blob = await (await fetch(url)).blob();
@@ -542,52 +623,57 @@ document.getElementById('copyBtn').onclick = async ()=>{
 // Denominator change
 denomSel.onchange = ()=>{
   const key=denomSel.value, P=PRECOMP[key];
-  Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main], name:[P.label]}, [MAX_SLOTS]);
-  Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main]},                [MAX_SLOTS+1]);
+  // main, click-catcher, cursor (cursor always full series to keep hover working across timeline)
+  Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main], name:[P.label]}, [IDX_MAIN]);
+  Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main]},                [IDX_CLICK]);
+  Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main]},                [IDX_CURSR]);
   Plotly.relayout(plotDiv, {annotations: []});
   renderRails(P);
-  updatePanel(P, P.x_main[P.x_main.length-1]);
+  applyIndicatorMask(P);
+  const x = locked ? lockedX : P.x_main[P.x_main.length-1];
+  updatePanel(P, x);
 };
 
-// Init
-denomSel.value='USD';
-document.getElementById('denomsDetected').textContent = extra.length ? extra.join(', ') : '(none)';
+// Indicator filter change
+indicatorSel.onchange = ()=>{
+  const P = PRECOMP[denomSel.value];
+  applyIndicatorMask(P);
+};
+
+// Sync
 function syncAll(){
   sortRails(); rebuildEditor();
   const P = PRECOMP[denomSel.value];
   renderRails(P);
-  updatePanel(P, P.x_main[P.x_main.length-1]);
+  applyIndicatorMask(P);
+  const x = locked ? lockedX : P.x_main[P.x_main.length-1];
+  updatePanel(P, x);
 }
-function applyChartWidthPx(px){
-  const v=Math.max(400, Math.min(2400, Number(px)||1100));
-  leftCol.style.flex='0 0 auto'; leftCol.style.width=v+'px';
-  if(window.Plotly&&plotDiv) Plotly.Plots.resize(plotDiv);
-}
-document.getElementById('chartWpx').addEventListener('change',()=>applyChartWidthPx(document.getElementById('chartWpx').value));
-document.getElementById('fitBtn').addEventListener('click',()=>{
-  const total=document.documentElement.clientWidth||window.innerWidth, panel=420, pad=32;
-  const target=Math.max(400, total-panel-pad); document.getElementById('chartWpx').value=target; applyChartWidthPx(target);
-});
-rebuildReadoutRows(); rebuildEditor(); renderRails(PRECOMP['USD']); updatePanel(PRECOMP['USD'], PRECOMP['USD'].x_main[PRECOMP['USD'].x_main.length-1]);
+
+// Init
+denomSel.value='USD';
+rebuildReadoutRows(); rebuildEditor();
+renderRails(PRECOMP['USD']);
+applyIndicatorMask(PRECOMP['USD']);
+updatePanel(PRECOMP['USD'], PRECOMP['USD'].x_main[PRECOMP['USD'].x_main.length-1]);
 </script>
 </body></html>
 """
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Fill placeholders (no f-strings; no brace escaping headaches)
-# ──────────────────────────────────────────────────────────────────────────────
+# Fill placeholders safely
 HTML = (HTML
     .replace("__PLOT_HTML__", plot_html)
     .replace("__PRECOMP__", json.dumps(PRECOMP))
     .replace("__GENESIS__", GENESIS_DATE.strftime("%Y-%m-%d"))
     .replace("__MAX_RAIL_SLOTS__", str(MAX_RAIL_SLOTS))
+    .replace("__IDX_MAIN__",  str(IDX_MAIN))
+    .replace("__IDX_CLICK__", str(IDX_CLICK))
+    .replace("__IDX_CURSR__", str(IDX_CURSR))
     .replace("__EPS_LOG_SPACING__", str(EPS_LOG_SPACING))
 )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Write site
-# ──────────────────────────────────────────────────────────────────────────────
+# Write
 os.makedirs(os.path.dirname(OUTPUT_HTML), exist_ok=True)
 with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
     f.write(HTML)
-print(f"Wrote", OUTPUT_HTML)
+print("Wrote", OUTPUT_HTML)
