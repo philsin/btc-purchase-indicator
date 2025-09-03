@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BTC Purchase Indicator — dynamic percentile rails with editable dashboard.
+BTC Purchase Indicator — dynamic percentile rails with editable dashboard
+and a Halvings toggle (vertical lines for past halvings, dashed for future).
 
-Key bits in this version:
-- Hover tooltip shows date + value for the active denominator (USD or ratio).
-- Right-panel rows show value + multiple vs 50% rail at the same x (e.g., $1,000,000.00 (4.0x)).
-- Hover/click drives panel into the future (to 2040). BTC price & p≈ hidden beyond last price.
-- Denominators: USD, GOLD (XAUUSD), SPX (^SPX), ETH (robust fallbacks).
-- 50% dashed (all rails dashed), rails editor, indicator multi-select.
-- Copy Chart captures current zoom/pan; buttons with hover/active feedback.
+What you get:
+- Denominators: USD, GOLD (XAUUSD), SPX (^SPX), ETH (multi-source fallback).
+- Tooltip shows date + value for active denominator (USD uses $, others raw ratio).
+- Right panel rails show value plus (Nx) vs the 50% rail at the same x.
+- Hover/click drives the panel into the future (to 2040); price & p≈ hidden beyond last price.
+- Editable rails (sorted, dashed), indicator multi-select (checkboxes), copy current view.
+- Year labels tilted 45°, chart width in pixels.
+- NEW: “Halvings” button toggles vertical gray lines for halvings (solid past, dashed future).
 """
 
 import os, io, glob, json
@@ -20,9 +22,7 @@ import plotly.graph_objects as go
 import requests
 from statsmodels.regression.quantile_regression import QuantReg
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Config
-# ──────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────── Config ─────────────────────────────
 DATA_DIR     = "data"
 BTC_FILE     = os.path.join(DATA_DIR, "btc_usd.csv")
 OUTPUT_HTML  = "docs/index.html"
@@ -35,21 +35,21 @@ RESID_WINSOR     = 0.02
 EPS_LOG_SPACING  = 0.010
 COL_BTC          = "#000000"
 
-# Auto-fetch denominators; ETH has robust fallback chain
+# Halvings: past + projected (approx every ~4 years from 2024-04-20)
+PAST_HALVINGS = ["2012-11-28", "2016-07-09", "2020-05-11", "2024-04-20"]
+FUTURE_HALVINGS = ["2028-04-20", "2032-04-20", "2036-04-19", "2040-04-19"]
+
 AUTO_DENOMS = {
     "GOLD": {"path": os.path.join(DATA_DIR, "denominator_gold.csv"),
              "url":  "https://stooq.com/q/d/l/?s=xauusd&i=d", "parser":"stooq"},
     "SPX":  {"path": os.path.join(DATA_DIR, "denominator_spx.csv"),
              "url":  "https://stooq.com/q/d/l/?s=%5Espx&i=d", "parser":"stooq"},
     "ETH":  {"path": os.path.join(DATA_DIR, "denominator_eth.csv"),
-             "url":  "https://stooq.com/q/d/l/?s=ethusd&i=d", "parser":"stooq"},  # first try stooq
+             "url":  "https://stooq.com/q/d/l/?s=ethusd&i=d", "parser":"stooq"},
 }
-
 UA = {"User-Agent":"btc-indicator/1.0"}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Data helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────── Data helpers / fetchers ───────────────────────
 def years_since_genesis(dates):
     d = pd.to_datetime(dates)
     delta_days = (d - GENESIS_DATE) / np.timedelta64(1, "D")
@@ -77,8 +77,7 @@ def fetch_btc_csv() -> pd.DataFrame:
     return df
 
 def _fetch_stooq_csv(url: str) -> pd.DataFrame:
-    r = requests.get(url, timeout=30, headers=UA)
-    r.raise_for_status()
+    r = requests.get(url, timeout=30, headers=UA); r.raise_for_status()
     df = pd.read_csv(io.StringIO(r.text))
     lower = {c: c.lower() for c in df.columns}
     df = df.rename(columns=lower)
@@ -94,94 +93,64 @@ def _fetch_eth_from_stooq() -> pd.DataFrame:
 
 def _fetch_eth_from_coingecko() -> pd.DataFrame:
     url = "https://api.coingecko.com/api/v3/coins/ethereum/market_chart?vs_currency=usd&days=max"
-    r = requests.get(url, timeout=30, headers=UA)
-    r.raise_for_status()
+    r = requests.get(url, timeout=30, headers=UA); r.raise_for_status()
     js = r.json()
-    if "prices" not in js or not js["prices"]:
-        raise ValueError("coingecko empty payload for ETH")
-    rows = js["prices"]  # [[ms, price], ...]
+    rows = js.get("prices") or []
+    if not rows: raise ValueError("coingecko empty ETH")
     df = pd.DataFrame(rows, columns=["ms", "price"])
     df["date"] = pd.to_datetime(df["ms"], unit="ms").dt.normalize()
-    out = df[["date", "price"]].sort_values("date").dropna()
+    out = df[["date","price"]].sort_values("date").dropna()
     out = out.groupby("date", as_index=False).last()
     return out
 
 def _fetch_eth_from_cryptocompare() -> pd.DataFrame:
     url = "https://min-api.cryptocompare.com/data/v2/histoday?fsym=ETH&tsym=USD&allData=true"
-    r = requests.get(url, timeout=30, headers=UA)
-    r.raise_for_status()
+    r = requests.get(url, timeout=30, headers=UA); r.raise_for_status()
     js = r.json()
-    if js.get("Response") != "Success" or "Data" not in js or "Data" not in js["Data"]:
-        raise ValueError("cryptocompare empty payload for ETH")
-    rows = js["Data"]["Data"]
-    if not rows:
-        raise ValueError("cryptocompare no rows")
+    if js.get("Response")!="Success": raise ValueError("cryptocompare not success")
+    rows = js.get("Data",{}).get("Data") or []
+    if not rows: raise ValueError("cryptocompare empty")
     df = pd.DataFrame(rows)
-    if "time" not in df.columns or "close" not in df.columns:
-        raise ValueError("cryptocompare missing columns")
     df["date"] = pd.to_datetime(df["time"], unit="s").dt.normalize()
-    df = df.rename(columns={"close":"price"})[["date","price"]]
-    df["price"] = pd.to_numeric(df["price"], errors="coerce")
-    return df.sort_values("date").dropna()
+    df = df.rename(columns={"close":"price"})[["date","price"]].sort_values("date").dropna()
+    return df
 
 def _fetch_eth_from_binance() -> pd.DataFrame:
     base = "https://api.binance.com/api/v3/klines"
     params = {"symbol":"ETHUSDT","interval":"1d","limit":1000}
-    out = []
-    start = None
+    out=[]; start=None
     while True:
-        q = params.copy()
-        if start is not None:
-            q["startTime"] = start
-        r = requests.get(base, params=q, timeout=30, headers=UA)
-        r.raise_for_status()
-        chunk = r.json()
-        if not chunk:
-            break
+        q=params.copy()
+        if start is not None: q["startTime"]=start
+        r=requests.get(base, params=q, timeout=30, headers=UA); r.raise_for_status()
+        chunk=r.json()
+        if not chunk: break
         out.extend(chunk)
-        start = int(chunk[-1][6]) + 1
-        if len(chunk) < params["limit"]:
-            break
-        if len(out) > 100000:
-            break
-    if not out:
-        raise ValueError("binance returned no data")
-    cols = ["openTime","open","high","low","close","volume","closeTime","qav","trades","takerBase","takerQuote","ignore"]
-    df = pd.DataFrame(out, columns=cols)
-    df["date"] = pd.to_datetime(df["closeTime"], unit="ms").dt.normalize()
-    df["price"] = pd.to_numeric(df["close"], errors="coerce")
-    df = df[["date","price"]].sort_values("date").dropna()
-    return df
+        start=int(chunk[-1][6])+1
+        if len(chunk)<params["limit"] or len(out)>100000: break
+    if not out: raise ValueError("binance empty")
+    cols=["openTime","open","high","low","close","volume","closeTime","qav","trades","takerBase","takerQuote","ignore"]
+    df=pd.DataFrame(out, columns=cols)
+    df["date"]=pd.to_datetime(df["closeTime"], unit="ms").dt.normalize()
+    df["price"]=pd.to_numeric(df["close"], errors="coerce")
+    return df[["date","price"]].sort_values("date").dropna()
 
 def ensure_auto_denominators():
     os.makedirs(DATA_DIR, exist_ok=True)
     for key, info in AUTO_DENOMS.items():
         path = info["path"]
-        if os.path.exists(path):
-            continue
+        if os.path.exists(path): continue
         try:
             if key == "ETH":
-                fetchers = [
-                    _fetch_eth_from_stooq,
-                    _fetch_eth_from_coingecko,
-                    _fetch_eth_from_cryptocompare,
-                    _fetch_eth_from_binance,
-                ]
-                df = None; last_err=None
-                for fn in fetchers:
+                for fn in (_fetch_eth_from_stooq, _fetch_eth_from_coingecko, _fetch_eth_from_cryptocompare, _fetch_eth_from_binance):
                     try:
                         df = fn()
-                        if df is not None and not df.empty:
-                            break
-                    except Exception as e:
-                        last_err=e
-                if df is None or df.empty:
-                    raise last_err or ValueError("ETH fetchers returned no data")
+                        if df is not None and not df.empty: break
+                    except Exception: df=None
+                if df is None or df.empty: raise ValueError("ETH fetchers returned no data")
             else:
                 df = _fetch_stooq_csv(info["url"]) if info["parser"]=="stooq" else None
-
-            if df is None or df.empty:
-                raise ValueError(f"{key} returned no data")
+            if df is None or df.empty: raise ValueError(f"{key} returned no data")
             df.to_csv(path, index=False)
             print(f"[auto-denom] wrote {path} ({len(df)} rows)")
         except Exception as e:
@@ -202,9 +171,7 @@ def load_denominators():
             print(f"[warn] skip {p}: {e}")
     return out
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Fitting / rails support
-# ──────────────────────────────────────────────────────────────────────────────
+# ───────────────────────── Fit / rails support ─────────────────────────
 def quantile_fit_loglog(x_years, y_vals, q=0.5):
     x_years = np.asarray(x_years); y_vals = np.asarray(y_vals)
     mask = np.isfinite(x_years) & np.isfinite(y_vals) & (x_years>0) & (y_vals>0)
@@ -231,9 +198,7 @@ def build_support_for_dynamic_rails(x_years, y_vals):
             "q_grid":[float(q) for q in q_grid],
             "off_grid":[float(v) for v in off_grid]}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Axis ticks
-# ──────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────── Axis ticks ─────────────────────────────
 def year_ticks_log(first_dt, last_dt):
     vals, labs = [], []
     for y in range(first_dt.year, last_dt.year+1):
@@ -241,7 +206,7 @@ def year_ticks_log(first_dt, last_dt):
         if d < first_dt or d > last_dt: continue
         vy = float(years_since_genesis(pd.Series([d])).iloc[0])
         if vy <= 0: continue
-        if y > 2026 and (y % 2 == 1):
+        if y > 2026 and (y % 2 == 1):  # hide odd labels after 2026
             continue
         vals.append(vy); labs.append(str(y))
     return vals, labs
@@ -251,9 +216,7 @@ def y_ticks():
     labs = [f"{int(10**e):,}" for e in range(0,9)]
     return vals, labs
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Build model
-# ──────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────── Build model ─────────────────────────────
 btc = fetch_btc_csv().rename(columns={"price":"btc"})
 denoms = load_denominators()
 print("[denoms]", list(denoms.keys()))
@@ -302,14 +265,12 @@ for k in sorted(denoms.keys()):
     PRECOMP[k] = build_payload(base, k)
 P0 = PRECOMP["USD"]
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Plot base figure and traces
-# ──────────────────────────────────────────────────────────────────────────────
+# ───────────────────── Plot base figure and traces ─────────────────────
 MAX_RAIL_SLOTS = 12
 IDX_MAIN  = MAX_RAIL_SLOTS
 IDX_CLICK = MAX_RAIL_SLOTS + 1
-IDX_CURSR = MAX_RAIL_SLOTS + 2   # silent cursor on midline (x_grid)
-IDX_TT    = MAX_RAIL_SLOTS + 3   # tooltip-only trace on actual series
+IDX_CURSR = MAX_RAIL_SLOTS + 2
+IDX_TT    = MAX_RAIL_SLOTS + 3
 
 def add_stub(idx):
     return go.Scatter(x=P0["x_grid"], y=[None]*len(P0["x_grid"]), mode="lines",
@@ -336,13 +297,13 @@ traces += [
 fig = go.Figure(traces)
 fig.update_layout(
     template="plotly_white",
-    hovermode="x",  # simple crosshair hover
+    hovermode="x",
     showlegend=True,
     title="BTC Purchase Indicator — ",
     xaxis=dict(type="log", title=None, tickmode="array",
                tickvals=xtickvals, ticktext=xticktext,
                tickangle=45,
-               range=[np.log10(x_start), np.log10(x_end)], showspikes=False),
+               range=[np.log10(x_start), np.log10(x_end)]),
     yaxis=dict(type="log", title=P0["label"],
                tickmode="array", tickvals=ytickvals, ticktext=yticktext),
     legend=dict(x=1.02, xanchor="left", y=1.0, yanchor="top"),
@@ -352,9 +313,7 @@ fig.update_layout(
 plot_html = fig.to_html(full_html=False, include_plotlyjs="cdn",
                         config={"responsive":True,"displayModeBar":True,"modeBarButtonsToRemove":["toImage"]})
 
-# ──────────────────────────────────────────────────────────────────────────────
-# HTML (placeholders; NO f-strings)
-# ──────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────── HTML (no f-strings inside) ─────────────────────────────────
 HTML = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"/>
@@ -391,7 +350,7 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
 #chartWpx{width:120px}
 .hidden{display:none}
 
-/* Indicator multi-select (checkbox dropdown) */
+/* Indicator multi-select */
 .indicator-wrap{position:relative; display:inline-block;}
 .indicator-btn{padding:8px 10px; border:1px solid #d1d5db; border-radius:8px; background:#fff; cursor:pointer; font-size:14px; transition:background 120ms}
 .indicator-btn:hover{background:#f3f4f6}
@@ -405,9 +364,7 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
 </style>
 </head><body>
 <div id="capture" class="layout">
-  <div class="left" id="leftCol">
-    __PLOT_HTML__
-  </div>
+  <div class="left" id="leftCol">__PLOT_HTML__</div>
   <div class="right">
     <div id="controls">
       <label for="denomSel"><b>Denominator:</b></label>
@@ -433,6 +390,7 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
         </div>
       </div>
 
+      <button id="halvingsBtn" class="btn" title="Toggle halving lines">Halvings</button>
       <button id="copyBtn" class="btn" title="Copy current view to clipboard">Copy Chart</button>
     </div>
 
@@ -459,7 +417,7 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
       </div>
     </fieldset>
 
-    <div style="font-size:12px;color:#6b7280;">Detected denominators: <span id="denomsDetected"></span></div>
+    <div class="smallnote">Detected denominators: <span id="denomsDetected"></span></div>
 
     <div id="readout">
       <div class="date">—</div>
@@ -479,6 +437,8 @@ const IDX_CLICK = __IDX_CLICK__;
 const IDX_CURSR = __IDX_CURSR__;
 const IDX_TT    = __IDX_TT__;
 const EPS_LOG_SPACING = __EPS_LOG_SPACING__;
+const PAST_HALVINGS = __PAST_HALVINGS__;
+const FUTURE_HALVINGS = __FUTURE_HALVINGS__;
 
 const MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 function yearsFromISO(iso){ const d=new Date(iso+'T00:00:00Z'); return ((d-GENESIS)/86400000)/365.25 + (1.0/365.25); }
@@ -487,19 +447,14 @@ function interp(xs, ys, x){ let lo=0,hi=xs.length-1; if(x<=xs[0]) return ys[0]; 
   while(hi-lo>1){ const m=(hi+lo)>>1; if(xs[m]<=x) lo=m; else hi=m; }
   const t=(x-xs[lo])/(xs[hi]-xs[lo]); return ys[lo]+t*(ys[hi]-ys[lo]); }
 
-// Units
 function fmtVal(P, v){
   if(!isFinite(v)) return '—';
   const dec = Math.max(0, Math.min(10, P.decimals||2));
-  if (P.unit === '$') {
-    return '$'+Number(v).toLocaleString(undefined, {minimumFractionDigits: dec, maximumFractionDigits: dec});
-  } else {
-    const maxd = Math.max(dec, 6);
-    return Number(v).toLocaleString(undefined, {minimumFractionDigits: Math.min(6, maxd), maximumFractionDigits: maxd});
-  }
+  if (P.unit === '$') return '$'+Number(v).toLocaleString(undefined,{minimumFractionDigits:dec,maximumFractionDigits:dec});
+  const maxd=Math.max(dec,6);
+  return Number(v).toLocaleString(undefined,{minimumFractionDigits:Math.min(6,maxd),maximumFractionDigits:maxd});
 }
 
-// Color + indicator mapping
 function colorForPercent(p){ const t=Math.max(0,Math.min(1,p/100));
   function hx(v){return Math.max(0,Math.min(255,Math.round(v))); }
   function toHex(r,g,b){return '#'+[r,g,b].map(v=>hx(v).toString(16).padStart(2,'0')).join('');}
@@ -528,7 +483,7 @@ function rangeForIndicator(name){
   }
 }
 
-// DOM
+// DOM refs
 const leftCol=document.getElementById('leftCol');
 const plotDiv=document.querySelector('.left .js-plotly-plot') || document.querySelector('.left .plotly-graph-div');
 const denomSel=document.getElementById('denomSel');
@@ -537,6 +492,7 @@ const btnSet=document.getElementById('setDateBtn');
 const btnToday=document.getElementById('todayBtn');
 const btnCopy=document.getElementById('copyBtn');
 const btnFit=document.getElementById('fitBtn');
+const btnHalvings=document.getElementById('halvingsBtn');
 const elDate=document.querySelector('#readout .date');
 const elRows=document.getElementById('readoutRows');
 const elMain=document.getElementById('mainVal');
@@ -549,67 +505,44 @@ const railsListText=document.getElementById('railsListText');
 const railsEditor=document.getElementById('railsEditor');
 const railItems=document.getElementById('railItems');
 const addPct=document.getElementById('addPct');
-const addBtn=document.getElementById('addBtn');
+const indicatorBtn=document.getElementById('indicatorBtn');
+const indicatorMenu=document.getElementById('indicatorMenu');
+const indicatorClear=document.getElementById('indicatorClear');
+const indicatorApply=document.getElementById('indicatorApply');
+const denomsDetected=document.getElementById('denomsDetected');
 
-// Indicator multi-select UI
-const indicatorBtn = document.getElementById('indicatorBtn');
-const indicatorMenu = document.getElementById('indicatorMenu');
-const indicatorClear = document.getElementById('indicatorClear');
-const indicatorApply = document.getElementById('indicatorApply');
-function getCheckedIndicators(){
-  const boxes = indicatorMenu.querySelectorAll('input[type=checkbox]');
-  const out=[]; boxes.forEach(b=>{ if(b.checked) out.push(b.value); });
-  return out;
-}
-function setCheckedIndicators(arr){
-  const set=new Set(arr);
-  const boxes = indicatorMenu.querySelectorAll('input[type=checkbox]');
-  boxes.forEach(b=>{ b.checked = set.has(b.value); });
-}
-function labelForIndicatorBtn(arr){
-  return (arr.length===0) ? 'Indicator: All' :
-         (arr.length===1) ? 'Indicator: '+arr[0] :
-                            'Indicator: '+arr.length+' selected';
-}
-let selectedIndicators = [];
-indicatorBtn.addEventListener('click', (e)=>{ e.stopPropagation(); indicatorMenu.classList.toggle('open'); });
-indicatorClear.addEventListener('click', (e)=>{ e.preventDefault(); setCheckedIndicators([]); });
-indicatorApply.addEventListener('click', (e)=>{
-  e.preventDefault();
-  indicatorMenu.classList.remove('open');
-  selectedIndicators = getCheckedIndicators();
-  indicatorBtn.textContent = labelForIndicatorBtn(selectedIndicators);
-  const P = PRECOMP[denomSel.value];
-  applyIndicatorMask(P);
-});
-document.addEventListener('click', (e)=>{
-  if (!indicatorMenu.contains(e.target) && !indicatorBtn.contains(e.target)){
-    indicatorMenu.classList.remove('open');
-  }
-});
+// Indicator UI
+function getCheckedIndicators(){ const boxes=indicatorMenu.querySelectorAll('input[type=checkbox]'); const out=[]; boxes.forEach(b=>{if(b.checked) out.push(b.value)}); return out;}
+function setCheckedIndicators(arr){ const set=new Set(arr); const boxes=indicatorMenu.querySelectorAll('input[type=checkbox]'); boxes.forEach(b=>{b.checked=set.has(b.value)}); }
+function labelForIndicatorBtn(arr){ return (!arr.length)?'Indicator: All':(arr.length===1?'Indicator: '+arr[0]:'Indicator: '+arr.length+' selected'); }
+let selectedIndicators=[];
+indicatorBtn.addEventListener('click',e=>{e.stopPropagation(); indicatorMenu.classList.toggle('open');});
+indicatorClear.addEventListener('click',e=>{e.preventDefault(); setCheckedIndicators([]);});
+indicatorApply.addEventListener('click',e=>{e.preventDefault(); indicatorMenu.classList.remove('open'); selectedIndicators=getCheckedIndicators(); indicatorBtn.textContent=labelForIndicatorBtn(selectedIndicators); applyIndicatorMask(PRECOMP[denomSel.value]);});
+document.addEventListener('click',e=>{ if(!indicatorMenu.contains(e.target) && !indicatorBtn.contains(e.target)) indicatorMenu.classList.remove('open'); });
 
-// Denominator dropdown (USD first)
-const denomKeys = Object.keys(PRECOMP);
-['USD', ...denomKeys.filter(k=>k!=='USD')].forEach(k=>{ const o=document.createElement('option'); o.value=k; o.textContent=k; denomSel.appendChild(o); });
-document.getElementById('denomsDetected')?.textContent = denomKeys.filter(k=>k!=='USD').join(', ') || '(none)';
+// Denominator init
+(function initDenoms(){
+  const keys=Object.keys(PRECOMP); const order=['USD'].concat(keys.filter(k=>k!=='USD'));
+  denomSel.innerHTML=''; order.forEach(k=>{ const o=document.createElement('option'); o.value=k; o.textContent=k; denomSel.appendChild(o); });
+  denomSel.value='USD';
+  if (denomsDetected) denomsDetected.textContent = order.filter(k=>k!=='USD').join(', ') || '(none)';
+})();
 
 // Rails state
-let rails = [97.5, 90, 75, 50, 25, 2.5];
-function sortRails(){ rails = rails.filter(p=>isFinite(p)).map(Number).map(p=>Math.max(0.1,Math.min(99.9,p))).filter((p,i,a)=>a.indexOf(p)===i).sort((a,b)=>b-a); }
-function railsText(){ return rails.map(p=>String(p).replace(/\.0$/,'')+'%').join(', '); }
+let rails=[97.5,90,75,50,25,2.5];
+function sortRails(){ rails=rails.filter(p=>isFinite(p)).map(Number).map(p=>Math.max(0.1,Math.min(99.9,p))).filter((p,i,a)=>a.indexOf(p)===i).sort((a,b)=>b-a); }
+function railsText(){ return rails.map(p=>String(p).replace(/\\.0$/,'')+'%').join(', '); }
 function idFor(p){ return 'v'+String(p).replace('.','_'); }
 
 function rebuildReadoutRows(){
   elRows.innerHTML='';
   rails.forEach(p=>{
     const row=document.createElement('div'); row.className='row';
-    const lab=document.createElement('div');
-    const val=document.createElement('div'); val.className='num'; val.id=idFor(p);
-    const color=colorForPercent(p);
-    const name=Math.abs(p-2.5)<1e-9?'Floor':Math.abs(p-97.5)<1e-9?'Ceiling':(p+'%');
+    const lab=document.createElement('div'); const val=document.createElement('div'); val.className='num'; val.id=idFor(p);
+    const color=colorForPercent(p); const name=Math.abs(p-2.5)<1e-9?'Floor':Math.abs(p-97.5)<1e-9?'Ceiling':(p+'%');
     lab.innerHTML=`<span style="color:${color};">${name}</span>`;
-    row.appendChild(lab); row.appendChild(val); row.appendChild(document.createElement('div'));
-    elRows.appendChild(row);
+    row.appendChild(lab); row.appendChild(val); row.appendChild(document.createElement('div')); elRows.appendChild(row);
   });
 }
 function rebuildEditor(){
@@ -627,7 +560,7 @@ function rebuildEditor(){
   });
   railsListText.textContent=railsText();
 }
-addBtn.addEventListener('click',()=>{ const v=Number(addPct.value); if(!isFinite(v)) return; rails.push(v); addPct.value=''; sortRails(); syncAll(); });
+document.getElementById('addBtn').addEventListener('click',()=>{ const v=Number(addPct.value); if(!isFinite(v)) return; rails.push(v); addPct.value=''; sortRails(); syncAll(); });
 editBtn.addEventListener('click',()=>{ railsEditor.classList.toggle('hidden'); railsView.classList.toggle('hidden'); editBtn.textContent = railsEditor.classList.contains('hidden') ? 'Edit Rails' : 'Done'; });
 
 // Sizing
@@ -636,29 +569,22 @@ function applyChartWidthPx(px){
   leftCol.style.flex='0 0 auto'; leftCol.style.width=v+'px';
   if(window.Plotly&&plotDiv) Plotly.Plots.resize(plotDiv);
 }
-document.getElementById('chartWpx').addEventListener('change',()=>applyChartWidthPx(document.getElementById('chartWpx').value));
+chartWpx.addEventListener('change',()=>applyChartWidthPx(chartWpx.value));
 btnFit.addEventListener('click',()=>{
   const total=document.documentElement.clientWidth||window.innerWidth, panel=420, pad=32;
-  const target=Math.max(400, total-panel-pad); document.getElementById('chartWpx').value=target; applyChartWidthPx(target);
+  const target=Math.max(400, total-panel-pad); chartWpx.value=target; applyChartWidthPx(target);
 });
 if(window.ResizeObserver) new ResizeObserver(()=>{ if(window.Plotly&&plotDiv) Plotly.Plots.resize(plotDiv); }).observe(leftCol);
 
 // Rails math
 function logMidline(P){ const d=P.support; return P.x_grid.map(x=> (d.a0 + d.b*Math.log10(x)) ); }
-function offsetForPercent(P, percent){
-  const d=P.support; const p01=Math.max(d.q_grid[0], Math.min(d.q_grid[d.q_grid.length-1], percent/100));
-  return interp(d.q_grid, d.off_grid, p01);
-}
+function offsetForPercent(P, percent){ const d=P.support; const p01=Math.max(d.q_grid[0], Math.min(d.q_grid[d.q_grid.length-1], percent/100)); return interp(d.q_grid, d.off_grid, p01); }
 function seriesForPercent(P, percent){
   const logM=logMidline(P), off=offsetForPercent(P,percent);
   const eps=(percent>=97.5||percent<=2.5)?EPS_LOG_SPACING:0.0;
   return logM.map(v=>Math.pow(10, v+off+(percent>=50?eps:-eps)));
 }
-function percentFromOffset(P, off){
-  const d=P.support;
-  const q=Math.max(d.q_grid[0], Math.min(d.q_grid[d.q_grid.length-1], interp(d.off_grid, d.q_grid, off)));
-  return q;
-}
+function percentFromOffset(P, off){ const d=P.support; const q=Math.max(d.q_grid[0], Math.min(d.q_grid[d.q_grid.length-1], interp(d.off_grid, d.q_grid, off))); return q; }
 
 // Render rails (all dashed)
 function renderRails(P){
@@ -667,177 +593,132 @@ function renderRails(P){
     const visible=(i<n); let restyle={visible};
     if(visible){
       const p=rails[i], color=colorForPercent(p);
-      restyle=Object.assign(restyle,{
-        x:[P.x_grid], y:[seriesForPercent(P,p)],
-        name:(Math.abs(p-2.5)<1e-9?'Floor':(Math.abs(p-97.5)<1e-9?'Ceiling':(p+'%'))),
-        line:{color:color, width:1.6, dash:'dot'}
-      });
+      restyle=Object.assign(restyle,{x:[P.x_grid], y:[seriesForPercent(P,p)], name:(Math.abs(p-2.5)<1e-9?'Floor':(Math.abs(p-97.5)<1e-9?'Ceiling':(p+'%'))), line:{color:color, width:1.6, dash:'dot'}});
     }
     Plotly.restyle(plotDiv, restyle, [i]);
   }
-  railsListText.textContent=railsText();
-  rebuildReadoutRows();
+  railsListText.textContent=railsText(); rebuildReadoutRows();
 }
 
 let locked=false, lockedX=null;
 function setTitleForP(p){ Plotly.relayout(plotDiv, {'title.text': 'BTC Purchase Indicator — '+indicatorFromP(p)}); }
 
-// Cache p-series per payload
 function computePSeries(P){
-  const d=P.support;
-  const out = new Array(P.x_main.length);
+  const d=P.support; const out=new Array(P.x_main.length);
   for (let i=0;i<P.x_main.length;i++){
-    const logx=Math.log10(P.x_main[i]);
-    const ly=Math.log10(P.y_main[i]);
-    const mid=d.a0 + d.b*logx;
-    const off=ly-mid;
-    const q = percentFromOffset(P, off);
-    out[i] = Math.max(0, Math.min(100, 100*q));
+    const logx=Math.log10(P.x_main[i]); const ly=Math.log10(P.y_main[i]);
+    const mid=d.a0 + d.b*logx; const off=ly-mid;
+    const q = percentFromOffset(P, off); out[i]=Math.max(0, Math.min(100, 100*q));
   }
   P._pSeries = out;
 }
 
-// MULTI-SELECT INDICATOR MASK (union)
+// Indicator mask
 function applyIndicatorMask(P){
-  // Cursor spans full domain using midline so hover works into future; keep tooltip off
   Plotly.restyle(plotDiv, {x:[P.x_grid], y:[seriesForPercent(P,50)], hoverinfo:['skip']}, [IDX_CURSR]);
-
   if (!selectedIndicators || selectedIndicators.length===0){
     Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main], name:[P.label]}, [IDX_MAIN]);
     Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main]},                [IDX_CLICK]);
   } else {
     if (!P._pSeries) computePSeries(P);
     const ranges = selectedIndicators.map(rangeForIndicator);
-    const ym = P.y_main.map((v,i)=>{
-      const p = P._pSeries[i];
-      for (let r of ranges){ if (p>=r[0] && p<r[1]) return v; }
-      return null;
-    });
+    const ym = P.y_main.map((v,i)=>{ const p=P._pSeries[i]; for (let r of ranges){ if (p>=r[0] && p<r[1]) return v; } return null; });
     Plotly.restyle(plotDiv, {x:[P.x_main], y:[ym], name:[P.label+' — '+selectedIndicators.join(' + ')]}, [IDX_MAIN]);
     Plotly.restyle(plotDiv, {x:[P.x_main], y:[ym]},                                                           [IDX_CLICK]);
   }
-
-  // Tooltip formatting per unit
-  const tt = (P.unit === '$')
-      ? "%{x|%b-%d-%Y}<br>$%{y:.2f}<extra></extra>"
-      : "%{x|%b-%d-%Y}<br>%{y:.6f}<extra></extra>";
+  const tt = (P.unit === '$') ? "%{x|%b-%d-%Y}<br>$%{y:.2f}<extra></extra>" : "%{x|%b-%d-%Y}<br>%{y:.6f}<extra></extra>";
   Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main], hovertemplate:[tt], line:[{width:0}]}, [IDX_TT]);
 }
 
 function updatePanel(P,xYears){
-  // Always update date
   elDate.textContent=shortDateFromYears(xYears);
-
-  // v50 first, for (Nx)
   const v50 = interp(P.x_grid, seriesForPercent(P,50), xYears);
+  rails.forEach(p=>{ const v=interp(P.x_grid, seriesForPercent(P,p), xYears); const el=document.getElementById(idFor(p)); if(!el) return; const mult=(v50>0&&isFinite(v50))?` (${(v/v50).toFixed(1)}x)`:''; el.textContent=fmtVal(P,v)+mult; });
 
-  // Rails readout with (Nx)
-  rails.forEach(p=>{
-    const v = interp(P.x_grid, seriesForPercent(P,p), xYears);
-    const el = document.getElementById(idFor(p));
-    if (!el) return;
-    const mult = (v50>0 && isFinite(v50)) ? ` (${(v / v50).toFixed(1)}x)` : '';
-    el.textContent = fmtVal(P, v) + mult;
-  });
-
-  // Main price & p — hide in future
-  const lastX = P.x_main[P.x_main.length-1];
-  if (xYears > lastX){
-    elMain.textContent='—';
-    elP.textContent='(p≈—)';
-  } else {
+  const lastX=P.x_main[P.x_main.length-1];
+  if (xYears>lastX){ elMain.textContent='—'; elP.textContent='(p≈—)'; }
+  else{
     let idx=0,best=1e99; for(let i=0;i<P.x_main.length;i++){ const d=Math.abs(P.x_main[i]-xYears); if(d<best){best=d; idx=i;} }
-    const y=P.y_main[idx];
-    elMain.textContent=fmtVal(P,y);
-    elMainLabel.textContent=(P.unit==='$'?'BTC Price:':'BTC Ratio:');
-
+    const y=P.y_main[idx]; elMain.textContent=fmtVal(P,y); elMainLabel.textContent=(P.unit==='$'?'BTC Price:':'BTC Ratio:');
     const d=P.support, logx=Math.log10(xYears), ly=Math.log10(y), mid=d.a0+d.b*logx, off=ly-mid;
     const pVal=Math.max(0, Math.min(100, 100*percentFromOffset(P, off)));
     elP.textContent=`(p≈${pVal.toFixed(1)}%)`; setTitleForP(pVal);
   }
-
   Plotly.relayout(plotDiv, {"yaxis.title.text": P.label});
 }
 
-// Click annotation (ignored if locked)
+// Click → update panel + annotation
 plotDiv.on('plotly_click', ev=>{
-  if(!(ev.points && ev.points.length)) return;
-  if (locked) return;
-  const xYears = ev.points[0].x;
-  const P = PRECOMP[denomSel.value];
-  const yMid = interp(P.x_grid, seriesForPercent(P,50), xYears);
-  const yAbove = yMid * 1.2;
+  if(!(ev.points && ev.points.length) || locked) return;
+  const xYears=ev.points[0].x; const P=PRECOMP[denomSel.value];
+  const yMid=interp(P.x_grid, seriesForPercent(P,50), xYears); const yAbove=yMid*1.2;
   const text=shortDateFromYears(xYears);
-  const ann = { x:xYears, y:yAbove, xref:'x', yref:'y', text, showarrow:true, arrowhead:2, ax:0, ay:-20,
-                bgcolor:'rgba(255,255,255,0.95)', bordercolor:'#94a3b8', font:{size:12}};
-  Plotly.relayout(plotDiv, {annotations:[ann]});
-  updatePanel(P, xYears);
+  const ann={x:xYears,y:yAbove,xref:'x',yref:'y',text,showarrow:true,arrowhead:2,ax:0,ay:-20,bgcolor:'rgba(255,255,255,0.95)',bordercolor:'#94a3b8',font:{size:12}};
+  Plotly.relayout(plotDiv,{annotations:[ann]}); updatePanel(P,xYears);
 });
 
-// Hover drives panel when unlocked — works into future via cursor trace
+// Hover drives panel when unlocked
 plotDiv.on('plotly_hover', ev=>{
-  if(!(ev.points && ev.points.length)) return;
-  if (locked) return;
+  if(!(ev.points && ev.points.length) || locked) return;
   updatePanel(PRECOMP[denomSel.value], ev.points[0].x);
 });
 
 // Date buttons
-document.getElementById('setDateBtn').onclick = ()=>{ if(!datePick.value) return; locked=true; lockedX=yearsFromISO(datePick.value); updatePanel(PRECOMP[denomSel.value], lockedX); };
-document.getElementById('todayBtn').onclick = ()=>{ const P = PRECOMP[denomSel.value]; locked=true; lockedX=P.x_main[P.x_main.length-1]; updatePanel(P, lockedX); };
+btnSet.onclick=()=>{ if(!datePick.value) return; locked=true; lockedX=yearsFromISO(datePick.value); updatePanel(PRECOMP[denomSel.value], lockedX); };
+btnToday.onclick=()=>{ const P=PRECOMP[denomSel.value]; locked=true; lockedX=P.x_main[P.x_main.length-1]; updatePanel(P, lockedX); };
 
-// Copy current view
-document.getElementById('copyBtn').onclick = async ()=>{
-  try{
-    const url = await Plotly.toImage(plotDiv, {format:'png', scale:2});
-    if (navigator.clipboard && window.ClipboardItem){
-      const blob = await (await fetch(url)).blob();
-      await navigator.clipboard.write([new ClipboardItem({'image/png': blob})]);
-    } else {
-      const a=document.createElement('a'); a.href=url; a.download='btc-indicator.png'; document.body.appendChild(a); a.click(); a.remove();
-    }
-  }catch(e){ console.error('Copy Chart failed:', e); alert('Copy failed.'); }
-};
+// Copy chart
+btnCopy.onclick=async ()=>{ try{ const url=await Plotly.toImage(plotDiv,{format:'png',scale:2}); if(navigator.clipboard && window.ClipboardItem){ const blob=await (await fetch(url)).blob(); await navigator.clipboard.write([new ClipboardItem({'image/png':blob})]); } else { const a=document.createElement('a'); a.href=url; a.download='btc-indicator.png'; document.body.appendChild(a); a.click(); a.remove(); } }catch(e){ console.error('Copy Chart failed:', e); alert('Copy failed.'); } };
 
 // Denominator change
-denomSel.onchange = ()=>{
-  const key=denomSel.value, P=PRECOMP[key];
-  Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main], name:[P.label]}, [IDX_MAIN]);
-  Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main]},                [IDX_CLICK]);
-  Plotly.relayout(plotDiv, {annotations: []});
-  renderRails(P);
-  applyIndicatorMask(P);
-  const x = locked ? lockedX : P.x_main[P.x_main.length-1];
-  updatePanel(P, x);
+denomSel.onchange=()=>{ const key=denomSel.value, P=PRECOMP[key];
+  Plotly.restyle(plotDiv,{x:[P.x_main],y:[P.y_main],name:[P.label]},[IDX_MAIN]);
+  Plotly.restyle(plotDiv,{x:[P.x_main],y:[P.y_main]},[IDX_CLICK]);
+  Plotly.relayout(plotDiv,{annotations:[]}); renderRails(P); applyIndicatorMask(P);
+  const x=locked?lockedX:P.x_main[P.x_main.length-1]; updatePanel(P,x);
 };
 
-// Sync
-function syncAll(){
-  sortRails(); rebuildEditor();
-  const P = PRECOMP[denomSel.value];
-  renderRails(P);
-  applyIndicatorMask(P);
-  const x = locked ? lockedX : P.x_main[P.x_main.length-1];
-  updatePanel(P, x);
-}
+// Sync all
+function syncAll(){ sortRails(); rebuildEditor(); const P=PRECOMP[denomSel.value]; renderRails(P); applyIndicatorMask(P); const x=locked?lockedX:P.x_main[P.x_main.length-1]; updatePanel(P,x); }
 
 // Init
-denomSel.value='USD';
-rebuildReadoutRows(); rebuildEditor();
-renderRails(PRECOMP['USD']);
-applyIndicatorMask(PRECOMP['USD']);
-{
-  const P = PRECOMP['USD'];
-  const tt = "%{x|%b-%d-%Y}<br>$%{y:.2f}<extra></extra>";
-  Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main], hovertemplate:[tt], line:[{width:0}]}, [IDX_TT]);
+(function init(){
+  rebuildReadoutRows(); rebuildEditor();
+  renderRails(PRECOMP['USD']); applyIndicatorMask(PRECOMP['USD']);
+  const P=PRECOMP['USD']; const tt="%{x|%b-%d-%Y}<br>$%{y:.2f}<extra></extra>";
+  Plotly.restyle(plotDiv,{x:[P.x_main],y:[P.y_main],hovertemplate:[tt],line:[{width:0}]},[IDX_TT]);
+  updatePanel(P, P.x_main[P.x_main.length-1]);
+})();
+
+// ─────────────────────── Halvings toggle (NEW) ───────────────────────
+let halvingsOn=false;
+function makeHalvingShapes(){
+  const shapes=[];
+  function lineAt(xYears, dashed){
+    return {type:'line', xref:'x', yref:'paper', x0:xYears, x1:xYears, y0:0, y1:1,
+            line:{color:'#9CA3AF', width:1.2, dash:(dashed?'dash':'solid')}, layer:'below'};
+  }
+  PAST_HALVINGS.forEach(iso=>{ const x=yearsFromISO(iso); shapes.push(lineAt(x,false)); });
+  FUTURE_HALVINGS.forEach(iso=>{ const x=yearsFromISO(iso); shapes.push(lineAt(x,true)); });
+  return shapes;
 }
-updatePanel(PRECOMP['USD'], PRECOMP['USD'].x_main[PRECOMP['USD'].x_main.length-1]);
+btnHalvings.onclick=()=>{ halvingsOn=!halvingsOn;
+  const curr=plotDiv.layout.shapes||[];
+  if(halvingsOn){
+    Plotly.relayout(plotDiv, {shapes:[].concat(curr, makeHalvingShapes())});
+    btnHalvings.textContent='Halvings ✓';
+  }else{
+    // remove all halving lines by filtering on color/dash signature we used
+    const remain=(plotDiv.layout.shapes||[]).filter(s=>!(s.line && s.line.color==='#9CA3AF'));
+    Plotly.relayout(plotDiv, {shapes:remain});
+    btnHalvings.textContent='Halvings';
+  }
+};
 </script>
 </body></html>
 """
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Fill placeholders safely (no f-strings in HTML)
-# ──────────────────────────────────────────────────────────────────────────────
+# ───────────────────────── Fill placeholders (safe) ─────────────────────────
 HTML = (HTML
     .replace("__PLOT_HTML__", plot_html)
     .replace("__PRECOMP__", json.dumps(PRECOMP))
@@ -848,11 +729,11 @@ HTML = (HTML
     .replace("__IDX_CURSR__", str(IDX_CURSR))
     .replace("__IDX_TT__",    str(IDX_TT))
     .replace("__EPS_LOG_SPACING__", str(EPS_LOG_SPACING))
+    .replace("__PAST_HALVINGS__", json.dumps(PAST_HALVINGS))
+    .replace("__FUTURE_HALVINGS__", json.dumps(FUTURE_HALVINGS))
 )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Write site
-# ──────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────── Write site ─────────────────────────────
 os.makedirs(os.path.dirname(OUTPUT_HTML), exist_ok=True)
 with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
     f.write(HTML)
