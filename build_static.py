@@ -3,14 +3,13 @@
 """
 BTC Purchase Indicator — dynamic percentile rails with editable dashboard.
 
-Features:
-- Hover/click drives the panel (even into future up to 2040). When beyond the last BTC price,
-  the BTC price and p≈ are hidden; date and rails still update.
-- Denominators: USD, GOLD (XAUUSD), SPX (^SPX), ETH (ETHUSD with robust fallbacks).
-- Indicator multi-select dropdown (checkboxes) for union filtering of time segments.
-- 50% rail dashed; all rails dashed, sorted high→low; editable/add/remove.
-- Copy Chart captures current zoom/pan (clipboard + download fallback).
-- Year tick labels tilted 45°.
+Key bits in this version:
+- Hover tooltip shows date + value for the active denominator (USD or ratio).
+- Right-panel rows show value + multiple vs 50% rail at the same x (e.g., $1,000,000.00 (4.0x)).
+- Hover/click drives panel into the future (to 2040). BTC price & p≈ hidden beyond last price.
+- Denominators: USD, GOLD (XAUUSD), SPX (^SPX), ETH (robust fallbacks).
+- 50% dashed (all rails dashed), rails editor, indicator multi-select.
+- Copy Chart captures current zoom/pan; buttons with hover/active feedback.
 """
 
 import os, io, glob, json
@@ -43,7 +42,7 @@ AUTO_DENOMS = {
     "SPX":  {"path": os.path.join(DATA_DIR, "denominator_spx.csv"),
              "url":  "https://stooq.com/q/d/l/?s=%5Espx&i=d", "parser":"stooq"},
     "ETH":  {"path": os.path.join(DATA_DIR, "denominator_eth.csv"),
-             "url":  "https://stooq.com/q/d/l/?s=ethusd&i=d", "parser":"stooq"},  # try stooq first
+             "url":  "https://stooq.com/q/d/l/?s=ethusd&i=d", "parser":"stooq"},  # first try stooq
 }
 
 UA = {"User-Agent":"btc-indicator/1.0"}
@@ -81,7 +80,6 @@ def _fetch_stooq_csv(url: str) -> pd.DataFrame:
     r = requests.get(url, timeout=30, headers=UA)
     r.raise_for_status()
     df = pd.read_csv(io.StringIO(r.text))
-    # tolerant to schema shifts
     lower = {c: c.lower() for c in df.columns}
     df = df.rename(columns=lower)
     if "date" not in df.columns or "close" not in df.columns or df.empty:
@@ -109,7 +107,6 @@ def _fetch_eth_from_coingecko() -> pd.DataFrame:
     return out
 
 def _fetch_eth_from_cryptocompare() -> pd.DataFrame:
-    """ETH-USD daily from CryptoCompare (no key)."""
     url = "https://min-api.cryptocompare.com/data/v2/histoday?fsym=ETH&tsym=USD&allData=true"
     r = requests.get(url, timeout=30, headers=UA)
     r.raise_for_status()
@@ -128,7 +125,6 @@ def _fetch_eth_from_cryptocompare() -> pd.DataFrame:
     return df.sort_values("date").dropna()
 
 def _fetch_eth_from_binance() -> pd.DataFrame:
-    """ETH-USD (via USDT) daily klines from Binance. Back to ~2017. Good as last fallback."""
     base = "https://api.binance.com/api/v3/klines"
     params = {"symbol":"ETHUSDT","interval":"1d","limit":1000}
     out = []
@@ -143,7 +139,7 @@ def _fetch_eth_from_binance() -> pd.DataFrame:
         if not chunk:
             break
         out.extend(chunk)
-        start = int(chunk[-1][6]) + 1  # next after last closeTime
+        start = int(chunk[-1][6]) + 1
         if len(chunk) < params["limit"]:
             break
         if len(out) > 100000:
@@ -165,23 +161,20 @@ def ensure_auto_denominators():
             continue
         try:
             if key == "ETH":
-                # Try Stooq -> CoinGecko -> CryptoCompare -> Binance
                 fetchers = [
                     _fetch_eth_from_stooq,
                     _fetch_eth_from_coingecko,
                     _fetch_eth_from_cryptocompare,
                     _fetch_eth_from_binance,
                 ]
-                last_err = None
-                df = None
+                df = None; last_err=None
                 for fn in fetchers:
                     try:
                         df = fn()
                         if df is not None and not df.empty:
                             break
                     except Exception as e:
-                        last_err = e
-                        continue
+                        last_err=e
                 if df is None or df.empty:
                     raise last_err or ValueError("ETH fetchers returned no data")
             else:
@@ -248,7 +241,7 @@ def year_ticks_log(first_dt, last_dt):
         if d < first_dt or d > last_dt: continue
         vy = float(years_since_genesis(pd.Series([d])).iloc[0])
         if vy <= 0: continue
-        if y > 2026 and (y % 2 == 1):  # hide odd labels after 2026
+        if y > 2026 and (y % 2 == 1):
             continue
         vals.append(vy); labs.append(str(y))
     return vals, labs
@@ -310,17 +303,18 @@ for k in sorted(denoms.keys()):
 P0 = PRECOMP["USD"]
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Base figure (rails + main + click catcher + cursor)
+# Plot base figure and traces
 # ──────────────────────────────────────────────────────────────────────────────
 MAX_RAIL_SLOTS = 12
 IDX_MAIN  = MAX_RAIL_SLOTS
 IDX_CLICK = MAX_RAIL_SLOTS + 1
-IDX_CURSR = MAX_RAIL_SLOTS + 2  # invisible hover cursor (midline) covering full domain
+IDX_CURSR = MAX_RAIL_SLOTS + 2   # silent cursor on midline (x_grid)
+IDX_TT    = MAX_RAIL_SLOTS + 3   # tooltip-only trace on actual series
 
 def add_stub(idx):
-    # dashed for all rails, including 50%
     return go.Scatter(x=P0["x_grid"], y=[None]*len(P0["x_grid"]), mode="lines",
-                      name=f"Rail {idx+1}", line=dict(width=1.6, color="#999", dash="dot"),
+                      name=f"Rail {idx+1}",
+                      line=dict(width=1.6, color="#999", dash="dot"),
                       visible=False, hoverinfo="skip")
 
 traces = [add_stub(i) for i in range(MAX_RAIL_SLOTS)]
@@ -330,16 +324,19 @@ traces += [
     go.Scatter(x=P0["x_main"], y=P0["y_main"], mode="lines",
                name="_click", showlegend=False, hoverinfo="skip",
                line=dict(width=18, color="rgba(0,0,0,0.001)")),
-    # cursor spans midline so hover works into future
     go.Scatter(x=P0["x_grid"], y=[None]*len(P0["x_grid"]), mode="lines",
-               name="_cursor", showlegend=False, hoverinfo="x",
+               name="_cursor", showlegend=False, hoverinfo="skip",
                line=dict(width=0.1, color="rgba(0,0,0,0.001)")),
+    go.Scatter(x=P0["x_main"], y=P0["y_main"], mode="lines",
+               name="_tooltip", showlegend=False,
+               hovertemplate="%{x|%b-%d-%Y}<br>$%{y:.2f}<extra></extra>",
+               line=dict(width=0, color="rgba(0,0,0,0)")),
 ]
 
 fig = go.Figure(traces)
 fig.update_layout(
     template="plotly_white",
-    hovermode="x unified",
+    hovermode="x",  # simple crosshair hover
     showlegend=True,
     title="BTC Purchase Indicator — ",
     xaxis=dict(type="log", title=None, tickmode="array",
@@ -480,6 +477,7 @@ const MAX_SLOTS = __MAX_RAIL_SLOTS__;
 const IDX_MAIN  = __IDX_MAIN__;
 const IDX_CLICK = __IDX_CLICK__;
 const IDX_CURSR = __IDX_CURSR__;
+const IDX_TT    = __IDX_TT__;
 const EPS_LOG_SPACING = __EPS_LOG_SPACING__;
 
 const MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -539,7 +537,6 @@ const btnSet=document.getElementById('setDateBtn');
 const btnToday=document.getElementById('todayBtn');
 const btnCopy=document.getElementById('copyBtn');
 const btnFit=document.getElementById('fitBtn');
-const elDenoms=document.getElementById('denomsDetected');
 const elDate=document.querySelector('#readout .date');
 const elRows=document.getElementById('readoutRows');
 const elMain=document.getElementById('mainVal');
@@ -574,14 +571,9 @@ function labelForIndicatorBtn(arr){
          (arr.length===1) ? 'Indicator: '+arr[0] :
                             'Indicator: '+arr.length+' selected';
 }
-indicatorBtn.addEventListener('click', (e)=>{
-  e.stopPropagation();
-  indicatorMenu.classList.toggle('open');
-});
-indicatorClear.addEventListener('click', (e)=>{
-  e.preventDefault();
-  setCheckedIndicators([]);
-});
+let selectedIndicators = [];
+indicatorBtn.addEventListener('click', (e)=>{ e.stopPropagation(); indicatorMenu.classList.toggle('open'); });
+indicatorClear.addEventListener('click', (e)=>{ e.preventDefault(); setCheckedIndicators([]); });
 indicatorApply.addEventListener('click', (e)=>{
   e.preventDefault();
   indicatorMenu.classList.remove('open');
@@ -599,7 +591,7 @@ document.addEventListener('click', (e)=>{
 // Denominator dropdown (USD first)
 const denomKeys = Object.keys(PRECOMP);
 ['USD', ...denomKeys.filter(k=>k!=='USD')].forEach(k=>{ const o=document.createElement('option'); o.value=k; o.textContent=k; denomSel.appendChild(o); });
-document.getElementById('denomsDetected').textContent = denomKeys.filter(k=>k!=='USD').join(', ') || '(none)';
+document.getElementById('denomsDetected')?.textContent = denomKeys.filter(k=>k!=='USD').join(', ') || '(none)';
 
 // Rails state
 let rails = [97.5, 90, 75, 50, 25, 2.5];
@@ -644,10 +636,10 @@ function applyChartWidthPx(px){
   leftCol.style.flex='0 0 auto'; leftCol.style.width=v+'px';
   if(window.Plotly&&plotDiv) Plotly.Plots.resize(plotDiv);
 }
-chartWpx.addEventListener('change',()=>applyChartWidthPx(chartWpx.value));
+document.getElementById('chartWpx').addEventListener('change',()=>applyChartWidthPx(document.getElementById('chartWpx').value));
 btnFit.addEventListener('click',()=>{
   const total=document.documentElement.clientWidth||window.innerWidth, panel=420, pad=32;
-  const target=Math.max(400, total-panel-pad); chartWpx.value=target; applyChartWidthPx(target);
+  const target=Math.max(400, total-panel-pad); document.getElementById('chartWpx').value=target; applyChartWidthPx(target);
 });
 if(window.ResizeObserver) new ResizeObserver(()=>{ if(window.Plotly&&plotDiv) Plotly.Plots.resize(plotDiv); }).observe(leftCol);
 
@@ -688,7 +680,6 @@ function renderRails(P){
 }
 
 let locked=false, lockedX=null;
-
 function setTitleForP(p){ Plotly.relayout(plotDiv, {'title.text': 'BTC Purchase Indicator — '+indicatorFromP(p)}); }
 
 // Cache p-series per payload
@@ -707,44 +698,54 @@ function computePSeries(P){
 }
 
 // MULTI-SELECT INDICATOR MASK (union)
-let selectedIndicators = []; // none => All
 function applyIndicatorMask(P){
-  // Cursor spans full domain using midline so hover works into future
-  Plotly.restyle(plotDiv, {x:[P.x_grid], y:[seriesForPercent(P,50)]}, [IDX_CURSR]);
+  // Cursor spans full domain using midline so hover works into future; keep tooltip off
+  Plotly.restyle(plotDiv, {x:[P.x_grid], y:[seriesForPercent(P,50)], hoverinfo:['skip']}, [IDX_CURSR]);
 
   if (!selectedIndicators || selectedIndicators.length===0){
     Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main], name:[P.label]}, [IDX_MAIN]);
     Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main]},                [IDX_CLICK]);
-    return;
+  } else {
+    if (!P._pSeries) computePSeries(P);
+    const ranges = selectedIndicators.map(rangeForIndicator);
+    const ym = P.y_main.map((v,i)=>{
+      const p = P._pSeries[i];
+      for (let r of ranges){ if (p>=r[0] && p<r[1]) return v; }
+      return null;
+    });
+    Plotly.restyle(plotDiv, {x:[P.x_main], y:[ym], name:[P.label+' — '+selectedIndicators.join(' + ')]}, [IDX_MAIN]);
+    Plotly.restyle(plotDiv, {x:[P.x_main], y:[ym]},                                                           [IDX_CLICK]);
   }
-  if (!P._pSeries) computePSeries(P);
-  const ranges = selectedIndicators.map(rangeForIndicator);
-  const ym = P.y_main.map((v,i)=>{
-    const p = P._pSeries[i];
-    for (let r of ranges){ if (p>=r[0] && p<r[1]) return v; }
-    return null;
-  });
-  Plotly.restyle(plotDiv, {x:[P.x_main], y:[ym], name:[P.label+' — '+selectedIndicators.join(' + ')]}, [IDX_MAIN]);
-  Plotly.restyle(plotDiv, {x:[P.x_main], y:[ym]},                                                           [IDX_CLICK]);
+
+  // Tooltip formatting per unit
+  const tt = (P.unit === '$')
+      ? "%{x|%b-%d-%Y}<br>$%{y:.2f}<extra></extra>"
+      : "%{x|%b-%d-%Y}<br>%{y:.6f}<extra></extra>";
+  Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main], hovertemplate:[tt], line:[{width:0}]}, [IDX_TT]);
 }
 
 function updatePanel(P,xYears){
-  // Always update date — even in the future
+  // Always update date
   elDate.textContent=shortDateFromYears(xYears);
 
-  // Rails readout (exists for future dates via x_grid)
+  // v50 first, for (Nx)
+  const v50 = interp(P.x_grid, seriesForPercent(P,50), xYears);
+
+  // Rails readout with (Nx)
   rails.forEach(p=>{
-    const v=interp(P.x_grid, seriesForPercent(P,p), xYears);
-    const el=document.getElementById(idFor(p)); if(el) el.textContent=fmtVal(P, v);
+    const v = interp(P.x_grid, seriesForPercent(P,p), xYears);
+    const el = document.getElementById(idFor(p));
+    if (!el) return;
+    const mult = (v50>0 && isFinite(v50)) ? ` (${(v / v50).toFixed(1)}x)` : '';
+    el.textContent = fmtVal(P, v) + mult;
   });
 
-  // If xYears beyond last BTC point, hide main price & p
+  // Main price & p — hide in future
   const lastX = P.x_main[P.x_main.length-1];
   if (xYears > lastX){
     elMain.textContent='—';
     elP.textContent='(p≈—)';
   } else {
-    // nearest main point
     let idx=0,best=1e99; for(let i=0;i<P.x_main.length;i++){ const d=Math.abs(P.x_main[i]-xYears); if(d<best){best=d; idx=i;} }
     const y=P.y_main[idx];
     elMain.textContent=fmtVal(P,y);
@@ -764,7 +765,6 @@ plotDiv.on('plotly_click', ev=>{
   if (locked) return;
   const xYears = ev.points[0].x;
   const P = PRECOMP[denomSel.value];
-  // annotation y position based on midline (works in future)
   const yMid = interp(P.x_grid, seriesForPercent(P,50), xYears);
   const yAbove = yMid * 1.2;
   const text=shortDateFromYears(xYears);
@@ -781,16 +781,12 @@ plotDiv.on('plotly_hover', ev=>{
   updatePanel(PRECOMP[denomSel.value], ev.points[0].x);
 });
 
-// Tilt year labels to 45° (also set in layout)
-function tiltYearLabels(){ Plotly.relayout(plotDiv, {'xaxis.tickangle':45}); }
-tiltYearLabels();
-
 // Date buttons
-btnSet.onclick = ()=>{ if(!datePick.value) return; locked=true; lockedX=yearsFromISO(datePick.value); updatePanel(PRECOMP[denomSel.value], lockedX); };
-btnToday.onclick = ()=>{ const P = PRECOMP[denomSel.value]; locked=true; lockedX=P.x_main[P.x_main.length-1]; updatePanel(P, lockedX); };
+document.getElementById('setDateBtn').onclick = ()=>{ if(!datePick.value) return; locked=true; lockedX=yearsFromISO(datePick.value); updatePanel(PRECOMP[denomSel.value], lockedX); };
+document.getElementById('todayBtn').onclick = ()=>{ const P = PRECOMP[denomSel.value]; locked=true; lockedX=P.x_main[P.x_main.length-1]; updatePanel(P, lockedX); };
 
 // Copy current view
-btnCopy.onclick = async ()=>{
+document.getElementById('copyBtn').onclick = async ()=>{
   try{
     const url = await Plotly.toImage(plotDiv, {format:'png', scale:2});
     if (navigator.clipboard && window.ClipboardItem){
@@ -799,7 +795,7 @@ btnCopy.onclick = async ()=>{
     } else {
       const a=document.createElement('a'); a.href=url; a.download='btc-indicator.png'; document.body.appendChild(a); a.click(); a.remove();
     }
-  }catch(e){ console.error('Copy Chart failed:', e); alert('Copy failed. Try again or use the downloaded image.'); }
+  }catch(e){ console.error('Copy Chart failed:', e); alert('Copy failed.'); }
 };
 
 // Denominator change
@@ -807,8 +803,6 @@ denomSel.onchange = ()=>{
   const key=denomSel.value, P=PRECOMP[key];
   Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main], name:[P.label]}, [IDX_MAIN]);
   Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main]},                [IDX_CLICK]);
-  // Cursor spans full domain using midline so hover works into future
-  Plotly.restyle(plotDiv, {x:[P.x_grid], y:[seriesForPercent(P,50)]},  [IDX_CURSR]);
   Plotly.relayout(plotDiv, {annotations: []});
   renderRails(P);
   applyIndicatorMask(P);
@@ -831,6 +825,11 @@ denomSel.value='USD';
 rebuildReadoutRows(); rebuildEditor();
 renderRails(PRECOMP['USD']);
 applyIndicatorMask(PRECOMP['USD']);
+{
+  const P = PRECOMP['USD'];
+  const tt = "%{x|%b-%d-%Y}<br>$%{y:.2f}<extra></extra>";
+  Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main], hovertemplate:[tt], line:[{width:0}]}, [IDX_TT]);
+}
 updatePanel(PRECOMP['USD'], PRECOMP['USD'].x_main[PRECOMP['USD'].x_main.length-1]);
 </script>
 </body></html>
@@ -847,6 +846,7 @@ HTML = (HTML
     .replace("__IDX_MAIN__",  str(IDX_MAIN))
     .replace("__IDX_CLICK__", str(IDX_CLICK))
     .replace("__IDX_CURSR__", str(IDX_CURSR))
+    .replace("__IDX_TT__",    str(IDX_TT))
     .replace("__EPS_LOG_SPACING__", str(EPS_LOG_SPACING))
 )
 
