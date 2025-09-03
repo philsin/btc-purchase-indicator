@@ -3,18 +3,14 @@
 """
 BTC Purchase Indicator — dynamic percentile rails with editable dashboard.
 
-Updates in this version:
-- Hover and click update the panel even in the FUTURE (to 2040) via invisible x_grid traces.
-  - Future dates show Date, rails; BTC Price and p≈ are '—'.
-- X-axis year labels tilted 45°.
-- Copy Chart: robust clipboard + guaranteed download fallback, with button feedback.
-- Buttons have pointer cursor, hover color, and press feedback.
-
-Also includes:
-- Denominators: USD, GOLD (XAUUSD), SPX (^SPX), ETH (ETHUSD with CoinGecko fallback).
-- Multi-select Indicator (checkbox dropdown) to show any combination of bands.
-- Dashed rails (including 50%), editable rails list.
-- Width-in-pixels control (+ Fit).
+Features:
+- Hover/click drives the panel (even into future up to 2040). When beyond the last BTC price,
+  the BTC price and p≈ are hidden; date and rails still update.
+- Denominators: USD, GOLD (XAUUSD), SPX (^SPX), ETH (ETHUSD with robust fallbacks).
+- Indicator multi-select dropdown (checkboxes) for union filtering of time segments.
+- 50% rail dashed; all rails dashed, sorted high→low; editable/add/remove.
+- Copy Chart captures current zoom/pan (clipboard + download fallback).
+- Year tick labels tilted 45°.
 """
 
 import os, io, glob, json
@@ -40,15 +36,17 @@ RESID_WINSOR     = 0.02
 EPS_LOG_SPACING  = 0.010
 COL_BTC          = "#000000"
 
-# Auto-fetch denominators; ETH has robust fallback
+# Auto-fetch denominators; ETH has robust fallback chain
 AUTO_DENOMS = {
     "GOLD": {"path": os.path.join(DATA_DIR, "denominator_gold.csv"),
              "url":  "https://stooq.com/q/d/l/?s=xauusd&i=d", "parser":"stooq"},
     "SPX":  {"path": os.path.join(DATA_DIR, "denominator_spx.csv"),
              "url":  "https://stooq.com/q/d/l/?s=%5Espx&i=d", "parser":"stooq"},
     "ETH":  {"path": os.path.join(DATA_DIR, "denominator_eth.csv"),
-             "url":  "https://stooq.com/q/d/l/?s=ethusd&i=d", "parser":"stooq"},  # stooq first, then fallback
+             "url":  "https://stooq.com/q/d/l/?s=ethusd&i=d", "parser":"stooq"},  # try stooq first
 }
+
+UA = {"User-Agent":"btc-indicator/1.0"}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Data helpers
@@ -64,7 +62,7 @@ def fetch_btc_csv() -> pd.DataFrame:
         df = pd.read_csv(BTC_FILE, parse_dates=["date"])
         return df.sort_values("date").dropna()
     url = "https://api.blockchain.info/charts/market-price?timespan=all&format=csv&sampled=false"
-    r = requests.get(url, timeout=30); r.raise_for_status()
+    r = requests.get(url, timeout=30, headers=UA); r.raise_for_status()
     raw = r.text.strip()
     if raw.splitlines()[0].lower().startswith("timestamp"):
         df = pd.read_csv(io.StringIO(raw))
@@ -80,7 +78,7 @@ def fetch_btc_csv() -> pd.DataFrame:
     return df
 
 def _fetch_stooq_csv(url: str) -> pd.DataFrame:
-    r = requests.get(url, timeout=30)
+    r = requests.get(url, timeout=30, headers=UA)
     r.raise_for_status()
     df = pd.read_csv(io.StringIO(r.text))
     # tolerant to schema shifts
@@ -98,7 +96,7 @@ def _fetch_eth_from_stooq() -> pd.DataFrame:
 
 def _fetch_eth_from_coingecko() -> pd.DataFrame:
     url = "https://api.coingecko.com/api/v3/coins/ethereum/market_chart?vs_currency=usd&days=max"
-    r = requests.get(url, timeout=30)
+    r = requests.get(url, timeout=30, headers=UA)
     r.raise_for_status()
     js = r.json()
     if "prices" not in js or not js["prices"]:
@@ -110,6 +108,55 @@ def _fetch_eth_from_coingecko() -> pd.DataFrame:
     out = out.groupby("date", as_index=False).last()
     return out
 
+def _fetch_eth_from_cryptocompare() -> pd.DataFrame:
+    """ETH-USD daily from CryptoCompare (no key)."""
+    url = "https://min-api.cryptocompare.com/data/v2/histoday?fsym=ETH&tsym=USD&allData=true"
+    r = requests.get(url, timeout=30, headers=UA)
+    r.raise_for_status()
+    js = r.json()
+    if js.get("Response") != "Success" or "Data" not in js or "Data" not in js["Data"]:
+        raise ValueError("cryptocompare empty payload for ETH")
+    rows = js["Data"]["Data"]
+    if not rows:
+        raise ValueError("cryptocompare no rows")
+    df = pd.DataFrame(rows)
+    if "time" not in df.columns or "close" not in df.columns:
+        raise ValueError("cryptocompare missing columns")
+    df["date"] = pd.to_datetime(df["time"], unit="s").dt.normalize()
+    df = df.rename(columns={"close":"price"})[["date","price"]]
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    return df.sort_values("date").dropna()
+
+def _fetch_eth_from_binance() -> pd.DataFrame:
+    """ETH-USD (via USDT) daily klines from Binance. Back to ~2017. Good as last fallback."""
+    base = "https://api.binance.com/api/v3/klines"
+    params = {"symbol":"ETHUSDT","interval":"1d","limit":1000}
+    out = []
+    start = None
+    while True:
+        q = params.copy()
+        if start is not None:
+            q["startTime"] = start
+        r = requests.get(base, params=q, timeout=30, headers=UA)
+        r.raise_for_status()
+        chunk = r.json()
+        if not chunk:
+            break
+        out.extend(chunk)
+        start = int(chunk[-1][6]) + 1  # next after last closeTime
+        if len(chunk) < params["limit"]:
+            break
+        if len(out) > 100000:
+            break
+    if not out:
+        raise ValueError("binance returned no data")
+    cols = ["openTime","open","high","low","close","volume","closeTime","qav","trades","takerBase","takerQuote","ignore"]
+    df = pd.DataFrame(out, columns=cols)
+    df["date"] = pd.to_datetime(df["closeTime"], unit="ms").dt.normalize()
+    df["price"] = pd.to_numeric(df["close"], errors="coerce")
+    df = df[["date","price"]].sort_values("date").dropna()
+    return df
+
 def ensure_auto_denominators():
     os.makedirs(DATA_DIR, exist_ok=True)
     for key, info in AUTO_DENOMS.items():
@@ -118,12 +165,28 @@ def ensure_auto_denominators():
             continue
         try:
             if key == "ETH":
-                try:
-                    df = _fetch_eth_from_stooq()
-                except Exception:
-                    df = _fetch_eth_from_coingecko()
+                # Try Stooq -> CoinGecko -> CryptoCompare -> Binance
+                fetchers = [
+                    _fetch_eth_from_stooq,
+                    _fetch_eth_from_coingecko,
+                    _fetch_eth_from_cryptocompare,
+                    _fetch_eth_from_binance,
+                ]
+                last_err = None
+                df = None
+                for fn in fetchers:
+                    try:
+                        df = fn()
+                        if df is not None and not df.empty:
+                            break
+                    except Exception as e:
+                        last_err = e
+                        continue
+                if df is None or df.empty:
+                    raise last_err or ValueError("ETH fetchers returned no data")
             else:
                 df = _fetch_stooq_csv(info["url"]) if info["parser"]=="stooq" else None
+
             if df is None or df.empty:
                 raise ValueError(f"{key} returned no data")
             df.to_csv(path, index=False)
@@ -247,14 +310,12 @@ for k in sorted(denoms.keys()):
 P0 = PRECOMP["USD"]
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Base figure (rails + main + click/hover catchers)
+# Base figure (rails + main + click catcher + cursor)
 # ──────────────────────────────────────────────────────────────────────────────
 MAX_RAIL_SLOTS = 12
-IDX_MAIN   = MAX_RAIL_SLOTS           # visible main BTC line
-IDX_CLICK1 = MAX_RAIL_SLOTS + 1       # click catcher (main path)
-IDX_CURSR  = MAX_RAIL_SLOTS + 2       # hover cursor (main path)
-IDX_CLICK2 = MAX_RAIL_SLOTS + 3       # click catcher for x_grid (future)
-IDX_HOVR   = MAX_RAIL_SLOTS + 4       # hover grid for x_grid (future)
+IDX_MAIN  = MAX_RAIL_SLOTS
+IDX_CLICK = MAX_RAIL_SLOTS + 1
+IDX_CURSR = MAX_RAIL_SLOTS + 2  # invisible hover cursor (midline) covering full domain
 
 def add_stub(idx):
     # dashed for all rails, including 50%
@@ -264,24 +325,14 @@ def add_stub(idx):
 
 traces = [add_stub(i) for i in range(MAX_RAIL_SLOTS)]
 traces += [
-    # visible main BTC series
     go.Scatter(x=P0["x_main"], y=P0["y_main"], mode="lines",
                name="BTC / USD", line=dict(color=COL_BTC,width=2.0), hoverinfo="skip"),
-    # click catcher: wide transparent along main
     go.Scatter(x=P0["x_main"], y=P0["y_main"], mode="lines",
-               name="_click_main", showlegend=False, hoverinfo="skip",
+               name="_click", showlegend=False, hoverinfo="skip",
                line=dict(width=18, color="rgba(0,0,0,0.001)")),
-    # thin cursor along main to keep hover alive
-    go.Scatter(x=P0["x_main"], y=P0["y_main"], mode="lines",
-               name="_cursor_main", showlegend=False, hoverinfo="x",
-               line=dict(width=0.1, color="rgba(0,0,0,0.001)")),
-    # click catcher along x_grid (covers FUTURE region too)
-    go.Scatter(x=P0["x_grid"], y=[1]*len(P0["x_grid"]), mode="lines",
-               name="_click_grid", showlegend=False, hoverinfo="skip",
-               line=dict(width=18, color="rgba(0,0,0,0.001)")),
-    # hover grid along x_grid (hover anywhere in future/past)
-    go.Scatter(x=P0["x_grid"], y=[1]*len(P0["x_grid"]), mode="lines",
-               name="_hover_grid", showlegend=False, hoverinfo="x",
+    # cursor spans midline so hover works into future
+    go.Scatter(x=P0["x_grid"], y=[None]*len(P0["x_grid"]), mode="lines",
+               name="_cursor", showlegend=False, hoverinfo="x",
                line=dict(width=0.1, color="rgba(0,0,0,0.001)")),
 ]
 
@@ -292,7 +343,8 @@ fig.update_layout(
     showlegend=True,
     title="BTC Purchase Indicator — ",
     xaxis=dict(type="log", title=None, tickmode="array",
-               tickvals=xtickvals, ticktext=xticktext, tickangle=45,
+               tickvals=xtickvals, ticktext=xticktext,
+               tickangle=45,
                range=[np.log10(x_start), np.log10(x_end)], showspikes=False),
     yaxis=dict(type="log", title=P0["label"],
                tickmode="array", tickvals=ytickvals, ticktext=yticktext),
@@ -657,7 +709,7 @@ function computePSeries(P){
 // MULTI-SELECT INDICATOR MASK (union)
 let selectedIndicators = []; // none => All
 function applyIndicatorMask(P){
-  // For hover into the future, ensure cursor spans full domain using midline
+  // Cursor spans full domain using midline so hover works into future
   Plotly.restyle(plotDiv, {x:[P.x_grid], y:[seriesForPercent(P,50)]}, [IDX_CURSR]);
 
   if (!selectedIndicators || selectedIndicators.length===0){
@@ -712,7 +764,7 @@ plotDiv.on('plotly_click', ev=>{
   if (locked) return;
   const xYears = ev.points[0].x;
   const P = PRECOMP[denomSel.value];
-  // For annotation y position use midline at that x (works in future)
+  // annotation y position based on midline (works in future)
   const yMid = interp(P.x_grid, seriesForPercent(P,50), xYears);
   const yAbove = yMid * 1.2;
   const text=shortDateFromYears(xYears);
@@ -722,14 +774,14 @@ plotDiv.on('plotly_click', ev=>{
   updatePanel(P, xYears);
 });
 
-// Hover drives panel when unlocked — works into future via cursor trace on x_grid
+// Hover drives panel when unlocked — works into future via cursor trace
 plotDiv.on('plotly_hover', ev=>{
   if(!(ev.points && ev.points.length)) return;
   if (locked) return;
   updatePanel(PRECOMP[denomSel.value], ev.points[0].x);
 });
 
-// Tilt year labels to 45°
+// Tilt year labels to 45° (also set in layout)
 function tiltYearLabels(){ Plotly.relayout(plotDiv, {'xaxis.tickangle':45}); }
 tiltYearLabels();
 
@@ -783,3 +835,25 @@ updatePanel(PRECOMP['USD'], PRECOMP['USD'].x_main[PRECOMP['USD'].x_main.length-1
 </script>
 </body></html>
 """
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Fill placeholders safely (no f-strings in HTML)
+# ──────────────────────────────────────────────────────────────────────────────
+HTML = (HTML
+    .replace("__PLOT_HTML__", plot_html)
+    .replace("__PRECOMP__", json.dumps(PRECOMP))
+    .replace("__GENESIS__", GENESIS_DATE.strftime("%Y-%m-%d"))
+    .replace("__MAX_RAIL_SLOTS__", str(MAX_RAIL_SLOTS))
+    .replace("__IDX_MAIN__",  str(IDX_MAIN))
+    .replace("__IDX_CLICK__", str(IDX_CLICK))
+    .replace("__IDX_CURSR__", str(IDX_CURSR))
+    .replace("__EPS_LOG_SPACING__", str(EPS_LOG_SPACING))
+)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Write site
+# ──────────────────────────────────────────────────────────────────────────────
+os.makedirs(os.path.dirname(OUTPUT_HTML), exist_ok=True)
+with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
+    f.write(HTML)
+print("Wrote", OUTPUT_HTML)
