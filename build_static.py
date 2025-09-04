@@ -1,20 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BTC Purchase Indicator — rails + dashboard + Halvings & Liquidity toggles.
+BTC Purchase Indicator — median power-law with *smooth* residual quantiles,
+future-stable rails, interactive dashboard, halvings & liquidity toggles.
 
-Liquidity toggle:
-- Peak-to-peak period = 65 months (per CrossBorderCapital chart)
-- Anchor a PEAK (increasing→decreasing) at 2015-02-01 (red)
-- TROUGHS (decreasing→increasing) = + ~32-33 months (green)
-- Past lines solid, future dashed
-- Independent from Halvings toggle
+This version models dispersion as *time-varying*:
+- Fit median line in log–log space (QuantReg @ q=0.5).
+- Compute residuals r = log10(y) - (a0 + b*log10(x)).
+- For a grid of percentiles q in [1%, 99%], estimate *rolling* residual
+  quantiles along log10(x) (nearest-neighbor window), then linearly
+  interpolate to the plotting grid (x_grid).
+- Rails use c_q(z) offsets so the multiples vs the midline can vary over
+  history, but are *frozen* after the last observed date (stable for planning).
 
-Other features kept:
-- Denominators: USD / GOLD / SPX / ETH (auto-fetch, multi-source fallback for ETH)
-- Editable percentile rails (sorted, dashed), indicator multi-select highlight
-- Hover/click panel with (Nx) multipliers vs 50% line and future readout
-- Copy current view, width in px, tilted year labels, date/today lock
+UI:
+- Denominators: USD (or None), GOLD, SPX, ETH (auto-fetched with fallbacks).
+- Edit/select percentile rails (sorted, dashed lines; 50% dashed too).
+- Indicator multi-select (SELL THE HOUSE … Top Inbound) filters the BTC line.
+- Click/hover panel shows values + (multiple vs 50%).
+- “Copy Chart” copies current view (zoom respected).
+- Halvings (past solid, future dashed).
+- Liquidity cycle: 65-month peak-to-peak, PEAK anchored at 2015-02-01 (red),
+  TROUGHS half-cycle later (green); drawn back to 2009-01-03.
+
+Writes: docs/index.html
 """
 
 import os, io, glob, json
@@ -34,8 +43,11 @@ GENESIS_DATE = datetime(2009, 1, 3)
 END_PROJ     = datetime(2040, 12, 31)
 X_START_DATE = datetime(2011, 1, 1)
 
-RESID_WINSOR     = 0.02
-EPS_LOG_SPACING  = 0.010
+RESID_WINSOR     = 0.02           # clip tails of residuals before smoothing
+WINDOW_FRAC      = 0.18           # rolling window (fraction of samples) for smooth quantiles
+Q_MIN, Q_MAX, Q_STEP = 0.01, 0.99, 0.01  # grid of residual quantiles
+EPS_LOG_SPACING  = 0.010          # small spread guard at floor/ceiling
+
 COL_BTC          = "#000000"
 
 # Halvings: past + projected
@@ -46,6 +58,10 @@ FUTURE_HALVINGS = ["2028-04-20", "2032-04-20", "2036-04-19", "2040-04-19"]
 LIQ_PEAK_ANCHOR_ISO = "2015-02-01"  # PEAK (red)
 LIQ_PERIOD_MONTHS   = 65            # peak-to-peak
 
+# Draw liquidity lines back to genesis so pre-2015 peaks/troughs show up
+LIQ_START_ISO = "2009-01-03"
+
+# Auto denominators (daily closes). Multiple fallbacks for ETH.
 AUTO_DENOMS = {
     "GOLD": {"path": os.path.join(DATA_DIR, "denominator_gold.csv"),
              "url":  "https://stooq.com/q/d/l/?s=xauusd&i=d", "parser":"stooq"},
@@ -149,7 +165,9 @@ def ensure_auto_denominators():
         if os.path.exists(path): continue
         try:
             if key == "ETH":
-                for fn in (_fetch_eth_from_stooq, _fetch_eth_from_coingecko, _fetch_eth_from_cryptocompare, _fetch_eth_from_binance):
+                df=None
+                for fn in (_fetch_eth_from_stooq, _fetch_eth_from_coingecko,
+                           _fetch_eth_from_cryptocompare, _fetch_eth_from_binance):
                     try:
                         df = fn()
                         if df is not None and not df.empty: break
@@ -180,6 +198,10 @@ def load_denominators():
     return out
 
 # ───────────────────────── Fit / rails support ─────────────────────────
+def winsorize(arr, p):
+    lo, hi = np.nanquantile(arr, p), np.nanquantile(arr, 1-p)
+    return np.clip(arr, lo, hi)
+
 def quantile_fit_loglog(x_years, y_vals, q=0.5):
     x_years = np.asarray(x_years); y_vals = np.asarray(y_vals)
     mask = np.isfinite(x_years) & np.isfinite(y_vals) & (x_years>0) & (y_vals>0)
@@ -188,41 +210,81 @@ def quantile_fit_loglog(x_years, y_vals, q=0.5):
     res = QuantReg(ylog, X).fit(q=q)
     a0 = float(res.params["const"]); b = float(res.params["logx"])
     resid = ylog - (a0 + b*xlog)
-    return a0, b, resid
+    return a0, b, resid, xlog
 
-def build_support_for_dynamic_rails(x_years, y_vals):
-    a0, b, resid = quantile_fit_loglog(x_years, y_vals, q=0.5)
-    r = np.copy(resid)
+def smooth_residual_quantiles(xlog, resid, x_grid):
+    """Return q_grid, z_grid, off_qz (shape: [len(q_grid), len(z_grid)]).
+       Uses nearest-neighbor rolling window along xlog (sorted), per-quantile."""
+    q_grid = np.arange(Q_MIN, Q_MAX + 1e-9, Q_STEP)
+    # sort by xlog
+    order = np.argsort(xlog)
+    xs = xlog[order]
+    rs = resid[order]
+    n = len(xs)
+    # rolling window size
+    k = int(max(101, round(WINDOW_FRAC * n)))
+    if k % 2 == 0: k += 1
+    m = k // 2
+    # compute quantiles at each observed xs
+    Qmat = np.zeros((n, len(q_grid)), dtype=float)
+    for j in range(n):
+        lo = max(0, j - m)
+        hi = min(n - 1, j + m)
+        window = rs[lo:hi+1]
+        # robust fallback if window tiny
+        if len(window) < 8:
+            Qmat[j, :] = np.quantile(rs, q_grid)
+        else:
+            Qmat[j, :] = np.quantile(window, q_grid)
+        # enforce monotone across q to avoid tiny inversions
+        Qmat[j, :] = np.maximum.accumulate(Qmat[j, :])
+    # interpolate to plotting grid (z_grid)
+    z_grid = np.log10(x_grid)
+    off_qz = np.zeros((len(q_grid), len(z_grid)), dtype=float)
+    for i_q in range(len(q_grid)):
+        off_qz[i_q, :] = np.interp(z_grid, xs, Qmat[:, i_q], left=Qmat[0, i_q], right=Qmat[-1, i_q])
+    return q_grid, z_grid, off_qz
+
+def build_payload(df, denom_key=None):
+    # y series for given denominator
+    if not denom_key or denom_key.lower() in ("usd", "none"):
+        y = df["btc"].copy()
+        label, unit, decimals = "BTC / USD", "$", 2
+    else:
+        k = denom_key.lower()
+        if k in df.columns:
+            y = df["btc"]/df[k]
+            label, unit, decimals = f"BTC / {denom_key.upper()}", "", 6
+        else:
+            y = df["btc"].copy()
+            label, unit, decimals = "BTC / USD", "$", 2
+
+    mask = np.isfinite(df["x_years"].values) & np.isfinite(y.values)
+    xs = df["x_years"].values[mask]
+    ys = y.values[mask]
+    dates = df["date_iso"].values[mask]
+
+    # median fit + residuals (winsorized)
+    a0, b, resid, xlog = quantile_fit_loglog(xs, ys, q=0.5)
     if RESID_WINSOR:
-        lo, hi = np.nanquantile(r, RESID_WINSOR), np.nanquantile(r, 1-RESID_WINSOR)
-        r = np.clip(r, lo, hi)
-    med = float(np.nanmedian(r))
-    q_grid = np.linspace(0.001, 0.999, 999)
-    rq = np.quantile(r, q_grid)
-    off_grid = rq - med
-    off_grid[0]  -= EPS_LOG_SPACING
-    off_grid[-1] += EPS_LOG_SPACING
-    return {"a0":a0, "b":b,
-            "q_grid":[float(q) for q in q_grid],
-            "off_grid":[float(v) for v in off_grid]}
+        resid = winsorize(resid, RESID_WINSOR)
 
-# ───────────────────────────── Axis ticks ─────────────────────────────
-def year_ticks_log(first_dt, last_dt):
-    vals, labs = [], []
-    for y in range(first_dt.year, last_dt.year+1):
-        d = datetime(y,1,1)
-        if d < first_dt or d > last_dt: continue
-        vy = float(years_since_genesis(pd.Series([d])).iloc[0])
-        if vy <= 0: continue
-        if y > 2026 and (y % 2 == 1):
-            continue
-        vals.append(vy); labs.append(str(y))
-    return vals, labs
+    # grid and smooth residual quantiles
+    q_grid, z_grid, off_qz = smooth_residual_quantiles(xlog, resid, x_grid)
 
-def y_ticks():
-    vals = [10**e for e in range(0,9)]
-    labs = [f"{int(10**e):,}" for e in range(0,9)]
-    return vals, labs
+    support = {
+        "a0": float(a0), "b": float(b),
+        "q_grid": [float(q) for q in q_grid],
+        "z_grid": [float(z) for z in z_grid],
+        "off_qz": [[float(v) for v in row] for row in off_qz]  # list of lists [q][z]
+    }
+    return {
+        "label": label, "unit": unit, "decimals": decimals,
+        "x_main": xs.tolist(), "y_main": ys.tolist(),
+        "date_iso_main": dates.tolist(),
+        "x_grid": x_grid.tolist(),
+        "support": support
+    }
 
 # ───────────────────────────── Build model ─────────────────────────────
 btc = fetch_btc_csv().rename(columns={"price":"btc"})
@@ -243,30 +305,24 @@ x_start = float(years_since_genesis(pd.Series([first_dt])).iloc[0])
 x_end   = float(years_since_genesis(pd.Series([max_dt])).iloc[0])
 x_grid  = np.logspace(np.log10(max(1e-6, x_start)), np.log10(x_end), 700)
 
+# y-axis ticks and x ticks
+def year_ticks_log(first_dt, last_dt):
+    vals, labs = [], []
+    for y in range(first_dt.year, last_dt.year+1):
+        d = datetime(y,1,1)
+        if d < first_dt or d > last_dt: continue
+        vy = float(years_since_genesis(pd.Series([d])).iloc[0])
+        if vy <= 0: continue
+        vals.append(vy); labs.append(str(y))
+    return vals, labs
+
+def y_ticks():
+    vals = [10**e for e in range(0,9)]
+    labs = [f"{int(10**e):,}" for e in range(0,9)]
+    return vals, labs
+
 xtickvals, xticktext = year_ticks_log(first_dt, max_dt)
 ytickvals, yticktext = y_ticks()
-
-def series_for_denom(df, key):
-    if not key or key.lower() in ("usd", "none"):
-        return df["btc"], "BTC / USD", "$", 2
-    k = key.lower()
-    if k in df.columns:
-        return df["btc"]/df[k], f"BTC / {key.upper()}", "", 6
-    return df["btc"], "BTC / USD", "$", 2
-
-def build_payload(df, denom_key=None):
-    y, label, unit, decimals = series_for_denom(df, denom_key)
-    mask = np.isfinite(df["x_years"].values) & np.isfinite(y.values)
-    xs = df["x_years"].values[mask]
-    ys = y.values[mask]
-    dates = df["date_iso"].values[mask]
-    support = build_support_for_dynamic_rails(xs, ys)
-    return {
-        "label": label, "unit": unit, "decimals": decimals,
-        "x_main": xs.tolist(), "y_main": ys.tolist(),
-        "date_iso_main": dates.tolist(), "x_grid": x_grid.tolist(),
-        "support": support
-    }
 
 PRECOMP = {"USD": build_payload(base, None)}
 for k in sorted(denoms.keys()):
@@ -323,7 +379,7 @@ fig.update_layout(
 plot_html = fig.to_html(full_html=False, include_plotlyjs="cdn",
                         config={"responsive":True,"displayModeBar":True,"modeBarButtonsToRemove":["toImage"]})
 
-# ───────────────────────────────── HTML (no f-strings inside) ─────────────────────────────────
+# ───────────────────────────────── HTML (placeholders replaced) ─────────────────────────────────
 HTML = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"/>
@@ -456,6 +512,7 @@ const FUTURE_HALVINGS = __FUTURE_HALVINGS__;
 
 const LIQ_PEAK_ANCHOR_ISO = '__LIQ_PEAK_ANCHOR_ISO__'; // PEAK (red)
 const LIQ_PERIOD_MONTHS   = __LIQ_PERIOD_MONTHS__;     // peak-to-peak
+const LIQ_START_ISO       = '__LIQ_START_ISO__';
 
 const MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 function yearsFromISO(iso){ const d=new Date(iso+'T00:00:00Z'); return ((d-GENESIS)/86400000)/365.25 + (1.0/365.25); }
@@ -463,7 +520,9 @@ function shortDateFromYears(y){ const ms=(y-(1.0/365.25))*365.25*86400000; const
 function interp(xs, ys, x){ let lo=0,hi=xs.length-1; if(x<=xs[0]) return ys[0]; if(x>=xs[hi]) return ys[hi];
   while(hi-lo>1){ const m=(hi+lo)>>1; if(xs[m]<=x) lo=m; else hi=m; }
   const t=(x-xs[lo])/(xs[hi]-xs[lo]); return ys[lo]+t*(ys[hi]-ys[lo]); }
+function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
 
+// value formatting
 function fmtVal(P, v){
   if(!isFinite(v)) return '—';
   const dec = Math.max(0, Math.min(10, P.decimals||2));
@@ -472,7 +531,8 @@ function fmtVal(P, v){
   return Number(v).toLocaleString(undefined,{minimumFractionDigits:Math.min(6,maxd),maximumFractionDigits:maxd});
 }
 
-function colorForPercent(p){ const t=Math.max(0,Math.min(1,p/100));
+// Colors and Indicator ranges
+function colorForPercent(p){ const t=clamp(p/100,0,1);
   function hx(v){return Math.max(0,Math.min(255,Math.round(v))); }
   function toHex(r,g,b){return '#'+[r,g,b].map(v=>hx(v).toString(16).padStart(2,'0')).join('');}
   if(t<=0.5){const u=t/0.5;return toHex(0xD3+(0xFB-0xD3)*u,0x2F+(0xC0-0x2F)*u,0x2F+(0x2D-0x2F)*u);}
@@ -547,9 +607,9 @@ document.addEventListener('click',e=>{ if(!indicatorMenu.contains(e.target) && !
   if (denomsDetected) denomsDetected.textContent = order.filter(k=>k!=='USD').join(', ') || '(none)';
 })();
 
-// Rails state
+// Rails state & UI
 let rails=[97.5,90,75,50,25,2.5];
-function sortRails(){ rails=rails.filter(p=>isFinite(p)).map(Number).map(p=>Math.max(0.1,Math.min(99.9,p))).filter((p,i,a)=>a.indexOf(p)===i).sort((a,b)=>b-a); }
+function sortRails(){ rails=rails.filter(p=>isFinite(p)).map(Number).map(p=>clamp(p,0.1,99.9)).filter((p,i,a)=>a.indexOf(p)===i).sort((a,b)=>b-a); }
 function railsText(){ return rails.map(p=>String(p).replace(/\\.0$/,'')+'%').join(', '); }
 function idFor(p){ return 'v'+String(p).replace('.','_'); }
 
@@ -558,8 +618,8 @@ function rebuildReadoutRows(){
   rails.forEach(p=>{
     const row=document.createElement('div'); row.className='row';
     const lab=document.createElement('div'); const val=document.createElement('div'); val.className='num'; val.id=idFor(p);
-    const color=colorForPercent(p); const name=Math.abs(p-2.5)<1e-9?'Floor':Math.abs(p-97.5)<1e-9?'Ceiling':(p+'%');
-    lab.innerHTML=`<span style="color:${color};">${name}</span>`;
+    const color=colorForPercent(p); const nm=(p===2.5?'Floor':(p===97.5?'Ceiling':(p+'%')));
+    lab.innerHTML=`<span style="color:${color};">${nm}</span>`;
     row.appendChild(lab); row.appendChild(val); row.appendChild(document.createElement('div')); elRows.appendChild(row);
   });
 }
@@ -568,7 +628,7 @@ function rebuildEditor(){
   rails.forEach((p,idx)=>{
     const row=document.createElement('div'); row.className='rail-row';
     const color=colorForPercent(p);
-    const labelTxt=Math.abs(p-2.5)<1e-9?'Floor':Math.abs(p-97.5)<1e-9?'Ceiling':(p+'%');
+    const labelTxt=(p===2.5?'Floor':(p===97.5?'Ceiling':(p+'%')));
     const lab=document.createElement('span'); lab.style.minWidth='48px'; lab.style.color=color; lab.textContent=labelTxt;
     const inp=document.createElement('input'); inp.type='number'; inp.step='0.1'; inp.min='0.1'; inp.max='99.9'; inp.value=String(p);
     const rm=document.createElement('button'); rm.textContent='Remove'; rm.className='btn';
@@ -583,7 +643,7 @@ editBtn.addEventListener('click',()=>{ railsEditor.classList.toggle('hidden'); r
 
 // Sizing
 function applyChartWidthPx(px){
-  const v=Math.max(400, Math.min(2400, Number(px)||1100));
+  const v=clamp(Number(px)||1100, 400, 2400);
   leftCol.style.flex='0 0 auto'; leftCol.style.width=v+'px';
   if(window.Plotly&&plotDiv) Plotly.Plots.resize(plotDiv);
 }
@@ -594,24 +654,67 @@ btnFit.addEventListener('click',()=>{
 });
 if(window.ResizeObserver) new ResizeObserver(()=>{ if(window.Plotly&&plotDiv) Plotly.Plots.resize(plotDiv); }).observe(leftCol);
 
-// Rails math
-function logMidline(P){ const d=P.support; return P.x_grid.map(x=> (d.a0 + d.b*Math.log10(x)) ); }
-function offsetForPercent(P, percent){ const d=P.support; const p01=Math.max(d.q_grid[0], Math.min(d.q_grid[d.q_grid.length-1], percent/100)); return interp(d.q_grid, d.off_grid, p01); }
-function seriesForPercent(P, percent){
-  const logM=logMidline(P), off=offsetForPercent(P,percent);
-  const eps=(percent>=97.5||percent<=2.5)?EPS_LOG_SPACING:0.0;
-  return logM.map(v=>Math.pow(10, v+off+(percent>=50?eps:-eps)));
-}
-function percentFromOffset(P, off){ const d=P.support; const q=Math.max(d.q_grid[0], Math.min(d.q_grid[d.q_grid.length-1], interp(d.off_grid, d.q_grid, off))); return q; }
+// ─────────── Rails math (time-varying residual quantiles, future-frozen) ───────────
+function logMidline(P){ const d=P.support; return d.z_grid.map(z=> d.a0 + d.b*z ); }
 
-// Render rails (all dashed)
+// offsets for given percent across x_grid (z_grid aligned)
+function offsetsForPercent(P, percent){
+  const d=P.support, qGrid=d.q_grid, off=d.off_qz; // off[q][z]
+  const p01=clamp(percent/100, qGrid[0], qGrid[qGrid.length-1]);
+  // for each z index, interpolate in q dimension
+  const out=new Array(d.z_grid.length);
+  for (let zi=0; zi<d.z_grid.length; zi++){
+    // build column (off vs q) for this z
+    // offCol is monotone
+    let lo=0, hi=qGrid.length-1;
+    while(hi-lo>1){ const m=(hi+lo)>>1; if(qGrid[m]<=p01) lo=m; else hi=m; }
+    const t=(p01-qGrid[lo])/(qGrid[hi]-qGrid[lo]);
+    out[zi]= off[lo][zi] + t*(off[hi][zi]-off[lo][zi]);
+  }
+  return out;
+}
+
+// produce y-series for a given percent (guard spacing at floor/ceiling)
+function seriesForPercent(P, percent){
+  const logM = logMidline(P);
+  const offs = offsetsForPercent(P, percent);
+  const out  = new Array(P.x_grid.length);
+  const eps  = (percent>=97.5||percent<=2.5)?EPS_LOG_SPACING:0.0;
+  for (let i=0;i<out.length;i++){ out[i]=Math.pow(10, logM[i] + offs[i] + (percent>=50?eps:-eps)); }
+  return out;
+}
+
+// compute percentile p of a (x,y) point from local residual curve
+function percentAtPoint(P, xYears, yVal){
+  const d=P.support, z=Math.log10(xYears), logy=Math.log10(yVal);
+  const mid = d.a0 + d.b*z;
+  const off = logy - mid;
+  // choose nearest z index
+  const zArr=d.z_grid; let lo=0, hi=zArr.length-1;
+  if (z<=zArr[0]){ lo=hi=0; }
+  else if (z>=zArr[hi]){ lo=hi=hi; }
+  else { while(hi-lo>1){ const m=(hi+lo)>>1; if(zArr[m]<=z) lo=m; else hi=m; } }
+  // access off vs q at column lo (nearest)
+  const qGrid=d.q_grid; const offCol = d.off_qz.map(row=>row[lo]);
+  // invert offCol(q) to get q(off)
+  let a=0, b=qGrid.length-1;
+  if (off<=offCol[0]) return 100*qGrid[0];
+  if (off>=offCol[b]) return 100*qGrid[b];
+  while(b-a>1){ const m=(a+b)>>1; if(offCol[m]<=off) a=m; else b=m; }
+  const t=(off-offCol[a])/(offCol[b]-offCol[a]);
+  const q = qGrid[a] + t*(qGrid[b]-qGrid[a]);
+  return 100*clamp(q,0,1);
+}
+
+// Render rails
 function renderRails(P){
   const n=Math.min(rails.length, MAX_SLOTS);
   for(let i=0;i<MAX_SLOTS;i++){
     const visible=(i<n); let restyle={visible};
     if(visible){
       const p=rails[i], color=colorForPercent(p);
-      restyle=Object.assign(restyle,{x:[P.x_grid], y:[seriesForPercent(P,p)], name:(Math.abs(p-2.5)<1e-9?'Floor':(Math.abs(p-97.5)<1e-9?'Ceiling':(p+'%'))), line:{color:color, width:1.6, dash:'dot'}});
+      const nm=(p===2.5?'Floor':(p===97.5?'Ceiling':(p+'%')));
+      restyle=Object.assign(restyle,{x:[P.x_grid], y:[seriesForPercent(P,p)], name:nm, line:{color:color, width:1.6, dash:'dot'}});
     }
     Plotly.restyle(plotDiv, restyle, [i]);
   }
@@ -621,19 +724,15 @@ function renderRails(P){
 let locked=false, lockedX=null;
 function setTitleForP(p){ Plotly.relayout(plotDiv, {'title.text': 'BTC Purchase Indicator — '+indicatorFromP(p)}); }
 
+// Indicator mask
 function computePSeries(P){
-  const d=P.support; const out=new Array(P.x_main.length);
+  const out=new Array(P.x_main.length);
   for (let i=0;i<P.x_main.length;i++){
-    const logx=Math.log10(P.x_main[i]); const ly=Math.log10(P.y_main[i]);
-    const mid=d.a0 + d.b*logx; const off=ly-mid;
-    const q = percentFromOffset(P, off); out[i]=Math.max(0, Math.min(100, 100*q));
+    out[i]=percentAtPoint(P, P.x_main[i], P.y_main[i]);
   }
   P._pSeries = out;
 }
-
-// Indicator mask
 function applyIndicatorMask(P){
-  Plotly.restyle(plotDiv, {x:[P.x_grid], y:[seriesForPercent(P,50)], hoverinfo:['skip']}, [IDX_CURSR]);
   if (!selectedIndicators || selectedIndicators.length===0){
     Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main], name:[P.label]}, [IDX_MAIN]);
     Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main]},                [IDX_CLICK]);
@@ -651,21 +750,23 @@ function applyIndicatorMask(P){
 function updatePanel(P,xYears){
   elDate.textContent=shortDateFromYears(xYears);
   const v50 = interp(P.x_grid, seriesForPercent(P,50), xYears);
-  rails.forEach(p=>{ const v=interp(P.x_grid, seriesForPercent(P,p), xYears); const el=document.getElementById(idFor(p)); if(!el) return; const mult=(v50>0&&isFinite(v50))?` (${(v/v50).toFixed(1)}x)`:''; el.textContent=fmtVal(P,v)+mult; });
+  rails.forEach(p=>{ const v=interp(P.x_grid, seriesForPercent(P,p), xYears);
+    const el=document.getElementById(idFor(p)); if(!el) return;
+    const mult=(v50>0&&isFinite(v50))?` (${(v/v50).toFixed(1)}x)`:''; el.textContent=fmtVal(P,v)+mult;
+  });
 
   const lastX=P.x_main[P.x_main.length-1];
   if (xYears>lastX){ elMain.textContent='—'; elP.textContent='(p≈—)'; }
   else{
     let idx=0,best=1e99; for(let i=0;i<P.x_main.length;i++){ const d=Math.abs(P.x_main[i]-xYears); if(d<best){best=d; idx=i;} }
     const y=P.y_main[idx]; elMain.textContent=fmtVal(P,y); elMainLabel.textContent=(P.unit==='$'?'BTC Price:':'BTC Ratio:');
-    const d=P.support, logx=Math.log10(xYears), ly=Math.log10(y), mid=d.a0+d.b*logx, off=ly-mid;
-    const pVal=Math.max(0, Math.min(100, 100*percentFromOffset(P, off)));
+    const pVal=percentAtPoint(P, P.x_main[idx], P.y_main[idx]);
     elP.textContent=`(p≈${pVal.toFixed(1)}%)`; setTitleForP(pVal);
   }
   Plotly.relayout(plotDiv, {"yaxis.title.text": P.label});
 }
 
-// Click → update panel + annotation
+// Click inserts small label above midline and locks panel
 plotDiv.on('plotly_click', ev=>{
   if(!(ev.points && ev.points.length) || locked) return;
   const xYears=ev.points[0].x; const P=PRECOMP[denomSel.value];
@@ -690,8 +791,8 @@ btnCopy.onclick=async ()=>{ try{ const url=await Plotly.toImage(plotDiv,{format:
 
 // Denominator change
 denomSel.onchange=()=>{ const key=denomSel.value, P=PRECOMP[key];
-  Plotly.restyle(plotDiv,{x:[P.x_main],y:[P.y_main],name:[P.label]},[IDX_MAIN]);
-  Plotly.restyle(plotDiv,{x:[P.x_main],y:[P.y_main]},[IDX_CLICK]);
+  Plotly.restyle(plotDiv,{x:[P.x_main], y:[P.y_main], name:[P.label]}, [IDX_MAIN]);
+  Plotly.restyle(plotDiv,{x:[P.x_main], y:[P.y_main]},                 [IDX_CLICK]);
   Plotly.relayout(plotDiv,{annotations:[]}); renderRails(P); applyIndicatorMask(P);
   const x=locked?lockedX:P.x_main[P.x_main.length-1]; updatePanel(P,x);
 };
@@ -704,7 +805,7 @@ function syncAll(){ sortRails(); rebuildEditor(); const P=PRECOMP[denomSel.value
   rebuildReadoutRows(); rebuildEditor();
   renderRails(PRECOMP['USD']); applyIndicatorMask(PRECOMP['USD']);
   const P=PRECOMP['USD']; const tt="%{x|%b-%d-%Y}<br>$%{y:.2f}<extra></extra>";
-  Plotly.restyle(plotDiv,{x:[P.x_main],y:[P.y_main],hovertemplate:[tt],line:[{width:0}]},[IDX_TT]);
+  Plotly.restyle(plotDiv,{x:[P.x_main], y:[P.y_main], hovertemplate:[tt], line:[{width:0}]},[IDX_TT]);
   updatePanel(P, P.x_main[P.x_main.length-1]);
 })();
 
@@ -732,7 +833,7 @@ btnHalvings.onclick=()=>{ halvingsOn=!halvingsOn;
   }
 };
 
-// ─────────────────────── Liquidity toggle (65-month peak-anchored) ───────────────────────
+// ─────────────────────── Liquidity toggle (65-month peaks) ───────────────────────
 let liquidityOn = false;
 
 function addMonthsISO(iso, months){
@@ -749,11 +850,11 @@ function compareISO(a,b){ return a<b?-1:(a>b?1:0); }
 
 function makeLiquidityShapes(){
   const shapes = [];
-  const startIso = '2011-01-01';
+  const startIso = LIQ_START_ISO;
   const endIso   = END_ISO;
   const lastIso  = LAST_PRICE_ISO;
 
-  // build peak sequence (red)
+  // build peak sequence (red) back and forward from anchor
   let peaks = [];
   let iso = LIQ_PEAK_ANCHOR_ISO;
   while (compareISO(iso, startIso) > 0){
@@ -767,7 +868,7 @@ function makeLiquidityShapes(){
     iso = addMonthsISO(iso, LIQ_PERIOD_MONTHS);
   }
 
-  // troughs (green) are half-cycle later
+  // troughs (green) half-cycle later
   const half = Math.round(LIQ_PERIOD_MONTHS/2);
   const troughs = peaks.map(p => addMonthsISO(p, half));
 
@@ -819,6 +920,7 @@ HTML = (HTML
     .replace("__FUTURE_HALVINGS__", json.dumps(FUTURE_HALVINGS))
     .replace("__LIQ_PEAK_ANCHOR_ISO__", LIQ_PEAK_ANCHOR_ISO)
     .replace("__LIQ_PERIOD_MONTHS__", str(LIQ_PERIOD_MONTHS))
+    .replace("__LIQ_START_ISO__", LIQ_START_ISO)
 )
 
 # ───────────────────────────── Write site ─────────────────────────────
