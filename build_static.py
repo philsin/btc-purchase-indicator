@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BTC Purchase Indicator — rails + dashboard + Halvings and Liquidity toggles.
+BTC Purchase Indicator — rails + dashboard + Halvings & Liquidity toggles.
 
-New in this version
-- Halvings toggle: vertical gray lines (solid past, dashed future).
-- Liquidity toggle: vertical cycle inflection lines based on a simple sinusoid model:
-  * Green = decreasing → increasing (troughs)
-  * Red   = increasing → decreasing (peaks)
-  * Future lines dashed; past solid
-  * Independent of Halvings toggle
+Liquidity toggle:
+- Peak-to-peak period = 65 months (per CrossBorderCapital chart)
+- Anchor a PEAK (increasing→decreasing) at 2015-02-01 (red)
+- TROUGHS (decreasing→increasing) = + ~32-33 months (green)
+- Past lines solid, future dashed
+- Independent from Halvings toggle
 
-The rest of your features are preserved: denominators (USD, GOLD, SPX, ETH),
-hover/click panel with (Nx) vs 50% midline, rails editor, indicator multi-select,
-copy current view (respects zoom), chart width in px, tilted years, etc.
+Other features kept:
+- Denominators: USD / GOLD / SPX / ETH (auto-fetch, multi-source fallback for ETH)
+- Editable percentile rails (sorted, dashed), indicator multi-select highlight
+- Hover/click panel with (Nx) multipliers vs 50% line and future readout
+- Copy current view, width in px, tilted year labels, date/today lock
 """
 
 import os, io, glob, json
@@ -38,13 +39,12 @@ EPS_LOG_SPACING  = 0.010
 COL_BTC          = "#000000"
 
 # Halvings: past + projected
-PAST_HALVINGS = ["2012-11-28", "2016-07-09", "2020-05-11", "2024-04-20"]
+PAST_HALVINGS   = ["2012-11-28", "2016-07-09", "2020-05-11", "2024-04-20"]
 FUTURE_HALVINGS = ["2028-04-20", "2032-04-20", "2036-04-19", "2040-04-19"]
 
-# === Liquidity cycle (simple sinusoid model) ===
-# First trough date (decreasing → increasing) and full-cycle length
-LIQ_FIRST_TROUGH_ISO = "2011-01-01"   # tune as desired to align with your reference chart(s)
-LIQ_PERIOD_DAYS      = 1278           # ~3.5 years; adjust if you want a different cadence
+# Liquidity cycle (peak anchored)
+LIQ_PEAK_ANCHOR_ISO = "2015-02-01"  # PEAK (red)
+LIQ_PERIOD_MONTHS   = 65            # peak-to-peak
 
 AUTO_DENOMS = {
     "GOLD": {"path": os.path.join(DATA_DIR, "denominator_gold.csv"),
@@ -153,7 +153,8 @@ def ensure_auto_denominators():
                     try:
                         df = fn()
                         if df is not None and not df.empty: break
-                    except Exception: df=None
+                    except Exception:
+                        df = None
                 if df is None or df.empty: raise ValueError("ETH fetchers returned no data")
             else:
                 df = _fetch_stooq_csv(info["url"]) if info["parser"]=="stooq" else None
@@ -213,7 +214,7 @@ def year_ticks_log(first_dt, last_dt):
         if d < first_dt or d > last_dt: continue
         vy = float(years_since_genesis(pd.Series([d])).iloc[0])
         if vy <= 0: continue
-        if y > 2026 and (y % 2 == 1):  # hide odd labels after 2026
+        if y > 2026 and (y % 2 == 1):
             continue
         vals.append(vy); labs.append(str(y))
     return vals, labs
@@ -453,8 +454,8 @@ const EPS_LOG_SPACING = __EPS_LOG_SPACING__;
 const PAST_HALVINGS = __PAST_HALVINGS__;
 const FUTURE_HALVINGS = __FUTURE_HALVINGS__;
 
-const LIQ_FIRST_TROUGH_ISO = '__LIQ_FIRST_TROUGH_ISO__';
-const LIQ_PERIOD_DAYS = __LIQ_PERIOD_DAYS__;
+const LIQ_PEAK_ANCHOR_ISO = '__LIQ_PEAK_ANCHOR_ISO__'; // PEAK (red)
+const LIQ_PERIOD_MONTHS   = __LIQ_PERIOD_MONTHS__;     // peak-to-peak
 
 const MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 function yearsFromISO(iso){ const d=new Date(iso+'T00:00:00Z'); return ((d-GENESIS)/86400000)/365.25 + (1.0/365.25); }
@@ -707,7 +708,7 @@ function syncAll(){ sortRails(); rebuildEditor(); const P=PRECOMP[denomSel.value
   updatePanel(P, P.x_main[P.x_main.length-1]);
 })();
 
-// ─────────────────────── Halvings toggle (meta-tagged) ───────────────────────
+// ─────────────────────── Halvings toggle ───────────────────────
 let halvingsOn=false;
 function makeHalvingShapes(){
   const shapes=[];
@@ -731,54 +732,77 @@ btnHalvings.onclick=()=>{ halvingsOn=!halvingsOn;
   }
 };
 
-// ─────────────────────── Liquidity toggle (NEW) ───────────────────────
-let liquidityOn=false;
-function addDays(iso, days){ const d=new Date(iso+'T00:00:00Z'); d.setUTCDate(d.getUTCDate()+days); return d.toISOString().slice(0,10); }
-function makeLiquidityShapes(){
-  const shapes=[];
-  const endIso = END_ISO;
-  const lastIso = LAST_PRICE_ISO;
+// ─────────────────────── Liquidity toggle (65-month peak-anchored) ───────────────────────
+let liquidityOn = false;
 
-  // Troughs (decreasing -> increasing) every LIQ_PERIOD_DAYS from FIRST_TROUGH
-  let tIso = LIQ_FIRST_TROUGH_ISO;
-  while (tIso <= endIso){
-    const x = yearsFromISO(tIso);
-    const dashed = tIso > lastIso;
-    shapes.push({
-      type:'line', xref:'x', yref:'paper', x0:x, x1:x, y0:0, y1:1,
-      line:{color:'#22C55E', width:1.4, dash:(dashed?'dash':'solid')}, layer:'below', meta:'liquidity'
-    });
-    tIso = addDays(tIso, LIQ_PERIOD_DAYS);
+function addMonthsISO(iso, months){
+  const d  = new Date(iso + 'T00:00:00Z');
+  const y0 = d.getUTCFullYear();
+  const m0 = d.getUTCMonth();
+  const day= d.getUTCDate();
+  const nd = new Date(Date.UTC(y0, m0 + months, 1));
+  const lastDay = new Date(Date.UTC(nd.getUTCFullYear(), nd.getUTCMonth()+1, 0)).getUTCDate();
+  nd.setUTCDate(Math.min(day, lastDay));
+  return nd.toISOString().slice(0,10);
+}
+function compareISO(a,b){ return a<b?-1:(a>b?1:0); }
+
+function makeLiquidityShapes(){
+  const shapes = [];
+  const startIso = '2011-01-01';
+  const endIso   = END_ISO;
+  const lastIso  = LAST_PRICE_ISO;
+
+  // build peak sequence (red)
+  let peaks = [];
+  let iso = LIQ_PEAK_ANCHOR_ISO;
+  while (compareISO(iso, startIso) > 0){
+    peaks.push(iso);
+    iso = addMonthsISO(iso, -LIQ_PERIOD_MONTHS);
   }
-  // Peaks (increasing -> decreasing) are offset by half a cycle
-  let pIso = addDays(LIQ_FIRST_TROUGH_ISO, Math.floor(LIQ_PERIOD_DAYS/2));
-  while (pIso <= endIso){
-    const x = yearsFromISO(pIso);
-    const dashed = pIso > lastIso;
-    shapes.push({
-      type:'line', xref:'x', yref:'paper', x0:x, x1:x, y0:0, y1:1,
-      line:{color:'#EF4444', width:1.4, dash:(dashed?'dash':'solid')}, layer:'below', meta:'liquidity'
-    });
-    pIso = addDays(pIso, LIQ_PERIOD_DAYS);
+  peaks = peaks.reverse();
+  iso = addMonthsISO(peaks[peaks.length-1], LIQ_PERIOD_MONTHS);
+  while (compareISO(iso, endIso) <= 0){
+    peaks.push(iso);
+    iso = addMonthsISO(iso, LIQ_PERIOD_MONTHS);
   }
+
+  // troughs (green) are half-cycle later
+  const half = Math.round(LIQ_PERIOD_MONTHS/2);
+  const troughs = peaks.map(p => addMonthsISO(p, half));
+
+  function vline(iso, color){
+    const dashed = compareISO(iso, lastIso) > 0;
+    return {
+      type:'line', xref:'x', yref:'paper',
+      x0: yearsFromISO(iso), x1: yearsFromISO(iso), y0:0, y1:1,
+      line:{color:color, width:1.4, dash: dashed ? 'dash' : 'solid'},
+      layer:'below', meta:'liquidity'
+    };
+  }
+
+  troughs.forEach(tIso => { if (compareISO(tIso, startIso)>=0 && compareISO(tIso, endIso)<=0) shapes.push(vline(tIso, '#22C55E')); });
+  peaks.forEach(pIso =>   { if (compareISO(pIso, startIso)>=0 && compareISO(pIso, endIso)<=0) shapes.push(vline(pIso, '#EF4444')); });
   return shapes;
 }
-btnLiquidity.onclick=()=>{ liquidityOn=!liquidityOn;
-  const curr=plotDiv.layout.shapes||[];
-  if(liquidityOn){
+
+btnLiquidity.onclick = () => {
+  liquidityOn = !liquidityOn;
+  const curr = plotDiv.layout.shapes || [];
+  if (liquidityOn){
     Plotly.relayout(plotDiv, {shapes:[].concat(curr, makeLiquidityShapes())});
-    btnLiquidity.textContent='Liquidity ✓';
-  }else{
-    const remain=(plotDiv.layout.shapes||[]).filter(s=>s.meta!=='liquidity');
+    btnLiquidity.textContent = 'Liquidity ✓';
+  } else {
+    const remain = (plotDiv.layout.shapes||[]).filter(s => s.meta!=='liquidity');
     Plotly.relayout(plotDiv, {shapes:remain});
-    btnLiquidity.textContent='Liquidity';
+    btnLiquidity.textContent = 'Liquidity';
   }
 };
 </script>
 </body></html>
 """
 
-# ───────────────────────── Fill placeholders (safe) ─────────────────────────
+# ───────────────────────── Fill placeholders ─────────────────────────
 HTML = (HTML
     .replace("__PLOT_HTML__", plot_html)
     .replace("__PRECOMP__", json.dumps(PRECOMP))
@@ -793,8 +817,8 @@ HTML = (HTML
     .replace("__EPS_LOG_SPACING__", str(EPS_LOG_SPACING))
     .replace("__PAST_HALVINGS__", json.dumps(PAST_HALVINGS))
     .replace("__FUTURE_HALVINGS__", json.dumps(FUTURE_HALVINGS))
-    .replace("__LIQ_FIRST_TROUGH_ISO__", LIQ_FIRST_TROUGH_ISO)
-    .replace("__LIQ_PERIOD_DAYS__", str(LIQ_PERIOD_DAYS))
+    .replace("__LIQ_PEAK_ANCHOR_ISO__", LIQ_PEAK_ANCHOR_ISO)
+    .replace("__LIQ_PERIOD_MONTHS__", str(LIQ_PERIOD_MONTHS))
 )
 
 # ───────────────────────────── Write site ─────────────────────────────
