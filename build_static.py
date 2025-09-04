@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BTC Purchase Indicator — dynamic percentile rails with editable dashboard
-and a Halvings toggle (vertical lines for past halvings, dashed for future).
+BTC Purchase Indicator — rails + dashboard + Halvings and Liquidity toggles.
 
-What you get:
-- Denominators: USD, GOLD (XAUUSD), SPX (^SPX), ETH (multi-source fallback).
-- Tooltip shows date + value for active denominator (USD uses $, others raw ratio).
-- Right panel rails show value plus (Nx) vs the 50% rail at the same x.
-- Hover/click drives the panel into the future (to 2040); price & p≈ hidden beyond last price.
-- Editable rails (sorted, dashed), indicator multi-select (checkboxes), copy current view.
-- Year labels tilted 45°, chart width in pixels.
-- NEW: “Halvings” button toggles vertical gray lines for halvings (solid past, dashed future).
+New in this version
+- Halvings toggle: vertical gray lines (solid past, dashed future).
+- Liquidity toggle: vertical cycle inflection lines based on a simple sinusoid model:
+  * Green = decreasing → increasing (troughs)
+  * Red   = increasing → decreasing (peaks)
+  * Future lines dashed; past solid
+  * Independent of Halvings toggle
+
+The rest of your features are preserved: denominators (USD, GOLD, SPX, ETH),
+hover/click panel with (Nx) vs 50% midline, rails editor, indicator multi-select,
+copy current view (respects zoom), chart width in px, tilted years, etc.
 """
 
 import os, io, glob, json
@@ -35,9 +37,14 @@ RESID_WINSOR     = 0.02
 EPS_LOG_SPACING  = 0.010
 COL_BTC          = "#000000"
 
-# Halvings: past + projected (approx every ~4 years from 2024-04-20)
+# Halvings: past + projected
 PAST_HALVINGS = ["2012-11-28", "2016-07-09", "2020-05-11", "2024-04-20"]
 FUTURE_HALVINGS = ["2028-04-20", "2032-04-20", "2036-04-19", "2040-04-19"]
+
+# === Liquidity cycle (simple sinusoid model) ===
+# First trough date (decreasing → increasing) and full-cycle length
+LIQ_FIRST_TROUGH_ISO = "2011-01-01"   # tune as desired to align with your reference chart(s)
+LIQ_PERIOD_DAYS      = 1278           # ~3.5 years; adjust if you want a different cadence
 
 AUTO_DENOMS = {
     "GOLD": {"path": os.path.join(DATA_DIR, "denominator_gold.csv"),
@@ -265,6 +272,8 @@ for k in sorted(denoms.keys()):
     PRECOMP[k] = build_payload(base, k)
 P0 = PRECOMP["USD"]
 
+LAST_PRICE_ISO = str(pd.to_datetime(base["date"]).max().date())
+
 # ───────────────────── Plot base figure and traces ─────────────────────
 MAX_RAIL_SLOTS = 12
 IDX_MAIN  = MAX_RAIL_SLOTS
@@ -391,6 +400,7 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
       </div>
 
       <button id="halvingsBtn" class="btn" title="Toggle halving lines">Halvings</button>
+      <button id="liquidityBtn" class="btn" title="Toggle liquidity cycle">Liquidity</button>
       <button id="copyBtn" class="btn" title="Copy current view to clipboard">Copy Chart</button>
     </div>
 
@@ -431,6 +441,9 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
 <script>
 const PRECOMP = __PRECOMP__;
 const GENESIS = new Date('__GENESIS__T00:00:00Z');
+const END_ISO = '__END_ISO__';
+const LAST_PRICE_ISO = '__LAST_PRICE_ISO__';
+
 const MAX_SLOTS = __MAX_RAIL_SLOTS__;
 const IDX_MAIN  = __IDX_MAIN__;
 const IDX_CLICK = __IDX_CLICK__;
@@ -439,6 +452,9 @@ const IDX_TT    = __IDX_TT__;
 const EPS_LOG_SPACING = __EPS_LOG_SPACING__;
 const PAST_HALVINGS = __PAST_HALVINGS__;
 const FUTURE_HALVINGS = __FUTURE_HALVINGS__;
+
+const LIQ_FIRST_TROUGH_ISO = '__LIQ_FIRST_TROUGH_ISO__';
+const LIQ_PERIOD_DAYS = __LIQ_PERIOD_DAYS__;
 
 const MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 function yearsFromISO(iso){ const d=new Date(iso+'T00:00:00Z'); return ((d-GENESIS)/86400000)/365.25 + (1.0/365.25); }
@@ -493,6 +509,7 @@ const btnToday=document.getElementById('todayBtn');
 const btnCopy=document.getElementById('copyBtn');
 const btnFit=document.getElementById('fitBtn');
 const btnHalvings=document.getElementById('halvingsBtn');
+const btnLiquidity=document.getElementById('liquidityBtn');
 const elDate=document.querySelector('#readout .date');
 const elRows=document.getElementById('readoutRows');
 const elMain=document.getElementById('mainVal');
@@ -690,16 +707,16 @@ function syncAll(){ sortRails(); rebuildEditor(); const P=PRECOMP[denomSel.value
   updatePanel(P, P.x_main[P.x_main.length-1]);
 })();
 
-// ─────────────────────── Halvings toggle (NEW) ───────────────────────
+// ─────────────────────── Halvings toggle (meta-tagged) ───────────────────────
 let halvingsOn=false;
 function makeHalvingShapes(){
   const shapes=[];
   function lineAt(xYears, dashed){
     return {type:'line', xref:'x', yref:'paper', x0:xYears, x1:xYears, y0:0, y1:1,
-            line:{color:'#9CA3AF', width:1.2, dash:(dashed?'dash':'solid')}, layer:'below'};
+            line:{color:'#9CA3AF', width:1.2, dash:(dashed?'dash':'solid')}, layer:'below', meta:'halving'};
   }
-  PAST_HALVINGS.forEach(iso=>{ const x=yearsFromISO(iso); shapes.push(lineAt(x,false)); });
-  FUTURE_HALVINGS.forEach(iso=>{ const x=yearsFromISO(iso); shapes.push(lineAt(x,true)); });
+  PAST_HALVINGS.forEach(iso=>{ shapes.push(lineAt(yearsFromISO(iso), false)); });
+  FUTURE_HALVINGS.forEach(iso=>{ shapes.push(lineAt(yearsFromISO(iso), true)); });
   return shapes;
 }
 btnHalvings.onclick=()=>{ halvingsOn=!halvingsOn;
@@ -708,10 +725,53 @@ btnHalvings.onclick=()=>{ halvingsOn=!halvingsOn;
     Plotly.relayout(plotDiv, {shapes:[].concat(curr, makeHalvingShapes())});
     btnHalvings.textContent='Halvings ✓';
   }else{
-    // remove all halving lines by filtering on color/dash signature we used
-    const remain=(plotDiv.layout.shapes||[]).filter(s=>!(s.line && s.line.color==='#9CA3AF'));
+    const remain=(plotDiv.layout.shapes||[]).filter(s=>s.meta!=='halving');
     Plotly.relayout(plotDiv, {shapes:remain});
     btnHalvings.textContent='Halvings';
+  }
+};
+
+// ─────────────────────── Liquidity toggle (NEW) ───────────────────────
+let liquidityOn=false;
+function addDays(iso, days){ const d=new Date(iso+'T00:00:00Z'); d.setUTCDate(d.getUTCDate()+days); return d.toISOString().slice(0,10); }
+function makeLiquidityShapes(){
+  const shapes=[];
+  const endIso = END_ISO;
+  const lastIso = LAST_PRICE_ISO;
+
+  // Troughs (decreasing -> increasing) every LIQ_PERIOD_DAYS from FIRST_TROUGH
+  let tIso = LIQ_FIRST_TROUGH_ISO;
+  while (tIso <= endIso){
+    const x = yearsFromISO(tIso);
+    const dashed = tIso > lastIso;
+    shapes.push({
+      type:'line', xref:'x', yref:'paper', x0:x, x1:x, y0:0, y1:1,
+      line:{color:'#22C55E', width:1.4, dash:(dashed?'dash':'solid')}, layer:'below', meta:'liquidity'
+    });
+    tIso = addDays(tIso, LIQ_PERIOD_DAYS);
+  }
+  // Peaks (increasing -> decreasing) are offset by half a cycle
+  let pIso = addDays(LIQ_FIRST_TROUGH_ISO, Math.floor(LIQ_PERIOD_DAYS/2));
+  while (pIso <= endIso){
+    const x = yearsFromISO(pIso);
+    const dashed = pIso > lastIso;
+    shapes.push({
+      type:'line', xref:'x', yref:'paper', x0:x, x1:x, y0:0, y1:1,
+      line:{color:'#EF4444', width:1.4, dash:(dashed?'dash':'solid')}, layer:'below', meta:'liquidity'
+    });
+    pIso = addDays(pIso, LIQ_PERIOD_DAYS);
+  }
+  return shapes;
+}
+btnLiquidity.onclick=()=>{ liquidityOn=!liquidityOn;
+  const curr=plotDiv.layout.shapes||[];
+  if(liquidityOn){
+    Plotly.relayout(plotDiv, {shapes:[].concat(curr, makeLiquidityShapes())});
+    btnLiquidity.textContent='Liquidity ✓';
+  }else{
+    const remain=(plotDiv.layout.shapes||[]).filter(s=>s.meta!=='liquidity');
+    Plotly.relayout(plotDiv, {shapes:remain});
+    btnLiquidity.textContent='Liquidity';
   }
 };
 </script>
@@ -723,6 +783,8 @@ HTML = (HTML
     .replace("__PLOT_HTML__", plot_html)
     .replace("__PRECOMP__", json.dumps(PRECOMP))
     .replace("__GENESIS__", GENESIS_DATE.strftime("%Y-%m-%d"))
+    .replace("__END_ISO__", END_PROJ.strftime("%Y-%m-%d"))
+    .replace("__LAST_PRICE_ISO__", LAST_PRICE_ISO)
     .replace("__MAX_RAIL_SLOTS__", str(MAX_RAIL_SLOTS))
     .replace("__IDX_MAIN__",  str(IDX_MAIN))
     .replace("__IDX_CLICK__", str(IDX_CLICK))
@@ -731,6 +793,8 @@ HTML = (HTML
     .replace("__EPS_LOG_SPACING__", str(EPS_LOG_SPACING))
     .replace("__PAST_HALVINGS__", json.dumps(PAST_HALVINGS))
     .replace("__FUTURE_HALVINGS__", json.dumps(FUTURE_HALVINGS))
+    .replace("__LIQ_FIRST_TROUGH_ISO__", LIQ_FIRST_TROUGH_ISO)
+    .replace("__LIQ_PERIOD_DAYS__", str(LIQ_PERIOD_DAYS))
 )
 
 # ───────────────────────────── Write site ─────────────────────────────
