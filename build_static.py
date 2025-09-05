@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 BTC Purchase Indicator — stationary rails (constant residual quantile offsets),
-cursor-driven right panel (future uses 50% rail with "(50%)"), corrected
-annotation text, even-year ticks after 2022, halvings & liquidity toggles.
+cursor-driven right panel (future uses 50% rail with "(50%)"), fixed buttons,
+even-year ticks after 2020, halvings & liquidity toggles.
 
 - Denominators: USD / GOLD / SPX / ETH (auto-fetch with fallbacks)
 - Editable rails (sorted; all dashed, including 50%)
@@ -229,13 +229,13 @@ x_start = float(years_since_genesis(pd.Series([first_dt])).iloc[0])
 x_end   = float(years_since_genesis(pd.Series([max_dt])).iloc[0])
 x_grid  = np.logspace(np.log10(max(1e-6, x_start)), np.log10(x_end), 700)
 
-# y-axis ticks and x ticks (evens after 2022)
+# y-axis ticks and x ticks (evens after 2020)
 def year_ticks_log(first_dt, last_dt):
     vals, labs = [], []
     for y in range(first_dt.year, last_dt.year+1):
         d = datetime(y,1,1)
         if d < first_dt or d > last_dt: continue
-        if y > 2022 and (y % 2 == 1):  # hide odd labels after 2022
+        if y > 2020 and (y % 2 == 1):  # hide odd labels after 2020
             continue
         vy = float(years_since_genesis(pd.Series([d])).iloc[0])
         if vy <= 0: continue
@@ -284,7 +284,7 @@ LAST_PRICE_ISO = str(pd.to_datetime(base["date"]).max().date())
 MAX_RAIL_SLOTS = 12
 IDX_MAIN  = MAX_RAIL_SLOTS
 IDX_CLICK = MAX_RAIL_SLOTS + 1
-IDX_CURSR = MAX_RAIL_SLOTS + 2
+IDX_CARRY = MAX_RAIL_SLOTS + 2  # hover carrier across full x_grid
 IDX_TT    = MAX_RAIL_SLOTS + 3
 
 def add_stub(idx):
@@ -300,8 +300,9 @@ traces += [
     go.Scatter(x=P0["x_main"], y=P0["y_main"], mode="lines",
                name="_click", showlegend=False, hoverinfo="skip",
                line=dict(width=18, color="rgba(0,0,0,0.001)")),
+    # Hover carrier: spans entire x_grid with P50 values; invisible but captures hover everywhere (past+future)
     go.Scatter(x=P0["x_grid"], y=[None]*len(P0["x_grid"]), mode="lines",
-               name="_cursor", showlegend=False, hoverinfo="skip",
+               name="_carry", showlegend=False, hoverinfo="x",
                line=dict(width=0.1, color="rgba(0,0,0,0.001)")),
     go.Scatter(x=P0["x_main"], y=P0["y_main"], mode="lines",
                name="_tooltip", showlegend=False,
@@ -453,7 +454,7 @@ const LAST_PRICE_ISO = '__LAST_PRICE_ISO__';
 const MAX_SLOTS = __MAX_RAIL_SLOTS__;
 const IDX_MAIN  = __IDX_MAIN__;
 const IDX_CLICK = __IDX_CLICK__;
-const IDX_CURSR = __IDX_CURSR__;
+const IDX_CARRY = __IDX_CARRY__;
 const IDX_TT    = __IDX_TT__;
 const EPS_LOG_SPACING = __EPS_LOG_SPACING__;
 const PAST_HALVINGS = __PAST_HALVINGS__;
@@ -511,7 +512,7 @@ function rangeForIndicator(name){
 
 // DOM refs
 const leftCol=document.getElementById('leftCol');
-const plotDiv=document.querySelector('.left .js-plotly-plot') || document.querySelector('.left .plotly-graph-div');
+const plotDiv=(function(){ return document.querySelector('.left .js-plotly-plot') || document.querySelector('.left .plotly-graph-div'); })();
 const denomSel=document.getElementById('denomSel');
 const datePick=document.getElementById('datePick');
 const btnSet=document.getElementById('setDateBtn');
@@ -538,6 +539,16 @@ const indicatorClear=document.getElementById('indicatorClear');
 const indicatorApply=document.getElementById('indicatorApply');
 const denomsDetected=document.getElementById('denomsDetected');
 
+// Indicator UI
+function getCheckedIndicators(){ const boxes=indicatorMenu.querySelectorAll('input[type=checkbox]'); const out=[]; boxes.forEach(b=>{if(b.checked) out.push(b.value)}); return out;}
+function setCheckedIndicators(arr){ const set=new Set(arr); const boxes=indicatorMenu.querySelectorAll('input[type=checkbox]'); boxes.forEach(b=>{b.checked=set.has(b.value)}); }
+function labelForIndicatorBtn(arr){ return (!arr.length)?'Indicator: All':(arr.length===1?'Indicator: '+arr[0]:'Indicator: '+arr.length+' selected'); }
+let selectedIndicators=[];
+indicatorBtn.addEventListener('click',e=>{e.stopPropagation(); indicatorMenu.classList.toggle('open');});
+indicatorClear.addEventListener('click',e=>{e.preventDefault(); setCheckedIndicators([]);});
+indicatorApply.addEventListener('click',e=>{e.preventDefault(); indicatorMenu.classList.remove('open'); selectedIndicators=getCheckedIndicators(); indicatorBtn.textContent=labelForIndicatorBtn(selectedIndicators); applyIndicatorMask(PRECOMP[denomSel.value]);});
+document.addEventListener('click',e=>{ if(!indicatorMenu.contains(e.target) && !indicatorBtn.contains(e.target)) indicatorMenu.classList.remove('open'); });
+
 // Denominator init
 (function initDenoms(){
   const keys=Object.keys(PRECOMP); const order=['USD'].concat(keys.filter(k=>k!=='USD'));
@@ -549,7 +560,7 @@ const denomsDetected=document.getElementById('denomsDetected');
 // Rails state & UI
 let rails=[97.5,90,75,50,25,2.5];
 function sortRails(){ rails=rails.filter(p=>isFinite(p)).map(Number).map(p=>clamp(p,0.1,99.9)).filter((p,i,a)=>a.indexOf(p)===i).sort((a,b)=>b-a); }
-function railsText(){ return rails.map(p=>String(p).replace(/\\.0$/,'')+'%').join(', '); }
+function railsText(){ return rails.map(p=>String(p).replace(/\.0$/,'')+'%').join(', '); }
 function idFor(p){ return 'v'+String(p).replace('.','_'); }
 
 function rebuildReadoutRows(){
@@ -630,6 +641,10 @@ function renderRails(P){
     }
     Plotly.restyle(plotDiv, restyle, [i]);
   }
+  // Update hover carrier to P50 so we get events everywhere (past+future)
+  const p50 = seriesForPercent(P, 50);
+  Plotly.restyle(plotDiv, {x:[P.x_grid], y:[p50]}, [IDX_CARRY]);
+
   railsListText.textContent=railsText(); rebuildReadoutRows();
 }
 
@@ -711,9 +726,10 @@ plotDiv.on('plotly_click', ev=>{
   Plotly.relayout(plotDiv,{annotations:[ann]}); updatePanel(P,xYears);
 });
 
-// Hover drives panel (unlocked only)
+// Hover drives panel everywhere (carrier trace guarantees events on future x)
 plotDiv.on('plotly_hover', ev=>{
-  if(!(ev.points && ev.points.length) || locked) return;
+  if(!(ev.points && ev.points.length)) return;
+  if (locked) return;
   updatePanel(PRECOMP[denomSel.value], ev.points[0].x);
 });
 
@@ -728,6 +744,8 @@ btnCopy.onclick=async ()=>{ try{ const url=await Plotly.toImage(plotDiv,{format:
 denomSel.onchange=()=>{ const key=denomSel.value, P=PRECOMP[key];
   Plotly.restyle(plotDiv,{x:[P.x_main], y:[P.y_main], name:[P.label]}, [IDX_MAIN]);
   Plotly.restyle(plotDiv,{x:[P.x_main], y:[P.y_main]},                 [IDX_CLICK]);
+  // update hover carrier to new denominator midline (future hover works)
+  Plotly.restyle(plotDiv,{x:[P.x_grid], y:[seriesForPercent(P,50)]},   [IDX_CARRY]);
   Plotly.relayout(plotDiv,{annotations:[]}); renderRails(P); applyIndicatorMask(P);
   const x=locked?lockedX:P.x_main[P.x_main.length-1]; updatePanel(P,x);
 };
@@ -739,7 +757,10 @@ function syncAll(){ sortRails(); rebuildEditor(); const P=PRECOMP[denomSel.value
 (function init(){
   rebuildReadoutRows(); rebuildEditor();
   renderRails(PRECOMP['USD']); applyIndicatorMask(PRECOMP['USD']);
-  const P=PRECOMP['USD']; const tt="%{x|%b-%d-%Y}<br>$%{y:.2f}<extra></extra>";
+  const P=PRECOMP['USD'];
+  // ensure carrier is live on first render
+  Plotly.restyle(plotDiv,{x:[P.x_grid], y:[seriesForPercent(P,50)]},[IDX_CARRY]);
+  const tt="%{x|%b-%d-%Y}<br>$%{y:.2f}<extra></extra>";
   Plotly.restyle(plotDiv,{x:[P.x_main], y:[P.y_main], hovertemplate:[tt], line:[{width:0}]},[IDX_TT]);
   updatePanel(P, P.x_main[P.x_main.length-1]);
 })();
@@ -848,7 +869,7 @@ HTML = (HTML
     .replace("__MAX_RAIL_SLOTS__", str(MAX_RAIL_SLOTS))
     .replace("__IDX_MAIN__",  str(IDX_MAIN))
     .replace("__IDX_CLICK__", str(IDX_CLICK))
-    .replace("__IDX_CURSR__", str(IDX_CURSR))
+    .replace("__IDX_CARRY__", str(IDX_CARRY))
     .replace("__IDX_TT__",    str(IDX_TT))
     .replace("__EPS_LOG_SPACING__", str(EPS_LOG_SPACING))
     .replace("__PAST_HALVINGS__", json.dumps(PAST_HALVINGS))
