@@ -516,7 +516,7 @@ function classFromScore(s){
   if (s >= 0.25) return 'Buy';
   if (s >  -0.25) return 'DCA';
   if (s >  -0.75) return 'Hold On';
-  if (s >  -1.25) return 'Frothy';
+  if (s >  -1.50) return 'Frothy';
   return 'Top Inbound';
 }
 
