@@ -1,16 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BTC Purchase Indicator — stationary rails (constant residual quantile offsets),
-cursor-driven right panel (future uses 50% rail with "(50%)"), fixed buttons,
-even-year ticks after 2020, halvings & liquidity toggles.
-
-- Denominators: USD / GOLD / SPX / ETH (auto-fetch with fallbacks)
-- Editable rails (sorted; all dashed, including 50%)
-- Indicator multi-select highlight
-- Copy current view (zoom respected)
-- Halvings (past solid, future dashed)
-- Liquidity peaks/troughs (65 mo; peak anchored 2015-02-01), drawn back to 2009
+BTC Purchase Indicator — stationary rails with composite signal (no cross-denom voting),
+cursor-driven panel (future uses 50%), even-year x labels after 2020, halvings & liquidity toggles,
+and an "i" info button.
 
 Writes: docs/index.html
 """
@@ -32,20 +25,25 @@ GENESIS_DATE = datetime(2009, 1, 3)
 END_PROJ     = datetime(2040, 12, 31)
 X_START_DATE = datetime(2011, 1, 1)
 
-RESID_WINSOR     = 0.02           # clip tails of residuals
-EPS_LOG_SPACING  = 0.010          # small spread guard at floor/ceiling
+RESID_WINSOR     = 0.02
+EPS_LOG_SPACING  = 0.010
 COL_BTC          = "#000000"
 
-# Halvings: past + projected
+# Halvings
 PAST_HALVINGS   = ["2012-11-28", "2016-07-09", "2020-05-11", "2024-04-20"]
 FUTURE_HALVINGS = ["2028-04-20", "2032-04-20", "2036-04-19", "2040-04-19"]
 
-# Liquidity cycle (peak anchored)
+# Liquidity (65-month wave)
 LIQ_PEAK_ANCHOR_ISO = "2015-02-01"  # PEAK (red)
-LIQ_PERIOD_MONTHS   = 65            # peak-to-peak
-LIQ_START_ISO       = "2009-01-03"  # draw prior to 2015
+LIQ_PERIOD_MONTHS   = 65
+LIQ_START_ISO       = "2009-01-03"
 
-# Auto denominators (daily closes). Multiple fallbacks for ETH.
+# Composite weights (tweakable)
+W_P   = 1.00   # rails p (centered at 50)
+W_LIQ = 0.60   # liquidity rising/falling (cosine of phase)
+W_HALV= 0.60   # halving window (+1 pre, +0.5 post, −0.5 late)
+
+# Auto denominators
 AUTO_DENOMS = {
     "GOLD": {"path": os.path.join(DATA_DIR, "denominator_gold.csv"),
              "url":  "https://stooq.com/q/d/l/?s=xauusd&i=d", "parser":"stooq"},
@@ -56,7 +54,7 @@ AUTO_DENOMS = {
 }
 UA = {"User-Agent":"btc-indicator/1.0"}
 
-# ─────────────────────── Data helpers / fetchers ───────────────────────
+# ───────────────────── Helpers / fetchers ─────────────────────
 def years_since_genesis(dates):
     d = pd.to_datetime(dates)
     delta_days = (d - GENESIS_DATE) / np.timedelta64(1, "D")
@@ -90,7 +88,7 @@ def _fetch_stooq_csv(url: str) -> pd.DataFrame:
     df = df.rename(columns=lower)
     if "date" not in df.columns or "close" not in df.columns or df.empty:
         raise ValueError("stooq returned no usable columns")
-    out = df[["date","close"]].rename(columns={"date":"date","close":"price"})
+    out = df[["date","close"]].rename(columns={"close":"price"})
     out["date"] = pd.to_datetime(out["date"], errors="coerce")
     out["price"] = pd.to_numeric(out["price"], errors="coerce")
     return out.sort_values("date").dropna()
@@ -181,7 +179,7 @@ def load_denominators():
             print(f"[warn] skip {p}: {e}")
     return out
 
-# ───────────────────────── Fit / stationary rails support ─────────────────────────
+# ───────────────────────── Fit / stationary rails ─────────────────────────
 def winsorize(arr, p):
     lo, hi = np.nanquantile(arr, p), np.nanquantile(arr, 1-p)
     return np.clip(arr, lo, hi)
@@ -197,7 +195,6 @@ def quantile_fit_loglog(x_years, y_vals, q=0.5):
     return a0, b, resid
 
 def build_support_constant_rails(x_years, y_vals):
-    """Median fit + global residual quantiles (stationary offsets)."""
     a0, b, resid = quantile_fit_loglog(x_years, y_vals, q=0.5)
     r = winsorize(resid, RESID_WINSOR) if RESID_WINSOR else resid
     med = float(np.nanmedian(r))
@@ -210,7 +207,7 @@ def build_support_constant_rails(x_years, y_vals):
             "q_grid":[float(q) for q in q_grid],
             "off_grid":[float(v) for v in off_grid]}
 
-# ───────────────────────────── Build model ─────────────────────────────
+# ───────────────────────── Build model ─────────────────────────
 btc = fetch_btc_csv().rename(columns={"price":"btc"})
 denoms = load_denominators()
 print("[denoms]", list(denoms.keys()))
@@ -229,13 +226,11 @@ x_start = float(years_since_genesis(pd.Series([first_dt])).iloc[0])
 x_end   = float(years_since_genesis(pd.Series([max_dt])).iloc[0])
 x_grid  = np.logspace(np.log10(max(1e-6, x_start)), np.log10(x_end), 700)
 
-# y-axis ticks and x ticks (evens after 2020)
 def year_ticks_log(first_dt, last_dt):
     vals, labs = [], []
     for y in range(first_dt.year, last_dt.year+1):
         d = datetime(y,1,1)
-        if d < first_dt or d > last_dt: continue
-        if y > 2020 and (y % 2 == 1):  # hide odd labels after 2020
+        if y > 2020 and (y % 2 == 1):  # hide odd years after 2020
             continue
         vy = float(years_since_genesis(pd.Series([d])).iloc[0])
         if vy <= 0: continue
@@ -277,14 +272,13 @@ PRECOMP = {"USD": build_payload(base, None)}
 for k in sorted(denoms.keys()):
     PRECOMP[k] = build_payload(base, k)
 P0 = PRECOMP["USD"]
-
 LAST_PRICE_ISO = str(pd.to_datetime(base["date"]).max().date())
 
-# ───────────────────── Plot base figure and traces ─────────────────────
+# ───────────────────── Plot (rails stubs + series) ─────────────────────
 MAX_RAIL_SLOTS = 12
 IDX_MAIN  = MAX_RAIL_SLOTS
 IDX_CLICK = MAX_RAIL_SLOTS + 1
-IDX_CARRY = MAX_RAIL_SLOTS + 2  # hover carrier across full x_grid
+IDX_CARRY = MAX_RAIL_SLOTS + 2
 IDX_TT    = MAX_RAIL_SLOTS + 3
 
 def add_stub(idx):
@@ -300,7 +294,6 @@ traces += [
     go.Scatter(x=P0["x_main"], y=P0["y_main"], mode="lines",
                name="_click", showlegend=False, hoverinfo="skip",
                line=dict(width=18, color="rgba(0,0,0,0.001)")),
-    # Hover carrier: spans entire x_grid with P50 values; invisible but captures hover everywhere (past+future)
     go.Scatter(x=P0["x_grid"], y=[None]*len(P0["x_grid"]), mode="lines",
                name="_carry", showlegend=False, hoverinfo="x",
                line=dict(width=0.1, color="rgba(0,0,0,0.001)")),
@@ -329,7 +322,7 @@ fig.update_layout(
 plot_html = fig.to_html(full_html=False, include_plotlyjs="cdn",
                         config={"responsive":True,"displayModeBar":True,"modeBarButtonsToRemove":["toImage"]})
 
-# ───────────────────────────────── HTML (placeholders replaced) ─────────────────────────────────
+# ───────────────────────────── HTML ─────────────────────────────
 HTML = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"/>
@@ -357,6 +350,12 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
 .rail-row input[type=number]{width:90px}
 .rail-row button{padding:4px 8px;font-size:12px}
 .smallnote{font-size:12px;color:#6b7280}
+.info-btn{width:28px;height:28px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-weight:700}
+.info-modal{position:fixed;inset:0;background:rgba(0,0,0,0.35);display:none;align-items:center;justify-content:center;z-index:100}
+.info-card{background:#fff;border-radius:12px;max-width:680px;width:92%;padding:16px;border:1px solid #e5e7eb;box-shadow:0 12px 28px rgba(0,0,0,0.18)}
+.info-card h3{margin:0 0 8px 0}
+.info-card p{margin:6px 0}
+.info-modal.open{display:flex}
 @media (max-width:900px){
   .layout{flex-direction:column}
   .right{flex:0 0 auto;border-left:none;border-top:1px solid #e5e7eb}
@@ -409,6 +408,8 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
       <button id="halvingsBtn" class="btn" title="Toggle halving lines">Halvings</button>
       <button id="liquidityBtn" class="btn" title="Toggle liquidity cycle">Liquidity</button>
       <button id="copyBtn" class="btn" title="Copy current view to clipboard">Copy Chart</button>
+
+      <button id="infoBtn" class="btn info-btn" title="How it works">i</button>
     </div>
 
     <div id="chartWidthBox">
@@ -441,6 +442,21 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
       <div id="readoutRows"></div>
       <div style="margin-top:10px;"><b id="mainLabel">BTC Price:</b> <span id="mainVal" class="num">—</span></div>
       <div><b>Position:</b> <span id="pPct" style="font-weight:600;">(p≈—)</span></div>
+      <div><b>Composite:</b> <span id="compLine" class="smallnote">—</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- Info modal -->
+<div id="infoModal" class="info-modal" role="dialog" aria-modal="true">
+  <div class="info-card">
+    <h3>How the Indicator Works</h3>
+    <p><b>Rails:</b> We fit a power-law (log-log) median to BTC and measure residuals. Fixed quantiles of residuals become % rails (Floor≈2.5% … Ceiling≈97.5%).</p>
+    <p><b>p-value:</b> Your position within Floor⇢Ceiling on a log scale (0–100%).</p>
+    <p><b>Composite score:</b> We blend (a) centered p, (b) the 65-month liquidity wave (rising=tailwind, falling=headwind), and (c) the halving window (+1 pre-halving year, +0.5 in first ~18 months after, −0.5 late). No cross-denominator voting.</p>
+    <p><b>Labels:</b> The title (SELL THE HOUSE → Top Inbound) comes from the composite score. The Indicator filter highlights dates that matched those labels historically.</p>
+    <div style="display:flex;justify-content:flex-end;margin-top:10px;">
+      <button id="infoClose" class="btn">Close</button>
     </div>
   </div>
 </div>
@@ -460,19 +476,25 @@ const EPS_LOG_SPACING = __EPS_LOG_SPACING__;
 const PAST_HALVINGS = __PAST_HALVINGS__;
 const FUTURE_HALVINGS = __FUTURE_HALVINGS__;
 
-const LIQ_PEAK_ANCHOR_ISO = '__LIQ_PEAK_ANCHOR_ISO__'; // PEAK (red)
-const LIQ_PERIOD_MONTHS   = __LIQ_PERIOD_MONTHS__;     // peak-to-peak
+const LIQ_PEAK_ANCHOR_ISO = '__LIQ_PEAK_ANCHOR_ISO__';
+const LIQ_PERIOD_MONTHS   = __LIQ_PERIOD_MONTHS__;
 const LIQ_START_ISO       = '__LIQ_START_ISO__';
+
+const W_P   = __W_P__;
+const W_LIQ = __W_LIQ__;
+const W_HALV= __W_HALV__;
 
 const MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 function yearsFromISO(iso){ const d=new Date(iso+'T00:00:00Z'); return ((d-GENESIS)/86400000)/365.25 + (1.0/365.25); }
 function shortDateFromYears(y){ const ms=(y-(1.0/365.25))*365.25*86400000; const d=new Date(GENESIS.getTime()+ms); return `${MONTHS[d.getUTCMonth()]}-${String(d.getUTCDate()).padStart(2,'0')}-${String(d.getUTCFullYear()).slice(-2)}`; }
+function isoFromYears(y){ const ms=(y-(1.0/365.25))*365.25*86400000; const d=new Date(GENESIS.getTime()+ms); return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`; }
 function interp(xs, ys, x){ let lo=0,hi=xs.length-1; if(x<=xs[0]) return ys[0]; if(x>=xs[hi]) return ys[hi];
   while(hi-lo>1){ const m=(hi+lo)>>1; if(xs[m]<=x) lo=m; else hi=m; }
   const t=(x-xs[lo])/(xs[hi]-xs[lo]); return ys[lo]+t*(ys[hi]-ys[lo]); }
 function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+function daysBetweenISO(a,b){ return Math.round((new Date(b+'T00:00:00Z') - new Date(a+'T00:00:00Z'))/86400000); }
+function monthsBetweenISO(a,b){ return (new Date(b+'T00:00:00Z') - new Date(a+'T00:00:00Z'))/(86400000*30.4375); }
 
-// value formatting
 function fmtVal(P, v){
   if(!isFinite(v)) return '—';
   const dec = Math.max(0, Math.min(10, P.decimals||2));
@@ -481,36 +503,24 @@ function fmtVal(P, v){
   return Number(v).toLocaleString(undefined,{minimumFractionDigits:Math.min(6,maxd),maximumFractionDigits:maxd});
 }
 
-// Colors and Indicator ranges
+// Colors & classes
 function colorForPercent(p){ const t=clamp(p/100,0,1);
   function hx(v){return Math.max(0,Math.min(255,Math.round(v))); }
   function toHex(r,g,b){return '#'+[r,g,b].map(v=>hx(v).toString(16).padStart(2,'0')).join('');}
   if(t<=0.5){const u=t/0.5;return toHex(0xD3+(0xFB-0xD3)*u,0x2F+(0xC0-0x2F)*u,0x2F+(0x2D-0x2F)*u);}
   const u=(t-0.5)/0.5; return toHex(0xFB+(0x2E-0xFB)*u,0xC0+(0x7D-0xC0)*u,0x2D+(0x32-0x2D)*u);
 }
-function indicatorFromP(p){
-  if (p < 2.5) return 'SELL THE HOUSE';
-  if (p < 25)  return 'Strong Buy';
-  if (p < 50)  return 'Buy';
-  if (p < 75)  return 'DCA';
-  if (p < 90)  return 'Hold On';
-  if (p <= 97.5) return 'Frothy';
+function classFromScore(s){
+  if (s >= 1.25) return 'SELL THE HOUSE';
+  if (s >= 0.75) return 'Strong Buy';
+  if (s >= 0.25) return 'Buy';
+  if (s >  -0.25) return 'DCA';
+  if (s >  -0.75) return 'Hold On';
+  if (s >  -1.25) return 'Frothy';
   return 'Top Inbound';
 }
-function rangeForIndicator(name){
-  switch(name){
-    case 'SELL THE HOUSE': return [-Infinity, 2.5];
-    case 'Strong Buy':     return [2.5, 25];
-    case 'Buy':            return [25, 50];
-    case 'DCA':            return [50, 75];
-    case 'Hold On':        return [75, 90];
-    case 'Frothy':         return [90, 97.5];
-    case 'Top Inbound':    return [97.5, Infinity];
-    default:               return [-Infinity, Infinity];
-  }
-}
 
-// DOM refs
+// DOM
 const leftCol=document.getElementById('leftCol');
 const plotDiv=(function(){ return document.querySelector('.left .js-plotly-plot') || document.querySelector('.left .plotly-graph-div'); })();
 const denomSel=document.getElementById('denomSel');
@@ -521,12 +531,18 @@ const btnCopy=document.getElementById('copyBtn');
 const btnFit=document.getElementById('fitBtn');
 const btnHalvings=document.getElementById('halvingsBtn');
 const btnLiquidity=document.getElementById('liquidityBtn');
+const infoBtn=document.getElementById('infoBtn');
+const infoModal=document.getElementById('infoModal');
+const infoClose=document.getElementById('infoClose');
+
 const elDate=document.querySelector('#readout .date');
 const elRows=document.getElementById('readoutRows');
 const elMain=document.getElementById('mainVal');
 const elMainLabel=document.getElementById('mainLabel');
 const elP=document.getElementById('pPct');
+const elComp=document.getElementById('compLine');
 const chartWpx=document.getElementById('chartWpx');
+
 const editBtn=document.getElementById('editBtn');
 const railsView=document.getElementById('railsView');
 const railsListText=document.getElementById('railsListText');
@@ -549,7 +565,7 @@ indicatorClear.addEventListener('click',e=>{e.preventDefault(); setCheckedIndica
 indicatorApply.addEventListener('click',e=>{e.preventDefault(); indicatorMenu.classList.remove('open'); selectedIndicators=getCheckedIndicators(); indicatorBtn.textContent=labelForIndicatorBtn(selectedIndicators); applyIndicatorMask(PRECOMP[denomSel.value]);});
 document.addEventListener('click',e=>{ if(!indicatorMenu.contains(e.target) && !indicatorBtn.contains(e.target)) indicatorMenu.classList.remove('open'); });
 
-// Denominator init
+// Denominators
 (function initDenoms(){
   const keys=Object.keys(PRECOMP); const order=['USD'].concat(keys.filter(k=>k!=='USD'));
   denomSel.innerHTML=''; order.forEach(k=>{ const o=document.createElement('option'); o.value=k; o.textContent=k; denomSel.appendChild(o); });
@@ -604,7 +620,7 @@ btnFit.addEventListener('click',()=>{
 });
 if(window.ResizeObserver) new ResizeObserver(()=>{ if(window.Plotly&&plotDiv) Plotly.Plots.resize(plotDiv); }).observe(leftCol);
 
-// ─────────── Rails math (stationary offsets) ───────────
+// ───────── Rails math ─────────
 function logMidline(P){ const d=P.support; return P.x_grid.map(x=> (d.a0 + d.b*Math.log10(x)) ); }
 function offsetForPercent(P, percent){
   const d=P.support; const q=d.q_grid, off=d.off_grid;
@@ -629,6 +645,44 @@ function percentFromOffset(P, off){
   return 100*(q[lo] + t*(q[hi]-q[lo]));
 }
 
+// Liquidity & halving utilities
+function liqCosAtISO(iso){
+  const m = monthsBetweenISO(LIQ_PEAK_ANCHOR_ISO, iso);
+  const ang = 2*Math.PI*m/LIQ_PERIOD_MONTHS;
+  return Math.cos(ang); // >0 rising from trough to peak; <0 falling
+}
+function halvingScoreAtISO(iso){
+  // +1 in the year before next halving; +0.5 in ~18 months after last; −0.5 late (>18m after)
+  // find last and next
+  let last = null, next = null;
+  for (const h of PAST_HALVINGS.concat(FUTURE_HALVINGS)){
+    if (h <= iso) last = h;
+    if (h > iso){ next = h; break; }
+  }
+  let s = 0;
+  if (next){
+    const d = daysBetweenISO(iso, next);
+    if (d >= 0 && d <= 365) s += 1.0; // pre-halving year
+  }
+  if (last){
+    const d = daysBetweenISO(last, iso);
+    if (d > 0 && d <= 540) s += 0.5;   // early post-halving
+    if (d > 540)           s -= 0.5;   // late post-halving
+  }
+  return s;
+}
+
+// Composite
+function zFromP(p){ return (50 - p)/25; } // +1 at p=25, 0 at p=50, −1 at p=75
+function compositeFrom(p, iso){
+  const liq = liqCosAtISO(iso);       // −1..+1
+  const halv= halvingScoreAtISO(iso); // −0.5..+1.5
+  const score = W_P*zFromP(p) + W_LIQ*liq + W_HALV*halv;
+  return score;
+}
+function titleForScore(s){ return 'BTC Purchase Indicator — ' + classFromScore(s); }
+function setTitle(s){ Plotly.relayout(plotDiv, {'title.text': titleForScore(s)}); }
+
 // Render rails
 function renderRails(P){
   const n=Math.min(rails.length, MAX_SLOTS);
@@ -641,101 +695,110 @@ function renderRails(P){
     }
     Plotly.restyle(plotDiv, restyle, [i]);
   }
-  // Update hover carrier to P50 so we get events everywhere (past+future)
-  const p50 = seriesForPercent(P, 50);
-  Plotly.restyle(plotDiv, {x:[P.x_grid], y:[p50]}, [IDX_CARRY]);
-
-  railsListText.textContent=railsText(); rebuildReadoutRows();
+  // hover carrier on P50
+  Plotly.restyle(plotDiv, {x:[P.x_grid], y:[seriesForPercent(P,50)]}, [IDX_CARRY]);
+  railsListText.textContent=railsText();
 }
 
-let locked=false, lockedX=null;
-function setTitleForP(p){ Plotly.relayout(plotDiv, {'title.text': 'BTC Purchase Indicator — '+indicatorFromP(p)}); }
-
-// Indicator mask (based on stationary residual)
-function computePSeries(P){
-  const d=P.support; const out=new Array(P.x_main.length);
+// Indicator mask based on COMPOSITE classes
+function computeSeriesForMask(P){
+  if (P._classSeries) return;
+  // p series
+  const d=P.support;
+  const pSeries=new Array(P.x_main.length);
   for (let i=0;i<P.x_main.length;i++){
     const z=Math.log10(P.x_main[i]); const ly=Math.log10(P.y_main[i]);
     const mid=d.a0 + d.b*z; const off=ly-mid;
-    out[i]=clamp(percentFromOffset(P, off), 0, 100);
+    pSeries[i]=clamp(percentFromOffset(P, off), 0, 100);
   }
-  P._pSeries = out;
+  // composite class series
+  const classes=new Array(P.x_main.length);
+  const scores=new Array(P.x_main.length);
+  for (let i=0;i<P.x_main.length;i++){
+    const iso = P.date_iso_main[i];
+    const sc = compositeFrom(pSeries[i], iso);
+    scores[i]=sc; classes[i]=classFromScore(sc);
+  }
+  P._pSeries=pSeries; P._scoreSeries=scores; P._classSeries=classes;
 }
 function applyIndicatorMask(P){
   if (!selectedIndicators || selectedIndicators.length===0){
     Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main], name:[P.label]}, [IDX_MAIN]);
     Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main]},                [IDX_CLICK]);
   } else {
-    if (!P._pSeries) computePSeries(P);
-    const ranges = selectedIndicators.map(rangeForIndicator);
-    const ym = P.y_main.map((v,i)=>{ const p=P._pSeries[i]; for (let r of ranges){ if (p>=r[0] && p<r[1]) return v; } return null; });
-    Plotly.restyle(plotDiv, {x:[P.x_main], y:[ym], name:[P.label+' — '+selectedIndicators.join(' + ')]}, [IDX_MAIN]);
-    Plotly.restyle(plotDiv, {x:[P.x_main], y:[ym]},                                                           [IDX_CLICK]);
+    computeSeriesForMask(P);
+    const set=new Set(selectedIndicators);
+    const ym = P.y_main.map((v,i)=> set.has(P._classSeries[i]) ? v : null);
+    const nm = P.label+' — '+Array.from(set).join(' + ');
+    Plotly.restyle(plotDiv, {x:[P.x_main], y:[ym], name:[nm]}, [IDX_MAIN]);
+    Plotly.restyle(plotDiv, {x:[P.x_main], y:[ym]},            [IDX_CLICK]);
   }
   const tt = (P.unit === '$') ? "%{x|%b-%d-%Y}<br>$%{y:.2f}<extra></extra>" : "%{x|%b-%d-%Y}<br>%{y:.6f}<extra></extra>";
   Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main], hovertemplate:[tt], line:[{width:0}]}, [IDX_TT]);
 }
 
-// Panel update — ALWAYS follows cursor, even into the future
+// Panel update (future uses 50% for main value; p hidden)
 function updatePanel(P,xYears){
+  const iso = isoFromYears(xYears);
   elDate.textContent=shortDateFromYears(xYears);
+
   const v50series = seriesForPercent(P,50);
   const v50 = interp(P.x_grid, v50series, xYears);
 
-  // update rail values with (Nx)
   rails.forEach(p=>{
     const v=interp(P.x_grid, seriesForPercent(P,p), xYears);
     const el=document.getElementById(idFor(p)); if(!el) return;
     const mult=(v50>0&&isFinite(v50))?` (${(v/v50).toFixed(1)}x)`:''; el.textContent=fmtVal(P,v)+mult;
   });
 
-  // main value: if future use 50% with "(50%)"
   const lastX=P.x_main[P.x_main.length-1];
+  let usedP=null, mainTxt='', compScore=null;
+
   if (xYears>lastX){
-    elMain.textContent = fmtVal(P, v50) + " (50%)";
+    mainTxt = fmtVal(P, v50) + " (50%)";
     elP.textContent = "(p≈—)";
     elMainLabel.textContent=(P.unit==='$'?'BTC Price:':'BTC Ratio:');
+    usedP = 50; // neutral p for future composite
   } else {
-    // nearest historical price
     let idx=0,best=1e99; for(let i=0;i<P.x_main.length;i++){ const d=Math.abs(P.x_main[i]-xYears); if(d<best){best=d; idx=i;} }
-    const y=P.y_main[idx]; elMain.textContent=fmtVal(P,y); elMainLabel.textContent=(P.unit==='$'?'BTC Price:':'BTC Ratio:');
+    const y=P.y_main[idx]; mainTxt = fmtVal(P,y); elMainLabel.textContent=(P.unit==='$'?'BTC Price:':'BTC Ratio:');
     const d=P.support, z=Math.log10(P.x_main[idx]), off=Math.log10(y)-(d.a0+d.b*z);
-    const pVal=clamp(percentFromOffset(P, off), 0, 100);
-    elP.textContent=`(p≈${pVal.toFixed(1)}%)`; setTitleForP(pVal);
+    usedP=clamp(percentFromOffset(P, off), 0, 100);
+    elP.textContent=`(p≈${usedP.toFixed(1)}%)`;
   }
+  elMain.textContent = mainTxt;
+
+  compScore = compositeFrom(usedP, iso);
+  elComp.textContent = `${compScore.toFixed(2)} — ${classFromScore(compScore)}`;
+  setTitle(compScore);
+
   Plotly.relayout(plotDiv, {"yaxis.title.text": P.label});
 }
 
-// Click adds annotation showing date + price at cursor (or 50%)
+// Click annotation (date + price or 50%)
 plotDiv.on('plotly_click', ev=>{
   if(!(ev.points && ev.points.length)) return;
   const xYears=ev.points[0].x; const P=PRECOMP[denomSel.value];
   const lastX=P.x_main[P.x_main.length-1];
   const v50 = interp(P.x_grid, seriesForPercent(P,50), xYears);
   let labelVal, suffix='';
-  if (xYears>lastX){
-    labelVal = fmtVal(P, v50); suffix=' (50%)';
-  } else {
-    // nearest y_main
-    let idx=0,best=1e99; for(let i=0;i<P.x_main.length;i++){ const d=Math.abs(P.x_main[i]-xYears); if(d<best){best=d; idx=i;} }
-    labelVal = fmtVal(P, P.y_main[idx]);
-  }
+  if (xYears>lastX){ labelVal = fmtVal(P, v50); suffix=' (50%)'; }
+  else { let idx=0,best=1e99; for(let i=0;i<P.x_main.length;i++){ const d=Math.abs(P.x_main[i]-xYears); if(d<best){best=d; idx=i;} } labelVal = fmtVal(P, P.y_main[idx]); }
   const text=shortDateFromYears(xYears)+" · "+labelVal+suffix;
   const yMid=interp(P.x_grid, seriesForPercent(P,50), xYears);
   const ann={x:xYears,y:yMid*1.2,xref:'x',yref:'y',text,showarrow:true,arrowhead:2,ax:0,ay:-20,bgcolor:'rgba(255,255,0,0.15)',bordercolor:'#FBBF24',font:{size:12}};
   Plotly.relayout(plotDiv,{annotations:[ann]}); updatePanel(P,xYears);
 });
 
-// Hover drives panel everywhere (carrier trace guarantees events on future x)
+// Hover drives panel everywhere (carrier trace active in future, too)
 plotDiv.on('plotly_hover', ev=>{
   if(!(ev.points && ev.points.length)) return;
-  if (locked) return;
   updatePanel(PRECOMP[denomSel.value], ev.points[0].x);
 });
 
-// Date buttons (lock to date)
-btnSet.onclick=()=>{ if(!datePick.value) return; locked=true; lockedX=yearsFromISO(datePick.value); updatePanel(PRECOMP[denomSel.value], lockedX); };
-btnToday.onclick=()=>{ const P=PRECOMP[denomSel.value]; locked=true; lockedX=P.x_main[P.x_main.length-1]; updatePanel(P, lockedX); };
+// Date lock
+document.getElementById('setDateBtn').onclick=()=>{ if(!datePick.value) return; updatePanel(PRECOMP[denomSel.value], yearsFromISO(datePick.value)); };
+document.getElementById('todayBtn').onclick=()=>{ const P=PRECOMP[denomSel.value]; updatePanel(P, P.x_main[P.x_main.length-1]); };
 
 // Copy chart
 btnCopy.onclick=async ()=>{ try{ const url=await Plotly.toImage(plotDiv,{format:'png',scale:2}); if(navigator.clipboard && window.ClipboardItem){ const blob=await (await fetch(url)).blob(); await navigator.clipboard.write([new ClipboardItem({'image/png':blob})]); } else { const a=document.createElement('a'); a.href=url; a.download='btc-indicator.png'; document.body.appendChild(a); a.click(); a.remove(); } }catch(e){ console.error('Copy Chart failed:', e); alert('Copy failed.'); } };
@@ -744,28 +807,26 @@ btnCopy.onclick=async ()=>{ try{ const url=await Plotly.toImage(plotDiv,{format:
 denomSel.onchange=()=>{ const key=denomSel.value, P=PRECOMP[key];
   Plotly.restyle(plotDiv,{x:[P.x_main], y:[P.y_main], name:[P.label]}, [IDX_MAIN]);
   Plotly.restyle(plotDiv,{x:[P.x_main], y:[P.y_main]},                 [IDX_CLICK]);
-  // update hover carrier to new denominator midline (future hover works)
   Plotly.restyle(plotDiv,{x:[P.x_grid], y:[seriesForPercent(P,50)]},   [IDX_CARRY]);
   Plotly.relayout(plotDiv,{annotations:[]}); renderRails(P); applyIndicatorMask(P);
-  const x=locked?lockedX:P.x_main[P.x_main.length-1]; updatePanel(P,x);
+  updatePanel(P, P.x_main[P.x_main.length-1]);
 };
 
 // Sync all
-function syncAll(){ sortRails(); rebuildEditor(); const P=PRECOMP[denomSel.value]; renderRails(P); applyIndicatorMask(P); const x=locked?lockedX:P.x_main[P.x_main.length-1]; updatePanel(P,x); }
+function syncAll(){ sortRails(); rebuildEditor(); const P=PRECOMP[denomSel.value]; renderRails(P); applyIndicatorMask(P); updatePanel(P, P.x_main[P.x_main.length-1]); }
 
 // Init
 (function init(){
   rebuildReadoutRows(); rebuildEditor();
   renderRails(PRECOMP['USD']); applyIndicatorMask(PRECOMP['USD']);
   const P=PRECOMP['USD'];
-  // ensure carrier is live on first render
   Plotly.restyle(plotDiv,{x:[P.x_grid], y:[seriesForPercent(P,50)]},[IDX_CARRY]);
   const tt="%{x|%b-%d-%Y}<br>$%{y:.2f}<extra></extra>";
   Plotly.restyle(plotDiv,{x:[P.x_main], y:[P.y_main], hovertemplate:[tt], line:[{width:0}]},[IDX_TT]);
   updatePanel(P, P.x_main[P.x_main.length-1]);
 })();
 
-// ─────────────────────── Halvings toggle ───────────────────────
+// Halvings toggle
 let halvingsOn=false;
 function makeHalvingShapes(){
   const shapes=[];
@@ -789,60 +850,45 @@ btnHalvings.onclick=()=>{ halvingsOn=!halvingsOn;
   }
 };
 
-// ─────────────────────── Liquidity toggle (65-month peaks) ───────────────────────
+// Liquidity toggle (peaks red, troughs green; future dashed)
 let liquidityOn = false;
-
 function addMonthsISO(iso, months){
   const d  = new Date(iso + 'T00:00:00Z');
-  const y0 = d.getUTCFullYear();
-  const m0 = d.getUTCMonth();
-  const day= d.getUTCDate();
+  const y0 = d.getUTCFullYear(); const m0 = d.getUTCMonth(); const day= d.getUTCDate();
   const nd = new Date(Date.UTC(y0, m0 + months, 1));
   const lastDay = new Date(Date.UTC(nd.getUTCFullYear(), nd.getUTCMonth()+1, 0)).getUTCDate();
   nd.setUTCDate(Math.min(day, lastDay));
   return nd.toISOString().slice(0,10);
 }
 function compareISO(a,b){ return a<b?-1:(a>b?1:0); }
-
 function makeLiquidityShapes(){
   const shapes = [];
   const startIso = LIQ_START_ISO;
   const endIso   = END_ISO;
   const lastIso  = LAST_PRICE_ISO;
 
-  // peaks (red)
   let peaks = [];
   let iso = LIQ_PEAK_ANCHOR_ISO;
-  while (compareISO(iso, startIso) > 0){
-    peaks.push(iso);
-    iso = addMonthsISO(iso, -LIQ_PERIOD_MONTHS);
-  }
+  while (compareISO(iso, startIso) > 0){ peaks.push(iso); iso = addMonthsISO(iso, -LIQ_PERIOD_MONTHS); }
   peaks = peaks.reverse();
   iso = addMonthsISO(peaks[peaks.length-1], LIQ_PERIOD_MONTHS);
-  while (compareISO(iso, endIso) <= 0){
-    peaks.push(iso);
-    iso = addMonthsISO(iso, LIQ_PERIOD_MONTHS);
-  }
+  while (compareISO(iso, endIso) <= 0){ peaks.push(iso); iso = addMonthsISO(iso, LIQ_PERIOD_MONTHS); }
 
-  // troughs (green) half-cycle later
   const half = Math.round(LIQ_PERIOD_MONTHS/2);
   const troughs = peaks.map(p => addMonthsISO(p, half));
 
   function vline(iso, color){
     const dashed = compareISO(iso, lastIso) > 0;
-    return {
-      type:'line', xref:'x', yref:'paper',
+    return { type:'line', xref:'x', yref:'paper',
       x0: yearsFromISO(iso), x1: yearsFromISO(iso), y0:0, y1:1,
       line:{color:color, width:1.4, dash: dashed ? 'dash' : 'solid'},
-      layer:'below', meta:'liquidity'
-    };
+      layer:'below', meta:'liquidity' };
   }
 
   troughs.forEach(tIso => { if (compareISO(tIso, startIso)>=0 && compareISO(tIso, endIso)<=0) shapes.push(vline(tIso, '#22C55E')); });
   peaks.forEach(pIso =>   { if (compareISO(pIso, startIso)>=0 && compareISO(pIso, endIso)<=0) shapes.push(vline(pIso, '#EF4444')); });
   return shapes;
 }
-
 btnLiquidity.onclick = () => {
   liquidityOn = !liquidityOn;
   const curr = plotDiv.layout.shapes || [];
@@ -855,11 +901,16 @@ btnLiquidity.onclick = () => {
     btnLiquidity.textContent = 'Liquidity';
   }
 };
+
+// Info modal
+infoBtn.onclick = ()=>{ infoModal.classList.add('open'); };
+infoClose.onclick = ()=>{ infoModal.classList.remove('open'); };
+infoModal.addEventListener('click', (e)=>{ if(e.target===infoModal) infoModal.classList.remove('open'); });
 </script>
 </body></html>
 """
 
-# ───────────────────────── Fill placeholders ─────────────────────────
+# ───────────────────────────── Fill placeholders ─────────────────────────────
 HTML = (HTML
     .replace("__PLOT_HTML__", plot_html)
     .replace("__PRECOMP__", json.dumps(PRECOMP))
@@ -877,6 +928,9 @@ HTML = (HTML
     .replace("__LIQ_PEAK_ANCHOR_ISO__", LIQ_PEAK_ANCHOR_ISO)
     .replace("__LIQ_PERIOD_MONTHS__", str(LIQ_PERIOD_MONTHS))
     .replace("__LIQ_START_ISO__", LIQ_START_ISO)
+    .replace("__W_P__", str(W_P))
+    .replace("__W_LIQ__", str(W_LIQ))
+    .replace("__W_HALV__", str(W_HALV))
 )
 
 # ───────────────────────────── Write site ─────────────────────────────
