@@ -319,8 +319,17 @@ fig.update_layout(
     margin=dict(l=70, r=420, t=70, b=70),
 )
 
-plot_html = fig.to_html(full_html=False, include_plotlyjs="cdn",
-                        config={"responsive":True,"displayModeBar":True,"modeBarButtonsToRemove":["toImage"]})
+# IMPORTANT: ensure double-click resets axes (works on desktop and iOS Safari)
+plot_html = fig.to_html(
+    full_html=False,
+    include_plotlyjs="cdn",
+    config={
+        "responsive": True,
+        "displayModeBar": True,
+        "modeBarButtonsToRemove": ["toImage"],
+        "doubleClick": "reset",      # <-- double-click / double-tap resets view
+    }
+)
 
 # ───────────────────────────── HTML ─────────────────────────────
 HTML = """<!doctype html>
@@ -532,6 +541,7 @@ function classFromScore(s){
 
 // DOM
 const leftCol=document.getElementById('leftCol');
+const rightCol=document.querySelector('.right');
 const plotDiv=(function(){ return document.querySelector('.left .js-plotly-plot') || document.querySelector('.left .plotly-graph-div'); })();
 const denomSel=document.getElementById('denomSel');
 const datePick=document.getElementById('datePick');
@@ -628,14 +638,28 @@ editBtn.addEventListener('click',()=>{ railsEditor.classList.toggle('hidden'); r
 function applyChartWidthPx(px){
   const v=clamp(Number(px)||1100, 400, 2400);
   leftCol.style.flex='0 0 auto'; leftCol.style.width=v+'px';
-  if(window.Plotly&&plotDiv) Plotly.Plots.resize(plotDiv);
+  // iOS Safari can require two-step resize to reflow canvas properly
+  if(window.Plotly&&plotDiv){
+    Plotly.Plots.resize(plotDiv);
+    requestAnimationFrame(()=>Plotly.Plots.resize(plotDiv));
+  }
 }
 chartWpx.addEventListener('change',()=>applyChartWidthPx(chartWpx.value));
+
+// Robust "Fit" that measures the right panel (fixes mobile Safari)
 btnFit.addEventListener('click',()=>{
-  const total=document.documentElement.clientWidth||window.innerWidth, panel=420, pad=32;
-  const target=Math.max(400, total-panel-pad); chartWpx.value=target; applyChartWidthPx(target);
+  const totalW = document.documentElement.clientWidth || window.innerWidth || screen.width || 1200;
+  const rightW = (rightCol && rightCol.getBoundingClientRect ? rightCol.getBoundingClientRect().width : 420);
+  const padding = 16; // small gutter
+  const target = Math.max(400, Math.floor(totalW - rightW - padding));
+  chartWpx.value = target;
+  applyChartWidthPx(target);
 });
-if(window.ResizeObserver) new ResizeObserver(()=>{ if(window.Plotly&&plotDiv) Plotly.Plots.resize(plotDiv); }).observe(leftCol);
+
+if(window.ResizeObserver){
+  // keep plot snug on orientation/keyboard changes on iOS
+  new ResizeObserver(()=>{ if(window.Plotly&&plotDiv) Plotly.Plots.resize(plotDiv); }).observe(leftCol);
+}
 
 // ───────── Rails math ─────────
 function logMidline(P){ const d=P.support; return P.x_grid.map(x=> (d.a0 + d.b*Math.log10(x)) ); }
@@ -783,24 +807,9 @@ function updatePanel(P,xYears){
   compScore = compositeFrom(usedP, iso);
   elComp.textContent = `${compScore.toFixed(2)} — ${classFromScore(compScore)}`;
   setTitle(compScore);
-
-  Plotly.relayout(plotDiv, {"yaxis.title.text": P.label});
 }
 
-// Click annotation (date + price or 50%)
-plotDiv.on('plotly_click', ev=>{
-  if(!(ev.points && ev.points.length)) return;
-  const xYears=ev.points[0].x; const P=PRECOMP[denomSel.value];
-  const lastX=P.x_main[P.x_main.length-1];
-  const v50 = interp(P.x_grid, seriesForPercent(P,50), xYears);
-  let labelVal, suffix='';
-  if (xYears>lastX){ labelVal = fmtVal(P, v50); suffix=' (50%)'; }
-  else { let idx=0,best=1e99; for(let i=0;i<P.x_main.length;i++){ const d=Math.abs(P.x_main[i]-xYears); if(d<best){best=d; idx=i;} } labelVal = fmtVal(P, P.y_main[idx]); }
-  const text=shortDateFromYears(xYears)+" · "+labelVal+suffix;
-  const yMid=interp(P.x_grid, seriesForPercent(P,50), xYears);
-  const ann={x:xYears,y:yMid*1.2,xref:'x',yref:'y',text,showarrow:true,arrowhead:2,ax:0,ay:-20,bgcolor:'rgba(255,255,0,0.15)',bordercolor:'#FBBF24',font:{size:12}};
-  Plotly.relayout(plotDiv,{annotations:[ann]}); updatePanel(P,xYears);
-});
+// NOTE: single-click should do NOTHING → removed plotly_click handler
 
 // Hover drives panel everywhere (carrier trace active in future, too)
 plotDiv.on('plotly_hover', ev=>{
@@ -994,7 +1003,7 @@ HTML = (HTML
     .replace("__LIQ_START_ISO__", LIQ_START_ISO)
     .replace("__W_P__", str(W_P))
     .replace("__W_LIQ__", str(W_LIQ))
-    .replace("__W_HALV__", str(W_HALV))
+    .replace("__W_HALV__", str(W_HALV__))
 )
 
 # ───────────────────────────── Write site ─────────────────────────────
