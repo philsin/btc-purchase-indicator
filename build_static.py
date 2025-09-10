@@ -3,7 +3,7 @@
 """
 BTC Purchase Indicator — stationary rails with composite signal (no cross-denom voting),
 cursor-driven panel (future uses 50%), even-year x labels after 2020, halvings & liquidity toggles,
-and an "i" info button.
+info modal, and user-defined horizontal Level lines (per denominator).
 
 Writes: docs/index.html
 """
@@ -363,6 +363,8 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
 }
 #chartWidthBox{display:flex;align-items:center;gap:8px}
 #chartWpx{width:120px}
+#levelsBox{display:flex;align-items:center;gap:8px}
+#levelsBox input[type=text]{font-size:14px;padding:8px 10px;border-radius:8px;border:1px solid #d1d5db;background:#fff;min-width:150px}
 .hidden{display:none}
 
 /* Indicator multi-select */
@@ -416,6 +418,14 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
       <b>Chart Width (px):</b>
       <input type="number" id="chartWpx" min="400" max="2400" step="10" value="1100"/>
       <button id="fitBtn" class="btn" title="Make chart fill remaining space">Fit</button>
+    </div>
+
+    <!-- Levels: user-defined horizontal lines -->
+    <div id="levelsBox">
+      <b>Level:</b>
+      <input type="text" id="levelInput" placeholder="e.g. 50000 or 1.2"/>
+      <button id="addLevelBtn" class="btn">Add Level</button>
+      <button id="clearLevelsBtn" class="btn">Clear</button>
     </div>
 
     <fieldset id="railsBox">
@@ -516,7 +526,7 @@ function classFromScore(s){
   if (s >= 0.25) return 'Buy';
   if (s >  -0.25) return 'DCA';
   if (s >  -0.75) return 'Hold On';
-  if (s >  -1.50) return 'Frothy';
+  if (s >  -1.50) return 'Frothy';   // Extended down to -1.50 per your request
   return 'Top Inbound';
 }
 
@@ -554,6 +564,13 @@ const indicatorMenu=document.getElementById('indicatorMenu');
 const indicatorClear=document.getElementById('indicatorClear');
 const indicatorApply=document.getElementById('indicatorApply');
 const denomsDetected=document.getElementById('denomsDetected');
+
+// Levels (horizontal lines) — state per denominator
+const levelInput      = document.getElementById('levelInput');
+const addLevelBtn     = document.getElementById('addLevelBtn');
+const clearLevelsBtn  = document.getElementById('clearLevelsBtn');
+const levelsByDenom = {};  // { USD:[numbers], GOLD:[...], ... }
+Object.keys(PRECOMP).forEach(k => levelsByDenom[k] = []);
 
 // Indicator UI
 function getCheckedIndicators(){ const boxes=indicatorMenu.querySelectorAll('input[type=checkbox]'); const out=[]; boxes.forEach(b=>{if(b.checked) out.push(b.value)}); return out;}
@@ -649,11 +666,9 @@ function percentFromOffset(P, off){
 function liqCosAtISO(iso){
   const m = monthsBetweenISO(LIQ_PEAK_ANCHOR_ISO, iso);
   const ang = 2*Math.PI*m/LIQ_PERIOD_MONTHS;
-  return Math.cos(ang); // >0 rising from trough to peak; <0 falling
+  return Math.cos(ang); // >0 rising; <0 falling
 }
 function halvingScoreAtISO(iso){
-  // +1 in the year before next halving; +0.5 in ~18 months after last; −0.5 late (>18m after)
-  // find last and next
   let last = null, next = null;
   for (const h of PAST_HALVINGS.concat(FUTURE_HALVINGS)){
     if (h <= iso) last = h;
@@ -695,7 +710,6 @@ function renderRails(P){
     }
     Plotly.restyle(plotDiv, restyle, [i]);
   }
-  // hover carrier on P50
   Plotly.restyle(plotDiv, {x:[P.x_grid], y:[seriesForPercent(P,50)]}, [IDX_CARRY]);
   railsListText.textContent=railsText();
 }
@@ -703,7 +717,6 @@ function renderRails(P){
 // Indicator mask based on COMPOSITE classes
 function computeSeriesForMask(P){
   if (P._classSeries) return;
-  // p series
   const d=P.support;
   const pSeries=new Array(P.x_main.length);
   for (let i=0;i<P.x_main.length;i++){
@@ -711,11 +724,10 @@ function computeSeriesForMask(P){
     const mid=d.a0 + d.b*z; const off=ly-mid;
     pSeries[i]=clamp(percentFromOffset(P, off), 0, 100);
   }
-  // composite class series
   const classes=new Array(P.x_main.length);
   const scores=new Array(P.x_main.length);
   for (let i=0;i<P.x_main.length;i++){
-    const iso = P.date_iso_main[i];
+    const iso = PRECOMP[denomSel.value].date_iso_main[i];
     const sc = compositeFrom(pSeries[i], iso);
     scores[i]=sc; classes[i]=classFromScore(sc);
   }
@@ -803,17 +815,68 @@ document.getElementById('todayBtn').onclick=()=>{ const P=PRECOMP[denomSel.value
 // Copy chart
 btnCopy.onclick=async ()=>{ try{ const url=await Plotly.toImage(plotDiv,{format:'png',scale:2}); if(navigator.clipboard && window.ClipboardItem){ const blob=await (await fetch(url)).blob(); await navigator.clipboard.write([new ClipboardItem({'image/png':blob})]); } else { const a=document.createElement('a'); a.href=url; a.download='btc-indicator.png'; document.body.appendChild(a); a.click(); a.remove(); } }catch(e){ console.error('Copy Chart failed:', e); alert('Copy failed.'); } };
 
+// ───────── Levels (horizontal price/ratio lines) ─────────
+function parseLevelInput(str){
+  if(!str) return NaN;
+  const cleaned = String(str).replace(/\$/g,'').replace(/,/g,'').trim();
+  return Number(cleaned);
+}
+function levelShape(P, y){
+  const x0 = P.x_grid[0], x1 = P.x_grid[P.x_grid.length-1];
+  return {
+    type:'line', xref:'x', yref:'y', x0:x0, x1:x1, y0:y, y1:y,
+    line:{color:'#6B7280', width:1.6, dash:'dot'},
+    layer:'above', meta:'level'
+  };
+}
+function levelLabel(P, y){
+  return {
+    x: P.x_grid[P.x_grid.length-1], y: y, xref:'x', yref:'y',
+    text: fmtVal(P, y), showarrow:false, xanchor:'left',
+    bgcolor:'rgba(0,0,0,0.03)', bordercolor:'#9CA3AF',
+    font:{size:11}, meta:'level'
+  };
+}
+function redrawLevels(P){
+  const keepShapes = (plotDiv.layout.shapes||[]).filter(s => s.meta!=='level');
+  const keepAnn    = (plotDiv.layout.annotations||[]).filter(a => a.meta!=='level');
+  const addShapes=[], addAnn=[];
+  (levelsByDenom[denomSel.value]||[]).forEach(v => {
+    addShapes.push(levelShape(P, v));
+    addAnn.push(levelLabel(P, v));
+  });
+  Plotly.relayout(plotDiv, { shapes: keepShapes.concat(addShapes),
+                             annotations: keepAnn.concat(addAnn) });
+}
+addLevelBtn.addEventListener('click', () => {
+  const P = PRECOMP[denomSel.value];
+  const v = parseLevelInput(levelInput.value);
+  if(!isFinite(v) || v <= 0){
+    alert('Please enter a positive number (price/ratio).');
+    return;
+  }
+  const arr = levelsByDenom[denomSel.value];
+  if(!arr.some(x => Math.abs(x - v) <= (Math.abs(v)*1e-12))) arr.push(v);
+  redrawLevels(P);
+});
+clearLevelsBtn.addEventListener('click', () => {
+  levelsByDenom[denomSel.value] = [];
+  redrawLevels(PRECOMP[denomSel.value]);
+});
+
 // Denominator change
 denomSel.onchange=()=>{ const key=denomSel.value, P=PRECOMP[key];
   Plotly.restyle(plotDiv,{x:[P.x_main], y:[P.y_main], name:[P.label]}, [IDX_MAIN]);
   Plotly.restyle(plotDiv,{x:[P.x_main], y:[P.y_main]},                 [IDX_CLICK]);
   Plotly.restyle(plotDiv,{x:[P.x_grid], y:[seriesForPercent(P,50)]},   [IDX_CARRY]);
-  Plotly.relayout(plotDiv,{annotations:[]}); renderRails(P); applyIndicatorMask(P);
+  Plotly.relayout(plotDiv,{annotations:(plotDiv.layout.annotations||[]).filter(a=>a.meta!=='halving' && a.meta!=='liquidity')});
+  renderRails(P); applyIndicatorMask(P);
+  redrawLevels(P);
   updatePanel(P, P.x_main[P.x_main.length-1]);
 };
 
 // Sync all
-function syncAll(){ sortRails(); rebuildEditor(); const P=PRECOMP[denomSel.value]; renderRails(P); applyIndicatorMask(P); updatePanel(P, P.x_main[P.x_main.length-1]); }
+function syncAll(){ sortRails(); rebuildEditor(); const P=PRECOMP[denomSel.value]; renderRails(P); applyIndicatorMask(P); redrawLevels(P); updatePanel(P, P.x_main[P.x_main.length-1]); }
 
 // Init
 (function init(){
@@ -824,6 +887,7 @@ function syncAll(){ sortRails(); rebuildEditor(); const P=PRECOMP[denomSel.value
   const tt="%{x|%b-%d-%Y}<br>$%{y:.2f}<extra></extra>";
   Plotly.restyle(plotDiv,{x:[P.x_main], y:[P.y_main], hovertemplate:[tt], line:[{width:0}]},[IDX_TT]);
   updatePanel(P, P.x_main[P.x_main.length-1]);
+  redrawLevels(P);
 })();
 
 // Halvings toggle
