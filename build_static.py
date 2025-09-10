@@ -1003,7 +1003,7 @@ HTML = (HTML
     .replace("__LIQ_START_ISO__", LIQ_START_ISO)
     .replace("__W_P__", str(W_P))
     .replace("__W_LIQ__", str(W_LIQ))
-    .replace("__W_HALV__", str(W_HALV__))
+    .replace("__W_HALV__", str(W_HALV))
 )
 
 # ───────────────────────────── Write site ─────────────────────────────
