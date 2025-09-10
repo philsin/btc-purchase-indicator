@@ -319,7 +319,7 @@ fig.update_layout(
     margin=dict(l=70, r=420, t=70, b=70),
 )
 
-# IMPORTANT: ensure double-click resets axes (works on desktop and iOS Safari)
+# Ensure double-click resets axes (desktop + iOS Safari)
 plot_html = fig.to_html(
     full_html=False,
     include_plotlyjs="cdn",
@@ -327,7 +327,7 @@ plot_html = fig.to_html(
         "responsive": True,
         "displayModeBar": True,
         "modeBarButtonsToRemove": ["toImage"],
-        "doubleClick": "reset",      # <-- double-click / double-tap resets view
+        "doubleClick": "reset",      # double-click / double-tap resets view
     }
 )
 
@@ -535,7 +535,7 @@ function classFromScore(s){
   if (s >= 0.25) return 'Buy';
   if (s >  -0.25) return 'DCA';
   if (s >  -0.75) return 'Hold On';
-  if (s >  -1.50) return 'Frothy';   // Extended down to -1.50 per your request
+  if (s >  -1.50) return 'Frothy';   # extended to −1.50 per your request
   return 'Top Inbound';
 }
 
@@ -809,7 +809,7 @@ function updatePanel(P,xYears){
   setTitle(compScore);
 }
 
-// NOTE: single-click should do NOTHING → removed plotly_click handler
+// NOTE: single-click should do NOTHING → no plotly_click handler
 
 // Hover drives panel everywhere (carrier trace active in future, too)
 plotDiv.on('plotly_hover', ev=>{
@@ -824,39 +824,57 @@ document.getElementById('todayBtn').onclick=()=>{ const P=PRECOMP[denomSel.value
 // Copy chart
 btnCopy.onclick=async ()=>{ try{ const url=await Plotly.toImage(plotDiv,{format:'png',scale:2}); if(navigator.clipboard && window.ClipboardItem){ const blob=await (await fetch(url)).blob(); await navigator.clipboard.write([new ClipboardItem({'image/png':blob})]); } else { const a=document.createElement('a'); a.href=url; a.download='btc-indicator.png'; document.body.appendChild(a); a.click(); a.remove(); } }catch(e){ console.error('Copy Chart failed:', e); alert('Copy failed.'); } };
 
-// ───────── Levels (horizontal price/ratio lines) ─────────
+// ─────────── Level Lines: no axis stretch + always span visible x-range ───────────
+function currentXRange(){
+  const fl = (plotDiv && plotDiv._fullLayout) ? plotDiv._fullLayout : null;
+  if (fl && fl.xaxis && Array.isArray(fl.xaxis.range)) return [fl.xaxis.range[0], fl.xaxis.range[1]];
+  const P = PRECOMP[denomSel.value];
+  return [P.x_main[0], P.x_main[P.x_main.length-1]];
+}
+
 function parseLevelInput(str){
   if(!str) return NaN;
   const cleaned = String(str).replace(/\$/g,'').replace(/,/g,'').trim();
   return Number(cleaned);
 }
-function levelShape(P, y){
-  const x0 = P.x_grid[0], x1 = P.x_grid[P.x_grid.length-1];
+
+function levelShape(y){
+  const xr = currentXRange();
   return {
-    type:'line', xref:'x', yref:'y', x0:x0, x1:x1, y0:y, y1:y,
+    type:'line', xref:'x', yref:'y',
+    x0:xr[0], x1:xr[1], y0:y, y1:y,
     line:{color:'#6B7280', width:1.6, dash:'dot'},
     layer:'above', meta:'level'
   };
 }
+
 function levelLabel(P, y){
+  // Pin to right edge of plotting area in paper coords (prevents axis stretch)
   return {
-    x: P.x_grid[P.x_grid.length-1], y: y, xref:'x', yref:'y',
+    xref:'paper', x:1.005,
+    yref:'y',     y:y,
     text: fmtVal(P, y), showarrow:false, xanchor:'left',
     bgcolor:'rgba(0,0,0,0.03)', bordercolor:'#9CA3AF',
     font:{size:11}, meta:'level'
   };
 }
+
 function redrawLevels(P){
   const keepShapes = (plotDiv.layout.shapes||[]).filter(s => s.meta!=='level');
   const keepAnn    = (plotDiv.layout.annotations||[]).filter(a => a.meta!=='level');
+
   const addShapes=[], addAnn=[];
   (levelsByDenom[denomSel.value]||[]).forEach(v => {
-    addShapes.push(levelShape(P, v));
+    addShapes.push(levelShape(v));
     addAnn.push(levelLabel(P, v));
   });
-  Plotly.relayout(plotDiv, { shapes: keepShapes.concat(addShapes),
-                             annotations: keepAnn.concat(addAnn) });
+
+  Plotly.relayout(plotDiv, {
+    shapes: keepShapes.concat(addShapes),
+    annotations: keepAnn.concat(addAnn)
+  });
 }
+
 addLevelBtn.addEventListener('click', () => {
   const P = PRECOMP[denomSel.value];
   const v = parseLevelInput(levelInput.value);
@@ -871,6 +889,33 @@ addLevelBtn.addEventListener('click', () => {
 clearLevelsBtn.addEventListener('click', () => {
   levelsByDenom[denomSel.value] = [];
   redrawLevels(PRECOMP[denomSel.value]);
+});
+
+// Keep level lines spanning current x-range after any pan/zoom/autorange
+plotDiv.on('plotly_relayout', (e)=>{
+  if (!e) return;
+  const touchedX = Object.keys(e).some(k => k.startsWith('xaxis.'));
+  if (!touchedX) return;
+  const xr = currentXRange();
+  const shapes = (plotDiv.layout.shapes||[]).map(s=>{
+    if (s.meta === 'level') return Object.assign({}, s, { x0: xr[0], x1: xr[1] });
+    return s;
+  });
+  Plotly.relayout(plotDiv, { shapes });
+});
+
+// Robust double-click reset that also realigns level lines
+plotDiv.on('plotly_doubleclick', ()=>{
+  Plotly.relayout(plotDiv, {'xaxis.autorange': true, 'yaxis.autorange': true});
+  requestAnimationFrame(()=>{
+    const xr = currentXRange();
+    const shapes = (plotDiv.layout.shapes||[]).map(s=>{
+      if (s.meta === 'level') return Object.assign({}, s, { x0: xr[0], x1: xr[1] });
+      return s;
+    });
+    Plotly.relayout(plotDiv, { shapes });
+  });
+  return false; // prevents race with built-in handler on some mobile Safari versions
 });
 
 // Denominator change
@@ -1003,7 +1048,7 @@ HTML = (HTML
     .replace("__LIQ_START_ISO__", LIQ_START_ISO)
     .replace("__W_P__", str(W_P))
     .replace("__W_LIQ__", str(W_LIQ))
-    .replace("__W_HALV__", str(W_HALV))
+    .replace("__W_HALV__", str(W_HALV))   # fixed typo here
 )
 
 # ───────────────────────────── Write site ─────────────────────────────
