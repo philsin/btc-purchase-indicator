@@ -203,9 +203,15 @@ def build_support_constant_rails(x_years, y_vals):
     off_grid = rq - med
     off_grid[0]  -= EPS_LOG_SPACING
     off_grid[-1] += EPS_LOG_SPACING
+    # Power Law Oscillator: normalize raw residuals to [-1, +1]
+    raw_resid = resid  # unwinsorized for oscillator
+    resid_min = float(np.nanmin(raw_resid))
+    resid_max = float(np.nanmax(raw_resid))
     return {"a0":a0, "b":b,
             "q_grid":[float(q) for q in q_grid],
-            "off_grid":[float(v) for v in off_grid]}
+            "off_grid":[float(v) for v in off_grid],
+            "resid_min": resid_min,
+            "resid_max": resid_max}
 
 # ───────────────────────── Build model ─────────────────────────
 btc = fetch_btc_csv().rename(columns={"price":"btc"})
@@ -308,7 +314,7 @@ fig.update_layout(
     template="plotly_white",
     hovermode="x",
     showlegend=True,
-    title="BTC Purchase Indicator — ",
+    title="BTC Purchase Indicator",
     xaxis=dict(type="log", title=None, tickmode="array",
                tickvals=xtickvals, ticktext=xticktext,
                tickangle=45,
@@ -344,15 +350,19 @@ html,body{height:100%} body{margin:0;font-family:Inter,system-ui,Segoe UI,Arial,
 .left{flex:0 0 auto;width:1100px;min-width:280px;padding:8px 0 8px 8px}
 .left .js-plotly-plot,.left .plotly-graph-div{width:100%!important}
 .right{flex:0 0 var(--panelW);border-left:1px solid #e5e7eb;padding:12px;display:flex;flex-direction:column;gap:12px;overflow:auto}
-#controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+#controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding-bottom:8px;border-bottom:1px solid #e5e7eb}
 select,input[type=date],input[type=number]{font-size:14px;padding:8px 10px;border-radius:8px;border:1px solid #d1d5db;background:#fff}
-.btn{font-size:14px;padding:8px 10px;border-radius:8px;border:1px solid #d1d5db;background:#fff;cursor:pointer;transition:background 120ms, box-shadow 120ms}
+.btn{font-size:14px;padding:8px 10px;border-radius:8px;border:1px solid #d1d5db;background:#fff;cursor:pointer;transition:background 120ms, box-shadow 120ms, border-color 120ms;user-select:none}
 .btn:hover{background:#f3f4f6}
 .btn:active{background:#e5e7eb; box-shadow:inset 0 1px 2px rgba(0,0,0,0.08)}
+.btn.active{background:#1d4ed8;color:#fff;border-color:#1d4ed8}
+.btn.active:hover{background:#2563eb}
 #readout{border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#fafafa;font-size:14px}
-#readout .date{font-weight:700;margin-bottom:6px}
-#readout .row{display:grid;grid-template-columns:auto 1fr auto;column-gap:8px;align-items:baseline}
+#readout .date{font-weight:700;margin-bottom:6px;font-size:15px}
+#readout .row{display:flex;justify-content:space-between;align-items:baseline;gap:8px;padding:2px 0}
 #readout .num{font-family:ui-monospace,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums;text-align:right;min-width:12ch;white-space:pre}
+#oscRow{padding:4px 0;margin:2px 0;border-radius:6px;transition:background 200ms}
+#plParams{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;line-height:1.6}
 fieldset{border:1px solid #e5e7eb;border-radius:8px;padding:8px 10px}
 legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
 .rail-row{display:flex;align-items:center;gap:8px;margin:2px 0}
@@ -370,17 +380,19 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
   .right{flex:0 0 auto;border-left:none;border-top:1px solid #e5e7eb}
   .left{flex:0 0 auto;width:100%;padding:8px}
 }
-#chartWidthBox{display:flex;align-items:center;gap:8px}
-#chartWpx{width:120px}
-#levelsBox{display:flex;align-items:center;gap:8px}
+#chartWidthBox{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+#chartWpx{width:72px}
+#levelsBox{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 #levelsBox input[type=text]{font-size:14px;padding:8px 10px;border-radius:8px;border:1px solid #d1d5db;background:#fff;min-width:150px}
 .hidden{display:none}
 
 /* Indicator multi-select */
 .indicator-wrap{position:relative; display:inline-block;}
-.indicator-btn{padding:8px 10px; border:1px solid #d1d5db; border-radius:8px; background:#fff; cursor:pointer; font-size:14px; transition:background 120ms}
+.indicator-btn{padding:8px 10px; border:1px solid #d1d5db; border-radius:8px; background:#fff; cursor:pointer; font-size:14px; transition:background 120ms, border-color 120ms}
 .indicator-btn:hover{background:#f3f4f6}
 .indicator-btn:active{background:#e5e7eb}
+.indicator-btn.active{background:#1d4ed8;color:#fff;border-color:#1d4ed8}
+.indicator-btn.active:hover{background:#2563eb}
 .indicator-menu{position:absolute; top:100%; left:0; z-index:50; min-width:220px; background:white; border:1px solid #e5e7eb; border-radius:10px; box-shadow:0 8px 24px rgba(0,0,0,0.08); padding:8px; display:none;}
 .indicator-menu.open{display:block;}
 .indicator-item{display:flex; align-items:center; gap:8px; padding:4px 6px; border-radius:6px; cursor:pointer;}
@@ -424,8 +436,10 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
     </div>
 
     <div id="chartWidthBox">
-      <b>Chart Width (px):</b>
-      <input type="number" id="chartWpx" min="400" max="2400" step="10" value="1100"/>
+      <b>Chart Width:</b>
+      <input type="range" id="chartWslider" min="400" max="2400" step="10" value="1100" style="flex:1;min-width:100px;cursor:pointer;"/>
+      <input type="number" id="chartWpx" min="400" max="2400" step="10" value="1100" style="width:72px;"/>
+      <span class="smallnote">px</span>
       <button id="fitBtn" class="btn" title="Make chart fill remaining space">Fit</button>
     </div>
 
@@ -457,23 +471,46 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
     <div class="smallnote">Detected denominators: <span id="denomsDetected"></span></div>
 
     <div id="readout">
-      <div class="date">—</div>
+      <div class="date">\u2014</div>
       <div id="readoutRows"></div>
-      <div style="margin-top:10px;"><b id="mainLabel">BTC Price:</b> <span id="mainVal" class="num">—</span></div>
-      <div><b>Position:</b> <span id="pPct" style="font-weight:600;">(p≈—)</span></div>
-      <div><b>Composite:</b> <span id="compLine" class="smallnote">—</span></div>
+      <div style="margin-top:10px;"><b id="mainLabel">BTC Price:</b> <span id="mainVal" class="num">\u2014</span></div>
+      <div><b>Position:</b> <span id="pPct" style="font-weight:600;">(p\u2248\u2014)</span></div>
+      <div id="oscRow"><b>Oscillator:</b> <span id="oscVal" style="font-weight:600;font-family:ui-monospace,Menlo,Consolas,monospace;">\u2014</span> <span id="oscLabel" class="smallnote"></span></div>
+      <div><b>Composite:</b> <span id="compLine" class="smallnote">\u2014</span></div>
+      <div id="plParams" class="smallnote" style="margin-top:8px;border-top:1px solid #e5e7eb;padding-top:8px;"></div>
     </div>
   </div>
 </div>
 
 <!-- Info modal -->
 <div id="infoModal" class="info-modal" role="dialog" aria-modal="true">
-  <div class="info-card">
+  <div class="info-card" style="max-width:780px;max-height:90vh;overflow-y:auto;">
     <h3>How the Indicator Works</h3>
-    <p><b>Rails:</b> We fit a power-law (log-log) median to BTC and measure residuals. Fixed quantiles of residuals become % rails (Floor≈2.5% … Ceiling≈97.5%).</p>
-    <p><b>p-value:</b> Your position within Floor⇢Ceiling on a log scale (0–100%).</p>
-    <p><b>Composite score:</b> We blend (a) centered p, (b) the 65-month liquidity wave (rising=tailwind, falling=headwind), and (c) the halving window (+1 pre-halving year, +0.5 in first ~18 months after, −0.5 late). No cross-denominator voting.</p>
-    <p><b>Labels:</b> The title (SELL THE HOUSE → Top Inbound) comes from the composite score. The Indicator filter highlights dates that matched those labels historically.</p>
+
+    <p><b>The Bitcoin Power Law:</b> Bitcoin's price follows a power law relationship with time:
+    <code style="display:block;margin:6px 0;padding:8px;background:#f3f4f6;border-radius:6px;font-size:13px;">log\u2081\u2080(Price) = a + b \u00d7 log\u2081\u2080(years_since_genesis)</code>
+    This means Price = 10<sup>a</sup> \u00d7 t<sup>b</sup>, where the exponent b \u2248 5.8 reflects Bitcoin's decelerating (not exponential) growth. On a log-log chart, this is a straight line. The power law emerges from Bitcoin's recursive feedback loop: price attracts miners \u2192 hash rate grows \u2192 difficulty adjusts \u2192 security increases \u2192 adoption grows. (Santostasi, 2014; Burger, 2019; Perrenod, 2024)</p>
+
+    <p><b>Why Power Law, Not Exponential?</b> An exponential model (P = c \u00d7 e<sup>t/\u03c4</sup>) implies constant percentage growth, but Bitcoin's growth rate is clearly decelerating over 15+ years. On a log-linear chart, Bitcoin curves downward (ruling out exponential). On a log-log chart, it forms a remarkably straight line (R\u00b2 \u2248 0.95) \u2014 the hallmark of a power law.</p>
+
+    <p><b>Rails (Quantile Bands):</b> We fit a median quantile regression in log-log space and measure residuals. Fixed quantiles of those residuals become percentage rails (Floor \u2248 2.5% ... Ceiling \u2248 97.5%). These are analogous to Mezinskis's percentile corridors at <a href="https://porkopolis.io/thechart" target="_blank" rel="noopener">porkopolis.io</a>.</p>
+
+    <p><b>p-value (Position):</b> Your position within the Floor\u2192Ceiling corridor on a log scale (0\u2013100%). Low p = undervalued relative to the power law; high p = overvalued.</p>
+
+    <p><b>Power Law Oscillator:</b> The log-deviation from the trend line, normalized to [-1, +1] using historical min/max (per Burger's oscillator). All four historical ATHs occurred in the 0.8\u20130.9 band. Values below -0.5 have historically been strong accumulation zones.</p>
+
+    <p><b>Composite Score:</b> We blend three signals:
+    <br>(a) <b>Position z:</b> (50 - p) / 25, so undervalued = positive, overvalued = negative
+    <br>(b) <b>65-month liquidity cycle:</b> A cosine wave anchored at Feb 2015 (rising = tailwind, falling = headwind)
+    <br>(c) <b>Halving window:</b> +1.0 in the year before halving, +0.5 for ~18 months after, \u22120.5 late in cycle
+    <br>Each denominator (USD, GOLD, SPX, ETH) is scored independently \u2014 no cross-denominator voting.</p>
+
+    <p><b>Labels:</b> SELL THE HOUSE (\u22651.25) \u2192 Strong Buy (\u22650.75) \u2192 Buy (\u22650.25) \u2192 DCA (>\u22120.25) \u2192 Hold On (>\u22120.75) \u2192 Frothy (>\u22121.50) \u2192 Top Inbound. The goal: reduce emotional decision-making and anchor purchases to mathematical structure.</p>
+
+    <p class="smallnote" style="margin-top:10px;border-top:1px solid #e5e7eb;padding-top:8px;">
+    <b>Key sources:</b> Giovanni Santostasi (power law theory, 2014), Harold C. Burger (power law corridor &amp; oscillator, 2019), Stephen Perrenod (FGLS regression, block-year analysis), Matthew Mezinskis / Porkopolis Economics (percentile bands), Nik Bhatia / The Bitcoin Layer.
+    </p>
+
     <div style="display:flex;justify-content:flex-end;margin-top:10px;">
       <button id="infoClose" class="btn">Close</button>
     </div>
@@ -535,7 +572,7 @@ function classFromScore(s){
   if (s >= 0.25) return 'Buy';
   if (s >  -0.25) return 'DCA';
   if (s >  -0.75) return 'Hold On';
-  if (s >  -1.50) return 'Frothy';   # extended to −1.50 per your request
+  if (s >  -1.50) return 'Frothy';
   return 'Top Inbound';
 }
 
@@ -589,8 +626,9 @@ function labelForIndicatorBtn(arr){ return (!arr.length)?'Indicator: All':(arr.l
 let selectedIndicators=[];
 indicatorBtn.addEventListener('click',e=>{e.stopPropagation(); indicatorMenu.classList.toggle('open');});
 indicatorClear.addEventListener('click',e=>{e.preventDefault(); setCheckedIndicators([]);});
-indicatorApply.addEventListener('click',e=>{e.preventDefault(); indicatorMenu.classList.remove('open'); selectedIndicators=getCheckedIndicators(); indicatorBtn.textContent=labelForIndicatorBtn(selectedIndicators); applyIndicatorMask(PRECOMP[denomSel.value]);});
+indicatorApply.addEventListener('click',e=>{e.preventDefault(); indicatorMenu.classList.remove('open'); selectedIndicators=getCheckedIndicators(); indicatorBtn.textContent=labelForIndicatorBtn(selectedIndicators); if(selectedIndicators.length>0){indicatorBtn.classList.add('active');}else{indicatorBtn.classList.remove('active');} applyIndicatorMask(PRECOMP[denomSel.value]);});
 document.addEventListener('click',e=>{ if(!indicatorMenu.contains(e.target) && !indicatorBtn.contains(e.target)) indicatorMenu.classList.remove('open'); });
+document.addEventListener('keydown',e=>{ if(e.key==='Escape') indicatorMenu.classList.remove('open'); });
 
 // Denominators
 (function initDenoms(){
@@ -612,8 +650,9 @@ function rebuildReadoutRows(){
     const row=document.createElement('div'); row.className='row';
     const lab=document.createElement('div'); const val=document.createElement('div'); val.className='num'; val.id=idFor(p);
     const color=colorForPercent(p); const nm=(p===2.5?'Floor':(p===97.5?'Ceiling':(p+'%')));
-    lab.innerHTML=`<span style="color:${color};">${nm}</span>`;
-    row.appendChild(lab); row.appendChild(val); row.appendChild(document.createElement('div')); elRows.appendChild(row);
+    const is50 = (Math.abs(p - 50) < 0.01);
+    lab.innerHTML='<span style="color:'+color+';'+(is50?'font-weight:700;':'')+'">'+nm+'</span>';
+    row.appendChild(lab); row.appendChild(val); elRows.appendChild(row);
   });
 }
 function rebuildEditor(){
@@ -644,15 +683,19 @@ function applyChartWidthPx(px){
     requestAnimationFrame(()=>Plotly.Plots.resize(plotDiv));
   }
 }
-chartWpx.addEventListener('change',()=>applyChartWidthPx(chartWpx.value));
+const chartWslider=document.getElementById('chartWslider');
+chartWpx.addEventListener('input',()=>{ chartWslider.value=chartWpx.value; applyChartWidthPx(chartWpx.value); });
+chartWpx.addEventListener('change',()=>{ chartWslider.value=chartWpx.value; applyChartWidthPx(chartWpx.value); });
+chartWslider.addEventListener('input',()=>{ chartWpx.value=chartWslider.value; applyChartWidthPx(chartWslider.value); });
 
 // Robust "Fit" that measures the right panel (fixes mobile Safari)
 btnFit.addEventListener('click',()=>{
   const totalW = document.documentElement.clientWidth || window.innerWidth || screen.width || 1200;
   const rightW = (rightCol && rightCol.getBoundingClientRect ? rightCol.getBoundingClientRect().width : 420);
-  const padding = 16; // small gutter
+  const padding = 16;
   const target = Math.max(400, Math.floor(totalW - rightW - padding));
   chartWpx.value = target;
+  chartWslider.value = target;
   applyChartWidthPx(target);
 });
 
@@ -719,7 +762,32 @@ function compositeFrom(p, iso){
   const score = W_P*zFromP(p) + W_LIQ*liq + W_HALV*halv;
   return score;
 }
-function titleForScore(s){ return 'BTC Purchase Indicator — ' + classFromScore(s); }
+// Power Law Oscillator: normalize log-deviation from trend to [-1, +1]
+function oscillatorFromDeviation(P, logDev){
+  const rmin = P.support.resid_min;
+  const rmax = P.support.resid_max;
+  if (rmax === rmin) return 0;
+  return (2 * (logDev - rmin) / (rmax - rmin)) - 1;
+}
+function oscillatorLabel(osc){
+  if (osc >= 0.8)  return 'Extreme Overvalued';
+  if (osc >= 0.5)  return 'Overvalued';
+  if (osc >= 0.2)  return 'Slightly Above Trend';
+  if (osc > -0.2)  return 'Fair Value';
+  if (osc > -0.5)  return 'Slightly Below Trend';
+  if (osc > -0.8)  return 'Undervalued';
+  return 'Extreme Undervalued';
+}
+function oscillatorColor(osc){
+  // Red at +1, yellow at 0, green at -1
+  const t = clamp((osc + 1) / 2, 0, 1); // 0=green, 0.5=yellow, 1=red
+  function hx(v){return Math.max(0,Math.min(255,Math.round(v)));}
+  function toHex(r,g,b){return '#'+[r,g,b].map(v=>hx(v).toString(16).padStart(2,'0')).join('');}
+  if (t <= 0.5){ const u=t/0.5; return toHex(0x2E+(0xFB-0x2E)*u, 0x7D+(0xC0-0x7D)*u, 0x32+(0x2D-0x32)*u); }
+  const u=(t-0.5)/0.5; return toHex(0xFB+(0xD3-0xFB)*u, 0xC0+(0x2F-0xC0)*u, 0x2D+(0x2F-0x2D)*u);
+}
+
+function titleForScore(s){ return 'BTC Purchase Indicator \u2014 ' + classFromScore(s); }
 function setTitle(s){ Plotly.relayout(plotDiv, {'title.text': titleForScore(s)}); }
 
 // Render rails
@@ -730,7 +798,9 @@ function renderRails(P){
     if(visible){
       const p=rails[i], color=colorForPercent(p);
       const nm=(p===2.5?'Floor':(p===97.5?'Ceiling':(p+'%')));
-      restyle=Object.assign(restyle,{x:[P.x_grid], y:[seriesForPercent(P,p)], name:nm, line:{color:color, width:1.6, dash:'dot'}});
+      const is50 = (Math.abs(p - 50) < 0.01);
+      restyle=Object.assign(restyle,{x:[P.x_grid], y:[seriesForPercent(P,p)], name:nm,
+        line:{color: is50 ? '#4B5563' : color, width: is50 ? 2.2 : 1.6, dash: is50 ? 'solid' : 'dot'}});
     }
     Plotly.restyle(plotDiv, restyle, [i]);
   }
@@ -774,6 +844,10 @@ function applyIndicatorMask(P){
 }
 
 // Panel update (future uses 50% for main value; p hidden)
+const elOsc = document.getElementById('oscVal');
+const elOscLabel = document.getElementById('oscLabel');
+const elPlParams = document.getElementById('plParams');
+
 function updatePanel(P,xYears){
   const iso = isoFromYears(xYears);
   elDate.textContent=shortDateFromYears(xYears);
@@ -788,25 +862,43 @@ function updatePanel(P,xYears){
   });
 
   const lastX=P.x_main[P.x_main.length-1];
-  let usedP=null, mainTxt='', compScore=null;
+  let usedP=null, mainTxt='', compScore=null, logDev=0;
 
   if (xYears>lastX){
-    mainTxt = fmtVal(P, v50) + " (50%)";
-    elP.textContent = "(p≈—)";
+    mainTxt = fmtVal(P, v50) + ' (50%)';
+    elP.textContent = '(p\u2248\u2014)';
     elMainLabel.textContent=(P.unit==='$'?'BTC Price:':'BTC Ratio:');
-    usedP = 50; // neutral p for future composite
+    usedP = 50;
+    logDev = 0;
   } else {
     let idx=0,best=1e99; for(let i=0;i<P.x_main.length;i++){ const d=Math.abs(P.x_main[i]-xYears); if(d<best){best=d; idx=i;} }
     const y=P.y_main[idx]; mainTxt = fmtVal(P,y); elMainLabel.textContent=(P.unit==='$'?'BTC Price:':'BTC Ratio:');
-    const d=P.support, z=Math.log10(P.x_main[idx]), off=Math.log10(y)-(d.a0+d.b*z);
+    const d=P.support, z=Math.log10(P.x_main[idx]);
+    logDev = Math.log10(y) - (d.a0 + d.b*z);
+    const off = logDev;
     usedP=clamp(percentFromOffset(P, off), 0, 100);
-    elP.textContent=`(p≈${usedP.toFixed(1)}%)`;
+    elP.textContent='(p\u2248'+usedP.toFixed(1)+'%)';
   }
   elMain.textContent = mainTxt;
 
+  // Power Law Oscillator
+  const osc = oscillatorFromDeviation(P, logDev);
+  const oscCol = oscillatorColor(osc);
+  elOsc.textContent = osc.toFixed(3);
+  elOsc.style.color = oscCol;
+  elOscLabel.textContent = oscillatorLabel(osc);
+  elOscLabel.style.color = oscCol;
+
   compScore = compositeFrom(usedP, iso);
-  elComp.textContent = `${compScore.toFixed(2)} — ${classFromScore(compScore)}`;
+  elComp.textContent = compScore.toFixed(2) + ' \u2014 ' + classFromScore(compScore);
   setTitle(compScore);
+
+  // Show power law parameters
+  const sup = P.support;
+  const slope = sup.b.toFixed(4);
+  const intercept = sup.a0.toFixed(4);
+  const fairVal = Math.pow(10, sup.a0 + sup.b * Math.log10(xYears));
+  elPlParams.innerHTML = 'Power Law: log\u2081\u2080(P) = '+intercept+' + '+slope+' \u00d7 log\u2081\u2080(t)<br>Fair Value (50%): '+fmtVal(P, fairVal) + (xYears<=lastX ? '<br>Deviation: '+(logDev>=0?'+':'')+logDev.toFixed(4)+' log units' : '');
 }
 
 // NOTE: single-click should do NOTHING → no plotly_click handler
@@ -818,11 +910,42 @@ plotDiv.on('plotly_hover', ev=>{
 });
 
 // Date lock
-document.getElementById('setDateBtn').onclick=()=>{ if(!datePick.value) return; updatePanel(PRECOMP[denomSel.value], yearsFromISO(datePick.value)); };
-document.getElementById('todayBtn').onclick=()=>{ const P=PRECOMP[denomSel.value]; updatePanel(P, P.x_main[P.x_main.length-1]); };
+datePick.value = LAST_PRICE_ISO;
+btnSet.addEventListener('click',()=>{
+  if(!datePick.value) return;
+  const P=PRECOMP[denomSel.value];
+  const y = yearsFromISO(datePick.value);
+  updatePanel(P, y);
+});
+datePick.addEventListener('keydown',(e)=>{
+  if(e.key==='Enter'){ e.preventDefault(); btnSet.click(); }
+});
+btnToday.addEventListener('click',()=>{
+  const P=PRECOMP[denomSel.value];
+  datePick.value = LAST_PRICE_ISO;
+  updatePanel(P, P.x_main[P.x_main.length-1]);
+});
 
 // Copy chart
-btnCopy.onclick=async ()=>{ try{ const url=await Plotly.toImage(plotDiv,{format:'png',scale:2}); if(navigator.clipboard && window.ClipboardItem){ const blob=await (await fetch(url)).blob(); await navigator.clipboard.write([new ClipboardItem({'image/png':blob})]); } else { const a=document.createElement('a'); a.href=url; a.download='btc-indicator.png'; document.body.appendChild(a); a.click(); a.remove(); } }catch(e){ console.error('Copy Chart failed:', e); alert('Copy failed.'); } };
+btnCopy.addEventListener('click', async ()=>{
+  btnCopy.textContent='Copying...'; btnCopy.disabled=true;
+  try{
+    const url=await Plotly.toImage(plotDiv,{format:'png',scale:2});
+    if(navigator.clipboard && window.ClipboardItem){
+      const blob=await (await fetch(url)).blob();
+      await navigator.clipboard.write([new ClipboardItem({'image/png':blob})]);
+      btnCopy.textContent='Copied!';
+    } else {
+      const a=document.createElement('a'); a.href=url; a.download='btc-indicator.png';
+      document.body.appendChild(a); a.click(); a.remove();
+      btnCopy.textContent='Downloaded!';
+    }
+  }catch(e){
+    console.error('Copy Chart failed:', e);
+    btnCopy.textContent='Failed';
+  }
+  setTimeout(()=>{ btnCopy.textContent='Copy Chart'; btnCopy.disabled=false; }, 1500);
+});
 
 // ─────────── Level Lines: no axis stretch + always span visible x-range ───────────
 function currentXRange(){
@@ -919,15 +1042,17 @@ plotDiv.on('plotly_doubleclick', ()=>{
 });
 
 // Denominator change
-denomSel.onchange=()=>{ const key=denomSel.value, P=PRECOMP[key];
+denomSel.addEventListener('change',()=>{ const key=denomSel.value, P=PRECOMP[key];
+  // Clear cached class series to force recalculation for new denominator
+  delete P._classSeries; delete P._pSeries; delete P._scoreSeries;
   Plotly.restyle(plotDiv,{x:[P.x_main], y:[P.y_main], name:[P.label]}, [IDX_MAIN]);
   Plotly.restyle(plotDiv,{x:[P.x_main], y:[P.y_main]},                 [IDX_CLICK]);
   Plotly.restyle(plotDiv,{x:[P.x_grid], y:[seriesForPercent(P,50)]},   [IDX_CARRY]);
-  Plotly.relayout(plotDiv,{annotations:(plotDiv.layout.annotations||[]).filter(a=>a.meta!=='halving' && a.meta!=='liquidity')});
+  Plotly.relayout(plotDiv,{'yaxis.title':P.label, annotations:(plotDiv.layout.annotations||[]).filter(a=>a.meta!=='halving' && a.meta!=='liquidity')});
   renderRails(P); applyIndicatorMask(P);
   redrawLevels(P);
   updatePanel(P, P.x_main[P.x_main.length-1]);
-};
+});
 
 // Sync all
 function syncAll(){ sortRails(); rebuildEditor(); const P=PRECOMP[denomSel.value]; renderRails(P); applyIndicatorMask(P); redrawLevels(P); updatePanel(P, P.x_main[P.x_main.length-1]); }
@@ -960,10 +1085,12 @@ btnHalvings.onclick=()=>{ halvingsOn=!halvingsOn;
   const curr=plotDiv.layout.shapes||[];
   if(halvingsOn){
     Plotly.relayout(plotDiv, {shapes:[].concat(curr, makeHalvingShapes())});
-    btnHalvings.textContent='Halvings ✓';
+    btnHalvings.classList.add('active');
+    btnHalvings.textContent='Halvings';
   }else{
     const remain=(plotDiv.layout.shapes||[]).filter(s=>s.meta!=='halving');
     Plotly.relayout(plotDiv, {shapes:remain});
+    btnHalvings.classList.remove('active');
     btnHalvings.textContent='Halvings';
   }
 };
@@ -1012,10 +1139,12 @@ btnLiquidity.onclick = () => {
   const curr = plotDiv.layout.shapes || [];
   if (liquidityOn){
     Plotly.relayout(plotDiv, {shapes:[].concat(curr, makeLiquidityShapes())});
-    btnLiquidity.textContent = 'Liquidity ✓';
+    btnLiquidity.classList.add('active');
+    btnLiquidity.textContent = 'Liquidity';
   } else {
     const remain = (plotDiv.layout.shapes||[]).filter(s => s.meta!=='liquidity');
     Plotly.relayout(plotDiv, {shapes:remain});
+    btnLiquidity.classList.remove('active');
     btnLiquidity.textContent = 'Liquidity';
   }
 };
