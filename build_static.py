@@ -54,7 +54,32 @@ AUTO_DENOMS = {
 }
 UA = {"User-Agent":"btc-indicator/1.0"}
 
+# ───────────────────── Time Periods (for zoom presets) ─────────────────────
+# Cycle dates based on halving schedule
+CYCLE_1_START = "2009-01-03"  # Genesis
+CYCLE_2_START = "2012-11-28"  # 1st halving
+CYCLE_3_START = "2016-07-09"  # 2nd halving
+CYCLE_4_START = "2020-05-11"  # 3rd halving
+CYCLE_5_START = "2024-04-20"  # 4th halving
+
+TIME_PERIODS = {
+    "full": {"label": "Full History", "start": "2009-01-03"},
+    "cycle4": {"label": "Cycle 4 (2020-2024)", "start": CYCLE_4_START, "end": CYCLE_5_START},
+    "cycle5": {"label": "Cycle 5 (2024+)", "start": CYCLE_5_START},
+    "modern": {"label": "Modern Era (2017+)", "start": "2017-01-01"},
+    "recent": {"label": "Recent (2020+)", "start": "2020-01-01"},
+    "1y": {"label": "Last Year", "days_back": 365},
+    "6m": {"label": "Last 6 Months", "days_back": 183},
+    "3m": {"label": "Last 3 Months", "days_back": 91},
+}
+
 # ───────────────────── Helpers / fetchers ─────────────────────
+def days_since_genesis(dates):
+    """Days since Bitcoin Genesis Block (Jan 3, 2009), starting at day 1."""
+    d = pd.to_datetime(dates)
+    delta_days = (d - GENESIS_DATE) / np.timedelta64(1, "D")
+    return delta_days.astype(float) + 1.0  # day 1 = genesis
+
 def years_since_genesis(dates):
     d = pd.to_datetime(dates)
     delta_days = (d - GENESIS_DATE) / np.timedelta64(1, "D")
@@ -223,6 +248,7 @@ for key, df in denoms.items():
     base = base.merge(df.rename(columns={"price": key.lower()}), on="date", how="left")
 
 base["x_years"]   = years_since_genesis(base["date"])
+base["x_days"]    = days_since_genesis(base["date"])
 base["date_iso"]  = base["date"].dt.strftime("%Y-%m-%d")
 
 first_dt = max(base["date"].iloc[0], X_START_DATE)
@@ -231,6 +257,11 @@ max_dt   = END_PROJ
 x_start = float(years_since_genesis(pd.Series([first_dt])).iloc[0])
 x_end   = float(years_since_genesis(pd.Series([max_dt])).iloc[0])
 x_grid  = np.logspace(np.log10(max(1e-6, x_start)), np.log10(x_end), 700)
+
+# Days-based grid (starting from day 1 = genesis)
+d_start = float(days_since_genesis(pd.Series([first_dt])).iloc[0])
+d_end   = float(days_since_genesis(pd.Series([max_dt])).iloc[0])
+x_grid_days = np.logspace(np.log10(max(1, d_start)), np.log10(d_end), 700)
 
 def year_ticks_log(first_dt, last_dt):
     vals, labs = [], []
@@ -259,19 +290,35 @@ def series_for_denom(df, key):
         return df["btc"]/df[k], f"BTC / {key.upper()}", "", 6
     return df["btc"], "BTC / USD", "$", 2
 
+def resample_ohlc(df, y_col, freq='W'):
+    """Resample to weekly or monthly OHLC candles."""
+    df = df.set_index('date')
+    ohlc = df[y_col].resample(freq).ohlc()
+    ohlc = ohlc.dropna()
+    ohlc = ohlc.reset_index()
+    return ohlc
+
 def build_payload(df, denom_key=None):
     y, label, unit, decimals = series_for_denom(df, denom_key)
     mask = np.isfinite(df["x_years"].values) & np.isfinite(y.values)
-    xs = df["x_years"].values[mask]
+    xs_years = df["x_years"].values[mask]
+    xs_days = df["x_days"].values[mask]
     ys = y.values[mask]
     dates = df["date_iso"].values[mask]
-    support = build_support_constant_rails(xs, ys)
+    support = build_support_constant_rails(xs_years, ys)
+
+    # Also fit in days-space for display
+    support_days = build_support_constant_rails(xs_days, ys)
+
     return {
         "label": label, "unit": unit, "decimals": decimals,
-        "x_main": xs.tolist(), "y_main": ys.tolist(),
+        "x_main": xs_years.tolist(), "y_main": ys.tolist(),
+        "x_days": xs_days.tolist(),
         "date_iso_main": dates.tolist(),
         "x_grid": x_grid.tolist(),
-        "support": support
+        "x_grid_days": x_grid_days.tolist(),
+        "support": support,
+        "support_days": support_days
     }
 
 PRECOMP = {"USD": build_payload(base, None)}
@@ -405,11 +452,37 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
   <div class="left" id="leftCol">__PLOT_HTML__</div>
   <div class="right">
     <div id="controls">
-      <label for="denomSel"><b>Denominator:</b></label>
+      <label for="denomSel"><b>Denom:</b></label>
       <select id="denomSel"></select>
+
+      <label for="periodSel"><b>Period:</b></label>
+      <select id="periodSel">
+        <option value="full">Full History</option>
+        <option value="cycle4">Cycle 4 (2020-24)</option>
+        <option value="cycle5">Cycle 5 (2024+)</option>
+        <option value="modern">Modern (2017+)</option>
+        <option value="recent">Recent (2020+)</option>
+        <option value="1y">Last Year</option>
+        <option value="6m">Last 6 Months</option>
+        <option value="3m">Last 3 Months</option>
+      </select>
+
+      <label for="xAxisSel"><b>X-Axis:</b></label>
+      <select id="xAxisSel">
+        <option value="years">Years</option>
+        <option value="days">Days</option>
+      </select>
+
+      <button id="halvingsBtn" class="btn" title="Toggle halving lines">Halvings</button>
+      <button id="liquidityBtn" class="btn" title="Toggle liquidity cycle">Liquidity</button>
+      <button id="infoBtn" class="btn info-btn" title="How it works">i</button>
+    </div>
+
+    <div id="controls2" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding-bottom:8px;border-bottom:1px solid #e5e7eb;">
       <input type="date" id="datePick"/>
       <button id="setDateBtn" class="btn">Set Date</button>
       <button id="todayBtn" class="btn">Today</button>
+      <button id="copyBtn" class="btn" title="Copy current view to clipboard">Copy Chart</button>
 
       <div class="indicator-wrap">
         <button id="indicatorBtn" class="indicator-btn">Indicator: All</button>
@@ -427,12 +500,6 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
           </div>
         </div>
       </div>
-
-      <button id="halvingsBtn" class="btn" title="Toggle halving lines">Halvings</button>
-      <button id="liquidityBtn" class="btn" title="Toggle liquidity cycle">Liquidity</button>
-      <button id="copyBtn" class="btn" title="Copy current view to clipboard">Copy Chart</button>
-
-      <button id="infoBtn" class="btn info-btn" title="How it works">i</button>
     </div>
 
     <div id="chartWidthBox">
@@ -449,6 +516,12 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
       <input type="text" id="levelInput" placeholder="e.g. 50000 or 1.2"/>
       <button id="addLevelBtn" class="btn">Add Level</button>
       <button id="clearLevelsBtn" class="btn">Clear</button>
+    </div>
+
+    <!-- Trend lines -->
+    <div style="display:flex;gap:8px;align-items:center;">
+      <span class="smallnote">Right-click chart twice to draw a trend line.</span>
+      <button id="clearTrendBtn" class="btn">Clear Lines</button>
     </div>
 
     <fieldset id="railsBox">
@@ -477,6 +550,13 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
       <div><b>Position:</b> <span id="pPct" style="font-weight:600;">(p\u2248\u2014)</span></div>
       <div id="oscRow"><b>Oscillator:</b> <span id="oscVal" style="font-weight:600;font-family:ui-monospace,Menlo,Consolas,monospace;">\u2014</span> <span id="oscLabel" class="smallnote"></span></div>
       <div><b>Composite:</b> <span id="compLine" class="smallnote">\u2014</span></div>
+
+      <!-- Prediction Signal -->
+      <div id="predictionBox" style="margin-top:10px;padding:10px;border-radius:8px;border:2px solid #e5e7eb;background:#fafafa;">
+        <div style="font-weight:700;font-size:16px;margin-bottom:4px;" id="predSignal">\u2014</div>
+        <div class="smallnote" id="predReason"></div>
+      </div>
+
       <div id="plParams" class="smallnote" style="margin-top:8px;border-top:1px solid #e5e7eb;padding-top:8px;"></div>
     </div>
   </div>
@@ -519,6 +599,7 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
 
 <script>
 const PRECOMP = __PRECOMP__;
+const TIME_PERIODS = __TIME_PERIODS__;
 const GENESIS = new Date('__GENESIS__T00:00:00Z');
 const END_ISO = '__END_ISO__';
 const LAST_PRICE_ISO = '__LAST_PRICE_ISO__';
@@ -540,16 +621,41 @@ const W_P   = __W_P__;
 const W_LIQ = __W_LIQ__;
 const W_HALV= __W_HALV__;
 
+// X-axis mode: 'years' or 'days'
+let xAxisMode = 'years';
+
 const MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 function yearsFromISO(iso){ const d=new Date(iso+'T00:00:00Z'); return ((d-GENESIS)/86400000)/365.25 + (1.0/365.25); }
+function daysFromISO(iso){ const d=new Date(iso+'T00:00:00Z'); return ((d-GENESIS)/86400000) + 1; }
 function shortDateFromYears(y){ const ms=(y-(1.0/365.25))*365.25*86400000; const d=new Date(GENESIS.getTime()+ms); return `${MONTHS[d.getUTCMonth()]}-${String(d.getUTCDate()).padStart(2,'0')}-${String(d.getUTCFullYear()).slice(-2)}`; }
+function shortDateFromDays(days){ const ms=(days-1)*86400000; const d=new Date(GENESIS.getTime()+ms); return `${MONTHS[d.getUTCMonth()]}-${String(d.getUTCDate()).padStart(2,'0')}-${String(d.getUTCFullYear()).slice(-2)}`; }
 function isoFromYears(y){ const ms=(y-(1.0/365.25))*365.25*86400000; const d=new Date(GENESIS.getTime()+ms); return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`; }
+function isoFromDays(days){ const ms=(days-1)*86400000; const d=new Date(GENESIS.getTime()+ms); return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`; }
 function interp(xs, ys, x){ let lo=0,hi=xs.length-1; if(x<=xs[0]) return ys[0]; if(x>=xs[hi]) return ys[hi];
   while(hi-lo>1){ const m=(hi+lo)>>1; if(xs[m]<=x) lo=m; else hi=m; }
   const t=(x-xs[lo])/(xs[hi]-xs[lo]); return ys[lo]+t*(ys[hi]-ys[lo]); }
 function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
 function daysBetweenISO(a,b){ return Math.round((new Date(b+'T00:00:00Z') - new Date(a+'T00:00:00Z'))/86400000); }
 function monthsBetweenISO(a,b){ return (new Date(b+'T00:00:00Z') - new Date(a+'T00:00:00Z'))/(86400000*30.4375); }
+
+// Get x-values based on current mode
+function getXMain(P){ return xAxisMode==='days' ? P.x_days : P.x_main; }
+function getXGrid(P){ return xAxisMode==='days' ? P.x_grid_days : P.x_grid; }
+function getSupport(P){ return xAxisMode==='days' ? P.support_days : P.support; }
+function xToISO(x){ return xAxisMode==='days' ? isoFromDays(x) : isoFromYears(x); }
+function xToShortDate(x){ return xAxisMode==='days' ? shortDateFromDays(x) : shortDateFromYears(x); }
+function isoToX(iso){ return xAxisMode==='days' ? daysFromISO(iso) : yearsFromISO(iso); }
+
+// Prediction signal based on oscillator thresholds (Burger's oscillator zones)
+function getPredictionSignal(osc, p){
+  if (osc >= 0.85) return {signal: '\u26a0\ufe0f SELL ZONE', color: '#DC2626', bg: '#FEE2E2', reason: 'Oscillator >=0.85: Historically all ATHs occurred here. Consider taking profits.'};
+  if (osc >= 0.7)  return {signal: '\u2b06\ufe0f FROTHY', color: '#F97316', bg: '#FFF7ED', reason: 'Oscillator 0.7-0.85: Approaching bubble territory. Reduce exposure.'};
+  if (osc >= 0.4)  return {signal: '\u2197\ufe0f ELEVATED', color: '#EAB308', bg: '#FEFCE8', reason: 'Oscillator 0.4-0.7: Above fair value. Hold, be cautious adding.'};
+  if (osc >= -0.2) return {signal: '\u2705 FAIR VALUE', color: '#16A34A', bg: '#F0FDF4', reason: 'Oscillator -0.2 to 0.4: Near trend line. Good for DCA.'};
+  if (osc >= -0.5) return {signal: '\u2b07\ufe0f ACCUMULATE', color: '#0EA5E9', bg: '#F0F9FF', reason: 'Oscillator -0.5 to -0.2: Below trend. Good buying opportunity.'};
+  if (osc >= -0.8) return {signal: '\ud83d\udcb0 STRONG BUY', color: '#2563EB', bg: '#EFF6FF', reason: 'Oscillator -0.8 to -0.5: Significantly undervalued. Aggressive accumulation.'};
+  return {signal: '\ud83d\udea8 EXTREME BUY', color: '#7C3AED', bg: '#F5F3FF', reason: 'Oscillator <-0.8: Extreme undervaluation. Rare opportunity.'};
+}
 
 function fmtVal(P, v){
   if(!isFinite(v)) return '—';
@@ -599,6 +705,11 @@ const elMainLabel=document.getElementById('mainLabel');
 const elP=document.getElementById('pPct');
 const elComp=document.getElementById('compLine');
 const chartWpx=document.getElementById('chartWpx');
+const periodSel=document.getElementById('periodSel');
+const xAxisSel=document.getElementById('xAxisSel');
+const predSignal=document.getElementById('predSignal');
+const predReason=document.getElementById('predReason');
+const predBox=document.getElementById('predictionBox');
 
 const editBtn=document.getElementById('editBtn');
 const railsView=document.getElementById('railsView');
@@ -705,9 +816,13 @@ if(window.ResizeObserver){
 }
 
 // ───────── Rails math ─────────
-function logMidline(P){ const d=P.support; return P.x_grid.map(x=> (d.a0 + d.b*Math.log10(x)) ); }
+function logMidline(P){
+  const d=getSupport(P);
+  const xg=getXGrid(P);
+  return xg.map(x=> (d.a0 + d.b*Math.log10(x)) );
+}
 function offsetForPercent(P, percent){
-  const d=P.support; const q=d.q_grid, off=d.off_grid;
+  const d=getSupport(P); const q=d.q_grid, off=d.off_grid;
   const p01=clamp(percent/100, q[0], q[q.length-1]);
   let lo=0, hi=q.length-1;
   while(hi-lo>1){ const m=(hi+lo)>>1; if(q[m]<=p01) lo=m; else hi=m; }
@@ -720,7 +835,7 @@ function seriesForPercent(P, percent){
   return logM.map(v=>Math.pow(10, v+off+(percent>=50?eps:-eps)));
 }
 function percentFromOffset(P, off){
-  const d=P.support; const q=d.q_grid, offg=d.off_grid;
+  const d=getSupport(P); const q=d.q_grid, offg=d.off_grid;
   if (off<=offg[0]) return 100*q[0];
   if (off>=offg[offg.length-1]) return 100*q[offg.length-1];
   let lo=0, hi=offg.length-1;
@@ -764,8 +879,9 @@ function compositeFrom(p, iso){
 }
 // Power Law Oscillator: normalize log-deviation from trend to [-1, +1]
 function oscillatorFromDeviation(P, logDev){
-  const rmin = P.support.resid_min;
-  const rmax = P.support.resid_max;
+  const sup = getSupport(P);
+  const rmin = sup.resid_min;
+  const rmax = sup.resid_max;
   if (rmax === rmin) return 0;
   return (2 * (logDev - rmin) / (rmax - rmin)) - 1;
 }
@@ -792,6 +908,7 @@ function setTitle(s){ Plotly.relayout(plotDiv, {'title.text': titleForScore(s)})
 
 // Render rails
 function renderRails(P){
+  const xg = getXGrid(P);
   const n=Math.min(rails.length, MAX_SLOTS);
   for(let i=0;i<MAX_SLOTS;i++){
     const visible=(i<n); let restyle={visible};
@@ -799,12 +916,12 @@ function renderRails(P){
       const p=rails[i], color=colorForPercent(p);
       const nm=(p===2.5?'Floor':(p===97.5?'Ceiling':(p+'%')));
       const is50 = (Math.abs(p - 50) < 0.01);
-      restyle=Object.assign(restyle,{x:[P.x_grid], y:[seriesForPercent(P,p)], name:nm,
+      restyle=Object.assign(restyle,{x:[xg], y:[seriesForPercent(P,p)], name:nm,
         line:{color: is50 ? '#4B5563' : color, width: is50 ? 2.2 : 1.6, dash: is50 ? 'solid' : 'dot'}});
     }
     Plotly.restyle(plotDiv, restyle, [i]);
   }
-  Plotly.restyle(plotDiv, {x:[P.x_grid], y:[seriesForPercent(P,50)]}, [IDX_CARRY]);
+  Plotly.restyle(plotDiv, {x:[xg], y:[seriesForPercent(P,50)]}, [IDX_CARRY]);
   railsListText.textContent=railsText();
 }
 
@@ -828,19 +945,20 @@ function computeSeriesForMask(P){
   P._pSeries=pSeries; P._scoreSeries=scores; P._classSeries=classes;
 }
 function applyIndicatorMask(P){
+  const xMain = getXMain(P);
   if (!selectedIndicators || selectedIndicators.length===0){
-    Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main], name:[P.label]}, [IDX_MAIN]);
-    Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main]},                [IDX_CLICK]);
+    Plotly.restyle(plotDiv, {x:[xMain], y:[P.y_main], name:[P.label]}, [IDX_MAIN]);
+    Plotly.restyle(plotDiv, {x:[xMain], y:[P.y_main]},                [IDX_CLICK]);
   } else {
     computeSeriesForMask(P);
     const set=new Set(selectedIndicators);
     const ym = P.y_main.map((v,i)=> set.has(P._classSeries[i]) ? v : null);
-    const nm = P.label+' — '+Array.from(set).join(' + ');
-    Plotly.restyle(plotDiv, {x:[P.x_main], y:[ym], name:[nm]}, [IDX_MAIN]);
-    Plotly.restyle(plotDiv, {x:[P.x_main], y:[ym]},            [IDX_CLICK]);
+    const nm = P.label+' \u2014 '+Array.from(set).join(' + ');
+    Plotly.restyle(plotDiv, {x:[xMain], y:[ym], name:[nm]}, [IDX_MAIN]);
+    Plotly.restyle(plotDiv, {x:[xMain], y:[ym]},            [IDX_CLICK]);
   }
-  const tt = (P.unit === '$') ? "%{x|%b-%d-%Y}<br>$%{y:.2f}<extra></extra>" : "%{x|%b-%d-%Y}<br>%{y:.6f}<extra></extra>";
-  Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main], hovertemplate:[tt], line:[{width:0}]}, [IDX_TT]);
+  const tt = (P.unit === '$') ? '%{customdata}<br>$%{y:.2f}<extra></extra>' : '%{customdata}<br>%{y:.6f}<extra></extra>';
+  Plotly.restyle(plotDiv, {x:[xMain], y:[P.y_main], customdata:[P.date_iso_main], hovertemplate:[tt], line:[{width:0}]}, [IDX_TT]);
 }
 
 // Panel update (future uses 50% for main value; p hidden)
@@ -848,33 +966,35 @@ const elOsc = document.getElementById('oscVal');
 const elOscLabel = document.getElementById('oscLabel');
 const elPlParams = document.getElementById('plParams');
 
-function updatePanel(P,xYears){
-  const iso = isoFromYears(xYears);
-  elDate.textContent=shortDateFromYears(xYears);
+function updatePanel(P, xVal){
+  const iso = xToISO(xVal);
+  elDate.textContent = xToShortDate(xVal);
 
+  const xg = getXGrid(P);
   const v50series = seriesForPercent(P,50);
-  const v50 = interp(P.x_grid, v50series, xYears);
+  const v50 = interp(xg, v50series, xVal);
 
   rails.forEach(p=>{
-    const v=interp(P.x_grid, seriesForPercent(P,p), xYears);
+    const v=interp(xg, seriesForPercent(P,p), xVal);
     const el=document.getElementById(idFor(p)); if(!el) return;
     const mult=(v50>0&&isFinite(v50))?` (${(v/v50).toFixed(1)}x)`:''; el.textContent=fmtVal(P,v)+mult;
   });
 
-  const lastX=P.x_main[P.x_main.length-1];
+  const xMain = getXMain(P);
+  const lastX = xMain[xMain.length-1];
   let usedP=null, mainTxt='', compScore=null, logDev=0;
 
-  if (xYears>lastX){
+  if (xVal > lastX){
     mainTxt = fmtVal(P, v50) + ' (50%)';
     elP.textContent = '(p\u2248\u2014)';
     elMainLabel.textContent=(P.unit==='$'?'BTC Price:':'BTC Ratio:');
     usedP = 50;
     logDev = 0;
   } else {
-    let idx=0,best=1e99; for(let i=0;i<P.x_main.length;i++){ const d=Math.abs(P.x_main[i]-xYears); if(d<best){best=d; idx=i;} }
+    let idx=0,best=1e99; for(let i=0;i<xMain.length;i++){ const d=Math.abs(xMain[i]-xVal); if(d<best){best=d; idx=i;} }
     const y=P.y_main[idx]; mainTxt = fmtVal(P,y); elMainLabel.textContent=(P.unit==='$'?'BTC Price:':'BTC Ratio:');
-    const d=P.support, z=Math.log10(P.x_main[idx]);
-    logDev = Math.log10(y) - (d.a0 + d.b*z);
+    const sup=getSupport(P), z=Math.log10(xMain[idx]);
+    logDev = Math.log10(y) - (sup.a0 + sup.b*z);
     const off = logDev;
     usedP=clamp(percentFromOffset(P, off), 0, 100);
     elP.textContent='(p\u2248'+usedP.toFixed(1)+'%)';
@@ -889,16 +1009,25 @@ function updatePanel(P,xYears){
   elOscLabel.textContent = oscillatorLabel(osc);
   elOscLabel.style.color = oscCol;
 
+  // Prediction Signal
+  const pred = getPredictionSignal(osc, usedP);
+  predSignal.textContent = pred.signal;
+  predSignal.style.color = pred.color;
+  predReason.textContent = pred.reason;
+  predBox.style.borderColor = pred.color;
+  predBox.style.background = pred.bg;
+
   compScore = compositeFrom(usedP, iso);
   elComp.textContent = compScore.toFixed(2) + ' \u2014 ' + classFromScore(compScore);
   setTitle(compScore);
 
   // Show power law parameters
-  const sup = P.support;
-  const slope = sup.b.toFixed(4);
-  const intercept = sup.a0.toFixed(4);
-  const fairVal = Math.pow(10, sup.a0 + sup.b * Math.log10(xYears));
-  elPlParams.innerHTML = 'Power Law: log\u2081\u2080(P) = '+intercept+' + '+slope+' \u00d7 log\u2081\u2080(t)<br>Fair Value (50%): '+fmtVal(P, fairVal) + (xYears<=lastX ? '<br>Deviation: '+(logDev>=0?'+':'')+logDev.toFixed(4)+' log units' : '');
+  const supP = getSupport(P);
+  const slope = supP.b.toFixed(4);
+  const intercept = supP.a0.toFixed(4);
+  const fairVal = Math.pow(10, supP.a0 + supP.b * Math.log10(xVal));
+  const xLabel = xAxisMode==='days' ? 'days' : 't';
+  elPlParams.innerHTML = 'Power Law: log\u2081\u2080(P) = '+intercept+' + '+slope+' \u00d7 log\u2081\u2080('+xLabel+')<br>Fair Value (50%): '+fmtVal(P, fairVal) + (xVal<=lastX ? '<br>Deviation: '+(logDev>=0?'+':'')+logDev.toFixed(4)+' log units' : '');
 }
 
 // NOTE: single-click should do NOTHING → no plotly_click handler
@@ -923,7 +1052,129 @@ datePick.addEventListener('keydown',(e)=>{
 btnToday.addEventListener('click',()=>{
   const P=PRECOMP[denomSel.value];
   datePick.value = LAST_PRICE_ISO;
-  updatePanel(P, P.x_main[P.x_main.length-1]);
+  const xMain = getXMain(P);
+  updatePanel(P, xMain[xMain.length-1]);
+});
+
+// ───────── X-Axis mode switching ─────────
+function fullRedraw(){
+  const P = PRECOMP[denomSel.value];
+  delete P._classSeries; delete P._pSeries; delete P._scoreSeries;
+  const xMain = getXMain(P);
+  const xg = getXGrid(P);
+  const xLabel = xAxisMode==='days' ? 'Log\u2081\u2080 Days from Genesis' : 'Log\u2081\u2080 Years from Genesis';
+  Plotly.restyle(plotDiv,{x:[xMain], y:[P.y_main], name:[P.label]}, [IDX_MAIN]);
+  Plotly.restyle(plotDiv,{x:[xMain], y:[P.y_main]},                 [IDX_CLICK]);
+  Plotly.restyle(plotDiv,{x:[xg], y:[seriesForPercent(P,50)]},      [IDX_CARRY]);
+  Plotly.relayout(plotDiv,{'xaxis.title': xLabel, 'yaxis.title':P.label, 'xaxis.autorange':true, 'yaxis.autorange':true});
+  renderRails(P); applyIndicatorMask(P);
+  redrawLevels(P); redrawTrendLines();
+  updatePanel(P, xMain[xMain.length-1]);
+}
+
+xAxisSel.addEventListener('change',()=>{
+  xAxisMode = xAxisSel.value;
+  fullRedraw();
+});
+
+// ───────── Period (zoom preset) switching ─────────
+periodSel.addEventListener('change',()=>{
+  const key = periodSel.value;
+  const per = TIME_PERIODS[key];
+  if (!per) return;
+  const P = PRECOMP[denomSel.value];
+  const xMain = getXMain(P);
+  let xlo, xhi;
+  if (per.days_back) {
+    xhi = xMain[xMain.length-1];
+    const isoStart = isoFromDays(daysFromISO(LAST_PRICE_ISO) - per.days_back);
+    xlo = isoToX(isoStart);
+  } else {
+    xlo = isoToX(per.start);
+    xhi = per.end ? isoToX(per.end) : (key==='full' ? undefined : xMain[xMain.length-1] * 1.05);
+  }
+  if (key==='full'){
+    Plotly.relayout(plotDiv,{'xaxis.autorange':true,'yaxis.autorange':true});
+  } else {
+    Plotly.relayout(plotDiv,{'xaxis.range':[Math.log10(Math.max(1e-6,xlo)), Math.log10(xhi)], 'yaxis.autorange':true});
+  }
+});
+
+// ───────── Right-click trend line drawing ─────────
+let trendLinePoints = [];
+let trendLines = [];
+const TREND_LINE_META = 'user-trend';
+
+plotDiv.addEventListener('contextmenu', (e)=>{
+  e.preventDefault();
+  const bb = plotDiv.getBoundingClientRect();
+  const fl = plotDiv._fullLayout;
+  if (!fl || !fl.xaxis || !fl.yaxis) return;
+  const xa = fl.xaxis, ya = fl.yaxis;
+  const px = e.clientX - bb.left - fl.margin.l;
+  const py = e.clientY - bb.top - fl.margin.t;
+  if (px < 0 || py < 0 || px > xa._length || py > ya._length) return;
+  const logx = xa.range[0] + (px / xa._length) * (xa.range[1] - xa.range[0]);
+  const logy = ya.range[0] + ((ya._length - py) / ya._length) * (ya.range[1] - ya.range[0]);
+  const xVal = Math.pow(10, logx);
+  const yVal = Math.pow(10, logy);
+  trendLinePoints.push({x: xVal, y: yVal, logx: logx, logy: logy});
+  if (trendLinePoints.length === 2) {
+    const p1 = trendLinePoints[0], p2 = trendLinePoints[1];
+    const slope = (p2.logy - p1.logy) / (p2.logx - p1.logx);
+    const intercept = p1.logy - slope * p1.logx;
+    const xRange = xa.range;
+    const x0log = xRange[0] - 0.5;
+    const x1log = xRange[1] + 0.5;
+    const y0log = intercept + slope * x0log;
+    const y1log = intercept + slope * x1log;
+    const line = {
+      type:'line', xref:'x', yref:'y',
+      x0: Math.pow(10, x0log), x1: Math.pow(10, x1log),
+      y0: Math.pow(10, y0log), y1: Math.pow(10, y1log),
+      line:{color:'#6366F1', width:1.8, dash:'solid'},
+      layer:'above', meta: TREND_LINE_META,
+      _slope: slope, _intercept: intercept
+    };
+    trendLines.push(line);
+    const shapes = (plotDiv.layout.shapes||[]).concat([line]);
+    Plotly.relayout(plotDiv, {shapes: shapes});
+    trendLinePoints = [];
+  }
+});
+
+function redrawTrendLines(){
+  const shapes = (plotDiv.layout.shapes||[]).filter(s => s.meta !== TREND_LINE_META);
+  const fl = plotDiv._fullLayout;
+  if (!fl || !fl.xaxis) { Plotly.relayout(plotDiv, {shapes: shapes}); return; }
+  const xRange = fl.xaxis.range;
+  const extended = trendLines.map(tl => {
+    const x0log = xRange[0] - 0.5;
+    const x1log = xRange[1] + 0.5;
+    const y0log = tl._intercept + tl._slope * x0log;
+    const y1log = tl._intercept + tl._slope * x1log;
+    return Object.assign({}, tl, {
+      x0: Math.pow(10, x0log), x1: Math.pow(10, x1log),
+      y0: Math.pow(10, y0log), y1: Math.pow(10, y1log)
+    });
+  });
+  Plotly.relayout(plotDiv, {shapes: shapes.concat(extended)});
+}
+
+// Re-extend trend lines on pan/zoom
+plotDiv.on('plotly_relayout', (e)=>{
+  if (!e) return;
+  const touchedX = Object.keys(e).some(k => k.startsWith('xaxis.'));
+  if (!touchedX || trendLines.length === 0) return;
+  requestAnimationFrame(()=> redrawTrendLines());
+});
+
+// Clear trend lines button
+document.getElementById('clearTrendBtn').addEventListener('click',()=>{
+  trendLines = [];
+  trendLinePoints = [];
+  const shapes = (plotDiv.layout.shapes||[]).filter(s => s.meta !== TREND_LINE_META);
+  Plotly.relayout(plotDiv, {shapes: shapes});
 });
 
 // Copy chart
@@ -1042,30 +1293,30 @@ plotDiv.on('plotly_doubleclick', ()=>{
 });
 
 // Denominator change
-denomSel.addEventListener('change',()=>{ const key=denomSel.value, P=PRECOMP[key];
-  // Clear cached class series to force recalculation for new denominator
-  delete P._classSeries; delete P._pSeries; delete P._scoreSeries;
-  Plotly.restyle(plotDiv,{x:[P.x_main], y:[P.y_main], name:[P.label]}, [IDX_MAIN]);
-  Plotly.restyle(plotDiv,{x:[P.x_main], y:[P.y_main]},                 [IDX_CLICK]);
-  Plotly.restyle(plotDiv,{x:[P.x_grid], y:[seriesForPercent(P,50)]},   [IDX_CARRY]);
-  Plotly.relayout(plotDiv,{'yaxis.title':P.label, annotations:(plotDiv.layout.annotations||[]).filter(a=>a.meta!=='halving' && a.meta!=='liquidity')});
-  renderRails(P); applyIndicatorMask(P);
-  redrawLevels(P);
-  updatePanel(P, P.x_main[P.x_main.length-1]);
+denomSel.addEventListener('change',()=>{
+  fullRedraw();
 });
 
 // Sync all
-function syncAll(){ sortRails(); rebuildEditor(); const P=PRECOMP[denomSel.value]; renderRails(P); applyIndicatorMask(P); redrawLevels(P); updatePanel(P, P.x_main[P.x_main.length-1]); }
+function syncAll(){
+  sortRails(); rebuildEditor();
+  const P=PRECOMP[denomSel.value];
+  const xMain = getXMain(P);
+  renderRails(P); applyIndicatorMask(P); redrawLevels(P);
+  updatePanel(P, xMain[xMain.length-1]);
+}
 
 // Init
 (function init(){
   rebuildReadoutRows(); rebuildEditor();
-  renderRails(PRECOMP['USD']); applyIndicatorMask(PRECOMP['USD']);
   const P=PRECOMP['USD'];
-  Plotly.restyle(plotDiv,{x:[P.x_grid], y:[seriesForPercent(P,50)]},[IDX_CARRY]);
-  const tt="%{x|%b-%d-%Y}<br>$%{y:.2f}<extra></extra>";
-  Plotly.restyle(plotDiv,{x:[P.x_main], y:[P.y_main], hovertemplate:[tt], line:[{width:0}]},[IDX_TT]);
-  updatePanel(P, P.x_main[P.x_main.length-1]);
+  const xMain = getXMain(P);
+  const xg = getXGrid(P);
+  renderRails(P); applyIndicatorMask(P);
+  Plotly.restyle(plotDiv,{x:[xg], y:[seriesForPercent(P,50)]},[IDX_CARRY]);
+  const tt='%{customdata}<br>$%{y:.2f}<extra></extra>';
+  Plotly.restyle(plotDiv,{x:[xMain], y:[P.y_main], customdata:[P.date_iso_main], hovertemplate:[tt], line:[{width:0}]},[IDX_TT]);
+  updatePanel(P, xMain[xMain.length-1]);
   redrawLevels(P);
 })();
 
@@ -1161,6 +1412,7 @@ infoModal.addEventListener('click', (e)=>{ if(e.target===infoModal) infoModal.cl
 HTML = (HTML
     .replace("__PLOT_HTML__", plot_html)
     .replace("__PRECOMP__", json.dumps(PRECOMP))
+    .replace("__TIME_PERIODS__", json.dumps(TIME_PERIODS))
     .replace("__GENESIS__", GENESIS_DATE.strftime("%Y-%m-%d"))
     .replace("__END_ISO__", END_PROJ.strftime("%Y-%m-%d"))
     .replace("__LAST_PRICE_ISO__", LAST_PRICE_ISO)
@@ -1177,7 +1429,7 @@ HTML = (HTML
     .replace("__LIQ_START_ISO__", LIQ_START_ISO)
     .replace("__W_P__", str(W_P))
     .replace("__W_LIQ__", str(W_LIQ))
-    .replace("__W_HALV__", str(W_HALV))   # fixed typo here
+    .replace("__W_HALV__", str(W_HALV))
 )
 
 # ───────────────────────────── Write site ─────────────────────────────
