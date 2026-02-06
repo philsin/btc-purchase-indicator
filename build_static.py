@@ -55,6 +55,29 @@ AUTO_DENOMS = {
 }
 UA = {"User-Agent":"btc-indicator/1.0"}
 
+# Smart caching: data older than this is considered stale and will be refreshed
+CACHE_MAX_AGE_HOURS = 12  # Refresh data every 12 hours
+
+def is_cache_stale(filepath, max_age_hours=CACHE_MAX_AGE_HOURS):
+    """Check if a cached file is older than max_age_hours."""
+    if not os.path.exists(filepath):
+        return True
+    file_mtime = os.path.getmtime(filepath)
+    age_hours = (datetime.now().timestamp() - file_mtime) / 3600
+    return age_hours > max_age_hours
+
+def data_needs_update(filepath, df=None):
+    """Check if data file is stale OR if the last data point is old."""
+    if is_cache_stale(filepath):
+        return True
+    # Also check if the data itself is outdated (last row is old)
+    if df is not None and "date" in df.columns:
+        last_date = pd.to_datetime(df["date"]).max()
+        days_old = (datetime.now() - last_date.to_pydatetime().replace(tzinfo=None)).days
+        if days_old > 2:  # Data is more than 2 days old
+            return True
+    return False
+
 # ───────────────────── Time Periods (for zoom presets) ─────────────────────
 # Cycle dates based on halving schedule
 CYCLE_1_START = "2009-01-03"  # Genesis
@@ -84,11 +107,8 @@ def years_since_genesis(dates):
     delta_days = (d - GENESIS_DATE) / np.timedelta64(1, "D")
     return (delta_days.astype(float) / 365.25) + (1.0/365.25)
 
-def fetch_btc_csv() -> pd.DataFrame:
-    os.makedirs(DATA_DIR, exist_ok=True)
-    if os.path.exists(BTC_FILE):
-        df = pd.read_csv(BTC_FILE, parse_dates=["date"])
-        return df.sort_values("date").dropna()
+def _fetch_btc_from_api() -> pd.DataFrame:
+    """Fetch BTC price data from blockchain.info API."""
     url = "https://api.blockchain.info/charts/market-price?timespan=all&format=csv&sampled=false"
     r = requests.get(url, timeout=30, headers=UA); r.raise_for_status()
     raw = r.text.strip()
@@ -101,7 +121,60 @@ def fetch_btc_csv() -> pd.DataFrame:
         df = pd.read_csv(io.StringIO(raw), header=None, names=["date","price"])
     df["date"] = pd.to_datetime(df["date"], utc=True).dt.tz_localize(None)
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
-    df = df.sort_values("date").dropna()
+    return df.sort_values("date").dropna()
+
+def _fetch_btc_from_coingecko() -> pd.DataFrame:
+    """Fallback: Fetch BTC price data from CoinGecko API."""
+    url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=max"
+    r = requests.get(url, timeout=30, headers=UA); r.raise_for_status()
+    js = r.json()
+    rows = js.get("prices") or []
+    if not rows: raise ValueError("CoinGecko returned no BTC data")
+    df = pd.DataFrame(rows, columns=["ms", "price"])
+    df["date"] = pd.to_datetime(df["ms"], unit="ms").dt.normalize()
+    out = df[["date","price"]].sort_values("date").dropna()
+    # CoinGecko can have multiple entries per day, take the last one
+    out = out.groupby("date", as_index=False).last()
+    return out
+
+def fetch_btc_csv() -> pd.DataFrame:
+    """
+    Fetch BTC/USD price data with smart caching.
+    - Returns cached data if fresh (< CACHE_MAX_AGE_HOURS old)
+    - Refreshes from API if cache is stale or data is outdated
+    - Falls back to CoinGecko if primary source fails
+    """
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+    # Check if we have fresh cached data
+    if os.path.exists(BTC_FILE):
+        df = pd.read_csv(BTC_FILE, parse_dates=["date"])
+        df = df.sort_values("date").dropna()
+        if not data_needs_update(BTC_FILE, df):
+            print(f"[cache] Using cached BTC data (last: {df['date'].max().date()})")
+            return df
+        print(f"[cache] BTC data is stale, refreshing...")
+
+    # Fetch fresh data
+    df = None
+    for fetch_fn, name in [(_fetch_btc_from_api, "blockchain.info"),
+                           (_fetch_btc_from_coingecko, "CoinGecko")]:
+        try:
+            df = fetch_fn()
+            if df is not None and not df.empty:
+                print(f"[fetch] Got {len(df)} rows from {name} (last: {df['date'].max().date()})")
+                break
+        except Exception as e:
+            print(f"[warn] {name} failed: {e}")
+            df = None
+
+    if df is None or df.empty:
+        # Last resort: use cached file even if stale
+        if os.path.exists(BTC_FILE):
+            print("[warn] All APIs failed, using stale cache")
+            return pd.read_csv(BTC_FILE, parse_dates=["date"]).sort_values("date").dropna()
+        raise ValueError("Could not fetch BTC data from any source")
+
     df.to_csv(BTC_FILE, index=False)
     return df
 
@@ -165,10 +238,28 @@ def _fetch_eth_from_binance() -> pd.DataFrame:
     return df[["date","price"]].sort_values("date").dropna()
 
 def ensure_auto_denominators():
+    """
+    Ensure denominator data files exist and are fresh.
+    Uses smart caching - refreshes if file is stale (> CACHE_MAX_AGE_HOURS old).
+    """
     os.makedirs(DATA_DIR, exist_ok=True)
     for key, info in AUTO_DENOMS.items():
         path = info["path"]
-        if os.path.exists(path): continue
+
+        # Check if we need to fetch (missing or stale)
+        needs_fetch = not os.path.exists(path) or is_cache_stale(path)
+        if not needs_fetch:
+            try:
+                df = pd.read_csv(path, parse_dates=["date"])
+                needs_fetch = data_needs_update(path, df)
+                if not needs_fetch:
+                    continue  # Cache is fresh
+            except Exception:
+                needs_fetch = True
+
+        if needs_fetch:
+            print(f"[cache] {key} data needs refresh...")
+
         try:
             if key == "ETH":
                 df=None
@@ -176,15 +267,19 @@ def ensure_auto_denominators():
                            _fetch_eth_from_cryptocompare, _fetch_eth_from_binance):
                     try:
                         df = fn()
-                        if df is not None and not df.empty: break
+                        if df is not None and not df.empty:
+                            print(f"[fetch] Got {len(df)} rows for ETH")
+                            break
                     except Exception:
                         df = None
                 if df is None or df.empty: raise ValueError("ETH fetchers returned no data")
             else:
                 df = _fetch_stooq_csv(info["url"]) if info["parser"]=="stooq" else None
+                if df is not None and not df.empty:
+                    print(f"[fetch] Got {len(df)} rows for {key}")
             if df is None or df.empty: raise ValueError(f"{key} returned no data")
             df.to_csv(path, index=False)
-            print(f"[auto-denom] wrote {path} ({len(df)} rows)")
+            print(f"[auto-denom] wrote {path} ({len(df)} rows, last: {df['date'].max().date()})")
         except Exception as e:
             print(f"[warn] could not fetch {key}: {e}")
 
@@ -1182,21 +1277,32 @@ plotDiv.on('plotly_hover', ev=>{
 });
 
 // Date lock
-datePick.value = LAST_PRICE_ISO;
+// Initialize date picker to actual today (user's local date)
+function getTodayISO(){
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+datePick.value = getTodayISO();
+datePick.max = getTodayISO();  // Can't select future dates
+
 btnSet.addEventListener('click',()=>{
   if(!datePick.value) return;
   const P=PRECOMP[denomSel.value];
-  const y = yearsFromISO(datePick.value);
-  updatePanel(P, y);
+  const xVal = isoToX(datePick.value);
+  updatePanel(P, xVal);
 });
 datePick.addEventListener('keydown',(e)=>{
   if(e.key==='Enter'){ e.preventDefault(); btnSet.click(); }
 });
 btnToday.addEventListener('click',()=>{
   const P=PRECOMP[denomSel.value];
-  datePick.value = LAST_PRICE_ISO;
+  const today = getTodayISO();
+  datePick.value = today;
+  // Use actual today or latest data point, whichever is earlier
+  const todayX = isoToX(today);
   const xMain = getXMain(P);
-  updatePanel(P, xMain[xMain.length-1]);
+  const lastDataX = xMain[xMain.length-1];
+  updatePanel(P, Math.min(todayX, lastDataX));
 });
 
 // ───────── X-Axis mode switching ─────────
