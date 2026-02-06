@@ -63,14 +63,12 @@ CYCLE_4_START = "2020-05-11"  # 3rd halving
 CYCLE_5_START = "2024-04-20"  # 4th halving
 
 TIME_PERIODS = {
-    "full": {"label": "Full History", "start": "2009-01-03"},
-    "cycle4": {"label": "Cycle 4 (2020-2024)", "start": CYCLE_4_START, "end": CYCLE_5_START},
-    "cycle5": {"label": "Cycle 5 (2024+)", "start": CYCLE_5_START},
-    "modern": {"label": "Modern Era (2017+)", "start": "2017-01-01"},
-    "recent": {"label": "Recent (2020+)", "start": "2020-01-01"},
-    "1y": {"label": "Last Year", "days_back": 365},
-    "6m": {"label": "Last 6 Months", "days_back": 183},
-    "3m": {"label": "Last 3 Months", "days_back": 91},
+    "all": {"label": "All Data", "start": "2009-01-03"},
+    "10y": {"label": "Last 10 Years", "days_back": 3652},
+    "5y": {"label": "Last 5 Years", "days_back": 1826},
+    "2y": {"label": "Last 2 Years", "days_back": 730},
+    "1y": {"label": "Last 1 Year", "days_back": 365},
+    "cycle": {"label": "Current Cycle", "start": CYCLE_5_START},
 }
 
 # ───────────────────── Helpers / fetchers ─────────────────────
@@ -310,6 +308,23 @@ def build_payload(df, denom_key=None):
     # Also fit in days-space for display
     support_days = build_support_constant_rails(xs_days, ys)
 
+    # Build OHLC for different candle intervals
+    y_col = "price" if denom_key is None else f"price_{denom_key.lower()}"
+    if y_col not in df.columns:
+        y_col = "price"
+
+    # Weekly OHLC
+    ohlc_w = resample_ohlc(df.copy(), y_col, 'W')
+    ohlc_w['x_years'] = years_since_genesis(ohlc_w['date'])
+    ohlc_w['x_days'] = days_since_genesis(ohlc_w['date'])
+    ohlc_w['date_iso'] = ohlc_w['date'].dt.strftime('%Y-%m-%d')
+
+    # Monthly OHLC
+    ohlc_m = resample_ohlc(df.copy(), y_col, 'ME')
+    ohlc_m['x_years'] = years_since_genesis(ohlc_m['date'])
+    ohlc_m['x_days'] = days_since_genesis(ohlc_m['date'])
+    ohlc_m['date_iso'] = ohlc_m['date'].dt.strftime('%Y-%m-%d')
+
     return {
         "label": label, "unit": unit, "decimals": decimals,
         "x_main": xs_years.tolist(), "y_main": ys.tolist(),
@@ -318,7 +333,27 @@ def build_payload(df, denom_key=None):
         "x_grid": x_grid.tolist(),
         "x_grid_days": x_grid_days.tolist(),
         "support": support,
-        "support_days": support_days
+        "support_days": support_days,
+        # Weekly candles
+        "ohlc_w": {
+            "x_years": ohlc_w["x_years"].tolist(),
+            "x_days": ohlc_w["x_days"].tolist(),
+            "date_iso": ohlc_w["date_iso"].tolist(),
+            "open": ohlc_w["open"].tolist(),
+            "high": ohlc_w["high"].tolist(),
+            "low": ohlc_w["low"].tolist(),
+            "close": ohlc_w["close"].tolist()
+        },
+        # Monthly candles
+        "ohlc_m": {
+            "x_years": ohlc_m["x_years"].tolist(),
+            "x_days": ohlc_m["x_days"].tolist(),
+            "date_iso": ohlc_m["date_iso"].tolist(),
+            "open": ohlc_m["open"].tolist(),
+            "high": ohlc_m["high"].tolist(),
+            "low": ohlc_m["low"].tolist(),
+            "close": ohlc_m["close"].tolist()
+        }
     }
 
 PRECOMP = {"USD": build_payload(base, None)}
@@ -487,18 +522,22 @@ input:focus{outline:none;border-color:#3b82f6;box-shadow:0 0 0 2px rgba(59,130,2
     <div class="topbar-controls">
       <select id="denomSel" title="Denominator"></select>
       <select id="periodSel" title="Time Period">
-        <option value="full">Full History</option>
-        <option value="cycle4">Cycle 4</option>
-        <option value="cycle5">Cycle 5</option>
-        <option value="modern">Modern (2017+)</option>
-        <option value="recent">Recent (2020+)</option>
-        <option value="1y">1 Year</option>
-        <option value="6m">6 Months</option>
-        <option value="3m">3 Months</option>
+        <option value="all">All Data</option>
+        <option value="10y">Last 10 Years</option>
+        <option value="5y">Last 5 Years</option>
+        <option value="2y">Last 2 Years</option>
+        <option value="1y">Last 1 Year</option>
+        <option value="cycle">Current Cycle</option>
       </select>
       <select id="xAxisSel" title="X-Axis Mode">
-        <option value="years">Years</option>
-        <option value="days">Days</option>
+        <option value="days">Days Since Genesis</option>
+        <option value="years">Years Since Genesis</option>
+        <option value="date">Calendar Date</option>
+      </select>
+      <select id="candleSel" title="Candle Interval">
+        <option value="D">Daily</option>
+        <option value="W">Weekly</option>
+        <option value="M">Monthly</option>
       </select>
       <button id="halvingsBtn" class="btn" title="Toggle halvings">Halvings</button>
       <button id="liquidityBtn" class="btn" title="Toggle liquidity cycle">Liquidity</button>
@@ -666,7 +705,8 @@ const W_LIQ = __W_LIQ__;
 const W_HALV= __W_HALV__;
 
 // X-axis mode: 'years' or 'days'
-let xAxisMode = 'years';
+let xAxisMode = 'days';
+let candleMode = 'D';  // D=daily, W=weekly, M=monthly
 
 const MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 function yearsFromISO(iso){ const d=new Date(iso+'T00:00:00Z'); return ((d-GENESIS)/86400000)/365.25 + (1.0/365.25); }
@@ -675,6 +715,9 @@ function shortDateFromYears(y){ const ms=(y-(1.0/365.25))*365.25*86400000; const
 function shortDateFromDays(days){ const ms=(days-1)*86400000; const d=new Date(GENESIS.getTime()+ms); return `${MONTHS[d.getUTCMonth()]}-${String(d.getUTCDate()).padStart(2,'0')}-${String(d.getUTCFullYear()).slice(-2)}`; }
 function isoFromYears(y){ const ms=(y-(1.0/365.25))*365.25*86400000; const d=new Date(GENESIS.getTime()+ms); return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`; }
 function isoFromDays(days){ const ms=(days-1)*86400000; const d=new Date(GENESIS.getTime()+ms); return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`; }
+function timestampFromISO(iso){ return new Date(iso+'T00:00:00Z').getTime(); }
+function isoFromTimestamp(ts){ const d=new Date(ts); return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`; }
+function shortDateFromTimestamp(ts){ const d=new Date(ts); return `${MONTHS[d.getUTCMonth()]}-${String(d.getUTCDate()).padStart(2,'0')}-${String(d.getUTCFullYear()).slice(-2)}`; }
 function interp(xs, ys, x){ let lo=0,hi=xs.length-1; if(x<=xs[0]) return ys[0]; if(x>=xs[hi]) return ys[hi];
   while(hi-lo>1){ const m=(hi+lo)>>1; if(xs[m]<=x) lo=m; else hi=m; }
   const t=(x-xs[lo])/(xs[hi]-xs[lo]); return ys[lo]+t*(ys[hi]-ys[lo]); }
@@ -683,12 +726,38 @@ function daysBetweenISO(a,b){ return Math.round((new Date(b+'T00:00:00Z') - new 
 function monthsBetweenISO(a,b){ return (new Date(b+'T00:00:00Z') - new Date(a+'T00:00:00Z'))/(86400000*30.4375); }
 
 // Get x-values based on current mode
-function getXMain(P){ return xAxisMode==='days' ? P.x_days : P.x_main; }
+function getXMain(P){
+  // For candle modes, use OHLC data
+  if(candleMode==='W' && P.ohlc_w) return xAxisMode==='days' ? P.ohlc_w.x_days : (xAxisMode==='years' ? P.ohlc_w.x_years : P.ohlc_w.date_iso.map(timestampFromISO));
+  if(candleMode==='M' && P.ohlc_m) return xAxisMode==='days' ? P.ohlc_m.x_days : (xAxisMode==='years' ? P.ohlc_m.x_years : P.ohlc_m.date_iso.map(timestampFromISO));
+  // Daily
+  if(xAxisMode==='date') return P.date_iso_main.map(timestampFromISO);
+  return xAxisMode==='days' ? P.x_days : P.x_main;
+}
+function getYMain(P){
+  if(candleMode==='W' && P.ohlc_w) return P.ohlc_w.close;
+  if(candleMode==='M' && P.ohlc_m) return P.ohlc_m.close;
+  return P.y_main;
+}
+function getOHLC(P){
+  if(candleMode==='W' && P.ohlc_w) return P.ohlc_w;
+  if(candleMode==='M' && P.ohlc_m) return P.ohlc_m;
+  return null;
+}
 function getXGrid(P){ return xAxisMode==='days' ? P.x_grid_days : P.x_grid; }
 function getSupport(P){ return xAxisMode==='days' ? P.support_days : P.support; }
-function xToISO(x){ return xAxisMode==='days' ? isoFromDays(x) : isoFromYears(x); }
-function xToShortDate(x){ return xAxisMode==='days' ? shortDateFromDays(x) : shortDateFromYears(x); }
-function isoToX(iso){ return xAxisMode==='days' ? daysFromISO(iso) : yearsFromISO(iso); }
+function xToISO(x){
+  if(xAxisMode==='date') return isoFromTimestamp(x);
+  return xAxisMode==='days' ? isoFromDays(x) : isoFromYears(x);
+}
+function xToShortDate(x){
+  if(xAxisMode==='date') return shortDateFromTimestamp(x);
+  return xAxisMode==='days' ? shortDateFromDays(x) : shortDateFromYears(x);
+}
+function isoToX(iso){
+  if(xAxisMode==='date') return timestampFromISO(iso);
+  return xAxisMode==='days' ? daysFromISO(iso) : yearsFromISO(iso);
+}
 
 // Prediction signal based on oscillator thresholds (Burger's oscillator zones)
 function getPredictionSignal(osc, p){
@@ -750,6 +819,7 @@ const elComp=document.getElementById('compLine');
 const chartWpx=document.getElementById('chartWpx');
 const periodSel=document.getElementById('periodSel');
 const xAxisSel=document.getElementById('xAxisSel');
+const candleSel=document.getElementById('candleSel');
 const predSignal=document.getElementById('predSignal');
 const predReason=document.getElementById('predReason');
 const predBox=document.getElementById('predictionBox');
@@ -995,19 +1065,20 @@ function computeSeriesForMask(P){
 }
 function applyIndicatorMask(P){
   const xMain = getXMain(P);
+  const yMain = getYMain(P);
   if (!selectedIndicators || selectedIndicators.length===0){
-    Plotly.restyle(plotDiv, {x:[xMain], y:[P.y_main], name:[P.label]}, [IDX_MAIN]);
-    Plotly.restyle(plotDiv, {x:[xMain], y:[P.y_main]},                [IDX_CLICK]);
+    Plotly.restyle(plotDiv, {x:[xMain], y:[yMain], name:[P.label]}, [IDX_MAIN]);
+    Plotly.restyle(plotDiv, {x:[xMain], y:[yMain]},                [IDX_CLICK]);
   } else {
     computeSeriesForMask(P);
     const set=new Set(selectedIndicators);
-    const ym = P.y_main.map((v,i)=> set.has(P._classSeries[i]) ? v : null);
+    const ym = yMain.map((v,i)=> set.has(P._classSeries[i]) ? v : null);
     const nm = P.label+' \u2014 '+Array.from(set).join(' + ');
     Plotly.restyle(plotDiv, {x:[xMain], y:[ym], name:[nm]}, [IDX_MAIN]);
     Plotly.restyle(plotDiv, {x:[xMain], y:[ym]},            [IDX_CLICK]);
   }
   const tt = (P.unit === '$') ? '%{customdata}<br>$%{y:.2f}<extra></extra>' : '%{customdata}<br>%{y:.6f}<extra></extra>';
-  Plotly.restyle(plotDiv, {x:[xMain], y:[P.y_main], customdata:[P.date_iso_main], hovertemplate:[tt], line:[{width:0}]}, [IDX_TT]);
+  Plotly.restyle(plotDiv, {x:[xMain], y:[yMain], customdata:[P.date_iso_main], hovertemplate:[tt], line:[{width:0}]}, [IDX_TT]);
 }
 
 // Panel update (future uses 50% for main value; p hidden)
@@ -1038,8 +1109,9 @@ function updatePanel(P, xVal){
     usedP = 50;
     logDev = 0;
   } else {
+    const yMain = getYMain(P);
     let idx=0,best=1e99; for(let i=0;i<xMain.length;i++){ const d=Math.abs(xMain[i]-xVal); if(d<best){best=d; idx=i;} }
-    const y=P.y_main[idx]; mainTxt = fmtVal(P,y);
+    const y=yMain[idx]; mainTxt = fmtVal(P,y);
     const sup=getSupport(P), z=Math.log10(xMain[idx]);
     logDev = Math.log10(y) - (sup.a0 + sup.b*z);
     const off = logDev;
@@ -1106,12 +1178,32 @@ function fullRedraw(){
   const P = PRECOMP[denomSel.value];
   delete P._classSeries; delete P._pSeries; delete P._scoreSeries;
   const xMain = getXMain(P);
+  const yMain = getYMain(P);
   const xg = getXGrid(P);
-  const xLabel = xAxisMode==='days' ? 'Log\u2081\u2080 Days from Genesis' : 'Log\u2081\u2080 Years from Genesis';
-  Plotly.restyle(plotDiv,{x:[xMain], y:[P.y_main], name:[P.label]}, [IDX_MAIN]);
-  Plotly.restyle(plotDiv,{x:[xMain], y:[P.y_main]},                 [IDX_CLICK]);
-  Plotly.restyle(plotDiv,{x:[xg], y:[seriesForPercent(P,50)]},      [IDX_CARRY]);
-  Plotly.relayout(plotDiv,{'xaxis.title': xLabel, 'yaxis.title':P.label, 'xaxis.autorange':true, 'yaxis.autorange':true});
+
+  // Axis labels and type based on mode
+  let xLabel, xType;
+  if(xAxisMode==='date'){
+    xLabel = 'Date';
+    xType = 'date';
+  } else if(xAxisMode==='days'){
+    xLabel = 'Log\u2081\u2080 Days from Genesis';
+    xType = 'log';
+  } else {
+    xLabel = 'Log\u2081\u2080 Years from Genesis';
+    xType = 'log';
+  }
+
+  Plotly.restyle(plotDiv,{x:[xMain], y:[yMain], name:[P.label]}, [IDX_MAIN]);
+  Plotly.restyle(plotDiv,{x:[xMain], y:[yMain]},                 [IDX_CLICK]);
+  Plotly.restyle(plotDiv,{x:[xg], y:[seriesForPercent(P,50)]},   [IDX_CARRY]);
+  Plotly.relayout(plotDiv,{
+    'xaxis.title': xLabel,
+    'xaxis.type': xType,
+    'yaxis.title': P.label,
+    'xaxis.autorange': true,
+    'yaxis.autorange': true
+  });
   renderRails(P); applyIndicatorMask(P);
   redrawLevels(P); redrawTrendLines();
   updatePanel(P, xMain[xMain.length-1]);
@@ -1119,6 +1211,11 @@ function fullRedraw(){
 
 xAxisSel.addEventListener('change',()=>{
   xAxisMode = xAxisSel.value;
+  fullRedraw();
+});
+
+candleSel.addEventListener('change',()=>{
+  candleMode = candleSel.value;
   fullRedraw();
 });
 
@@ -1136,10 +1233,13 @@ periodSel.addEventListener('change',()=>{
     xlo = isoToX(isoStart);
   } else {
     xlo = isoToX(per.start);
-    xhi = per.end ? isoToX(per.end) : (key==='full' ? undefined : xMain[xMain.length-1] * 1.05);
+    xhi = per.end ? isoToX(per.end) : (key==='all' ? undefined : xMain[xMain.length-1] * 1.05);
   }
-  if (key==='full'){
+  if (key==='all'){
     Plotly.relayout(plotDiv,{'xaxis.autorange':true,'yaxis.autorange':true});
+  } else if (xAxisMode==='date') {
+    // For calendar date mode, use timestamps directly
+    Plotly.relayout(plotDiv,{'xaxis.range':[xlo, xhi], 'yaxis.autorange':true});
   } else {
     Plotly.relayout(plotDiv,{'xaxis.range':[Math.log10(Math.max(1e-6,xlo)), Math.log10(xhi)], 'yaxis.autorange':true});
   }
@@ -1356,11 +1456,12 @@ function syncAll(){
   rebuildReadoutRows(); rebuildEditor();
   const P=PRECOMP['USD'];
   const xMain = getXMain(P);
+  const yMain = getYMain(P);
   const xg = getXGrid(P);
   renderRails(P); applyIndicatorMask(P);
   Plotly.restyle(plotDiv,{x:[xg], y:[seriesForPercent(P,50)]},[IDX_CARRY]);
   const tt='%{customdata}<br>$%{y:.2f}<extra></extra>';
-  Plotly.restyle(plotDiv,{x:[xMain], y:[P.y_main], customdata:[P.date_iso_main], hovertemplate:[tt], line:[{width:0}]},[IDX_TT]);
+  Plotly.restyle(plotDiv,{x:[xMain], y:[yMain], customdata:[P.date_iso_main], hovertemplate:[tt], line:[{width:0}]},[IDX_TT]);
   updatePanel(P, xMain[xMain.length-1]);
   redrawLevels(P);
 })();
@@ -1369,12 +1470,13 @@ function syncAll(){
 let halvingsOn=false;
 function makeHalvingShapes(){
   const shapes=[];
-  function lineAt(xYears, dashed){
-    return {type:'line', xref:'x', yref:'paper', x0:xYears, x1:xYears, y0:0, y1:1,
+  function lineAt(iso, dashed){
+    const xVal = isoToX(iso);
+    return {type:'line', xref:'x', yref:'paper', x0:xVal, x1:xVal, y0:0, y1:1,
             line:{color:'#9CA3AF', width:1.2, dash:(dashed?'dash':'solid')}, layer:'below', meta:'halving'};
   }
-  PAST_HALVINGS.forEach(iso=>{ shapes.push(lineAt(yearsFromISO(iso), false)); });
-  FUTURE_HALVINGS.forEach(iso=>{ shapes.push(lineAt(yearsFromISO(iso), true)); });
+  PAST_HALVINGS.forEach(iso=>{ shapes.push(lineAt(iso, false)); });
+  FUTURE_HALVINGS.forEach(iso=>{ shapes.push(lineAt(iso, true)); });
   return shapes;
 }
 btnHalvings.onclick=()=>{ halvingsOn=!halvingsOn;
@@ -1420,8 +1522,9 @@ function makeLiquidityShapes(){
 
   function vline(iso, color){
     const dashed = compareISO(iso, lastIso) > 0;
+    const xVal = isoToX(iso);
     return { type:'line', xref:'x', yref:'paper',
-      x0: yearsFromISO(iso), x1: yearsFromISO(iso), y0:0, y1:1,
+      x0: xVal, x1: xVal, y0:0, y1:1,
       line:{color:color, width:1.4, dash: dashed ? 'dash' : 'solid'},
       layer:'below', meta:'liquidity' };
   }
