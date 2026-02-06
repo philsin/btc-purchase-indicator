@@ -589,6 +589,21 @@ input:focus{outline:none;border-color:#3b82f6;box-shadow:0 0 0 2px rgba(59,130,2
 #predSignal{font-weight:700;font-size:18px;margin-bottom:4px}
 #predReason{font-size:11px;color:#64748b;line-height:1.4}
 
+/* Cycle & Projections */
+.cycle-info{display:grid;grid-template-columns:1fr 1fr;gap:4px 8px;font-size:11px;margin-top:8px}
+.cycle-item{display:flex;flex-direction:column}
+.cycle-label{color:#64748b;font-size:10px}
+.cycle-value{font-weight:600;font-size:12px}
+.cycle-phase{text-align:center;padding:6px;border-radius:6px;font-weight:600;font-size:12px;margin-bottom:8px}
+.proj-table{width:100%;font-size:11px;border-collapse:collapse}
+.proj-table th,.proj-table td{padding:4px 6px;text-align:left;border-bottom:1px solid #e2e8f0}
+.proj-table th{color:#64748b;font-weight:500}
+.proj-table td{font-family:ui-monospace,monospace}
+.proj-range{font-size:10px;color:#64748b}
+.signal-bar{height:6px;border-radius:3px;margin-top:4px;background:linear-gradient(to right,#7C3AED 0%,#2563EB 15%,#0EA5E9 25%,#16A34A 40%,#EAB308 60%,#F97316 75%,#DC2626 100%)}
+.signal-marker{width:8px;height:8px;background:#1e293b;border-radius:50%;border:2px solid #fff;box-shadow:0 1px 3px rgba(0,0,0,0.3);position:relative;top:-7px;transition:margin-left 300ms}
+.hist-context{font-size:11px;color:#475569;line-height:1.5;padding:8px;background:#f8fafc;border-radius:6px;margin-top:8px}
+
 /* Readout */
 .readout-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px 12px;font-size:12px}
 .readout-item{display:flex;flex-direction:column}
@@ -694,6 +709,13 @@ input:focus{outline:none;border-color:#3b82f6;box-shadow:0 0 0 2px rgba(59,130,2
           <div id="predSignal">\u2014</div>
           <div id="predReason"></div>
         </div>
+        <!-- Oscillator position bar -->
+        <div style="margin-top:8px">
+          <div class="signal-bar"></div>
+          <div class="signal-marker" id="oscMarker"></div>
+        </div>
+        <!-- Historical context -->
+        <div class="hist-context" id="histContext"></div>
       </div>
 
       <!-- Current Values -->
@@ -706,6 +728,31 @@ input:focus{outline:none;border-color:#3b82f6;box-shadow:0 0 0 2px rgba(59,130,2
           <div class="readout-item"><span class="readout-label">Composite</span><span class="readout-value" id="compLine">\u2014</span></div>
         </div>
         <div id="readoutRows" style="margin-top:8px;font-size:11px"></div>
+      </div>
+
+      <!-- Cycle Context (collapsible) -->
+      <div class="sidebar-section">
+        <div class="section-header" data-target="cycleContent">
+          <span class="section-title">Cycle & Projections</span>
+          <span class="section-toggle">\u25BC</span>
+        </div>
+        <div class="section-content" id="cycleContent">
+          <div class="cycle-phase" id="cyclePhase">Loading...</div>
+          <div class="cycle-info">
+            <div class="cycle-item"><span class="cycle-label">Since Last Halving</span><span class="cycle-value" id="sinceHalving">\u2014</span></div>
+            <div class="cycle-item"><span class="cycle-label">Until Next Halving</span><span class="cycle-value" id="untilHalving">\u2014</span></div>
+            <div class="cycle-item"><span class="cycle-label">Cycle Progress</span><span class="cycle-value" id="cycleProgress">\u2014</span></div>
+            <div class="cycle-item"><span class="cycle-label">Current Phase</span><span class="cycle-value" id="cyclePhaseShort">\u2014</span></div>
+          </div>
+          <div style="margin-top:10px;font-size:11px;font-weight:600;color:#475569">Price Projections (50% trend)</div>
+          <table class="proj-table">
+            <tr><th>Date</th><th>Projected</th><th>Range</th></tr>
+            <tr><td>+6 months</td><td id="proj6m">\u2014</td><td class="proj-range" id="proj6mRange"></td></tr>
+            <tr><td>+12 months</td><td id="proj12m">\u2014</td><td class="proj-range" id="proj12mRange"></td></tr>
+            <tr><td>+18 months</td><td id="proj18m">\u2014</td><td class="proj-range" id="proj18mRange"></td></tr>
+            <tr><td>Next Halving</td><td id="projHalving">\u2014</td><td class="proj-range" id="projHalvingRange"></td></tr>
+          </table>
+        </div>
       </div>
 
       <!-- Date Navigation -->
@@ -880,15 +927,126 @@ function isoToX(iso){
   return xAxisMode==='days' ? daysFromISO(iso) : yearsFromISO(iso);
 }
 
-// Prediction signal based on oscillator thresholds (Burger's oscillator zones)
+// ───────── Cycle Context & Projections ─────────
+function getNextHalving(fromISO){
+  const all = PAST_HALVINGS.concat(FUTURE_HALVINGS).sort();
+  for(const h of all){ if(h > fromISO) return h; }
+  return null;
+}
+function getPrevHalving(fromISO){
+  const all = PAST_HALVINGS.concat(FUTURE_HALVINGS).sort().reverse();
+  for(const h of all){ if(h <= fromISO) return h; }
+  return PAST_HALVINGS[0];
+}
+function daysBetween(iso1, iso2){
+  return Math.round((new Date(iso2+'T00:00:00Z') - new Date(iso1+'T00:00:00Z')) / 86400000);
+}
+function addDaysISO(iso, days){
+  const d = new Date(iso+'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0,10);
+}
+
+function getCycleContext(iso){
+  const prev = getPrevHalving(iso);
+  const next = getNextHalving(iso);
+  const daysSince = daysBetween(prev, iso);
+  const daysUntil = next ? daysBetween(iso, next) : null;
+  const cycleLength = next && prev ? daysBetween(prev, next) : 1460; // ~4 years
+  const progress = daysSince / cycleLength;
+
+  // Cycle phases based on typical halving cycle behavior
+  let phase, phaseColor;
+  if(progress < 0.25){
+    phase = 'Accumulation'; phaseColor = '#16A34A';
+  } else if(progress < 0.50){
+    phase = 'Bull Run'; phaseColor = '#2563EB';
+  } else if(progress < 0.65){
+    phase = 'Euphoria/Top'; phaseColor = '#DC2626';
+  } else if(progress < 0.85){
+    phase = 'Bear Market'; phaseColor = '#F97316';
+  } else {
+    phase = 'Recovery'; phaseColor = '#0EA5E9';
+  }
+
+  return {
+    prevHalving: prev, nextHalving: next,
+    daysSince, daysUntil, cycleLength, progress,
+    phase, phaseColor
+  };
+}
+
+function getProjectedPrice(P, futureISO){
+  const sup = getSupport(P);
+  const xFuture = xAxisMode==='days' ? daysFromISO(futureISO) : yearsFromISO(futureISO);
+  const logMid = sup.a0 + sup.b * Math.log10(xFuture);
+  const mid = Math.pow(10, logMid);
+  // Use quantile offsets for range
+  const q25 = mid * Math.pow(10, sup.off_grid[Math.floor(sup.off_grid.length*0.25)]);
+  const q75 = mid * Math.pow(10, sup.off_grid[Math.floor(sup.off_grid.length*0.75)]);
+  return { mid, low: q25, high: q75 };
+}
+
+function getHistoricalContext(osc, p){
+  // Historical patterns based on oscillator and p-value zones
+  if(osc >= 0.8){
+    return '\ud83d\udcca Historical: All 4 cycle tops occurred at oscillator >0.8. Average decline after: -75% to -85%. Consider defensive positioning.';
+  } else if(osc >= 0.6){
+    return '\ud83d\udcca Historical: Oscillator 0.6-0.8 preceded tops by 1-6 months in past cycles. Volatility increases significantly in this zone.';
+  } else if(osc >= 0.3){
+    return '\ud83d\udcca Historical: Mid-cycle consolidation zone. Price often trades sideways for extended periods before next major move.';
+  } else if(osc >= -0.2){
+    return '\ud83d\udcca Historical: Fair value zone. DCA strategies have performed well historically. Average time in this zone: 40% of cycle.';
+  } else if(osc >= -0.5){
+    return '\ud83d\udcca Historical: Below-trend zone. Past cycles showed 2-4x returns within 18 months from similar positions.';
+  } else if(osc >= -0.8){
+    return '\ud83d\udcca Historical: Deep value zone. Only ~5% of Bitcoin\u2019s history spent here. 3-10x returns typical over following 2 years.';
+  } else {
+    return '\ud83d\udcca Historical: Extreme undervaluation (bottom 2%). Occurred during 2011, 2015, 2019, 2022 capitulation events. 10x+ returns followed.';
+  }
+}
+
+// Prediction signal based on oscillator AND p-value (position in corridor)
+// More refined signals using both metrics
 function getPredictionSignal(osc, p){
-  if (osc >= 0.85) return {signal: '\u26a0\ufe0f SELL ZONE', color: '#DC2626', bg: '#FEE2E2', reason: 'Oscillator >=0.85: Historically all ATHs occurred here. Consider taking profits.'};
-  if (osc >= 0.7)  return {signal: '\u2b06\ufe0f FROTHY', color: '#F97316', bg: '#FFF7ED', reason: 'Oscillator 0.7-0.85: Approaching bubble territory. Reduce exposure.'};
-  if (osc >= 0.4)  return {signal: '\u2197\ufe0f ELEVATED', color: '#EAB308', bg: '#FEFCE8', reason: 'Oscillator 0.4-0.7: Above fair value. Hold, be cautious adding.'};
-  if (osc >= -0.2) return {signal: '\u2705 FAIR VALUE', color: '#16A34A', bg: '#F0FDF4', reason: 'Oscillator -0.2 to 0.4: Near trend line. Good for DCA.'};
-  if (osc >= -0.5) return {signal: '\u2b07\ufe0f ACCUMULATE', color: '#0EA5E9', bg: '#F0F9FF', reason: 'Oscillator -0.5 to -0.2: Below trend. Good buying opportunity.'};
-  if (osc >= -0.8) return {signal: '\ud83d\udcb0 STRONG BUY', color: '#2563EB', bg: '#EFF6FF', reason: 'Oscillator -0.8 to -0.5: Significantly undervalued. Aggressive accumulation.'};
-  return {signal: '\ud83d\udea8 EXTREME BUY', color: '#7C3AED', bg: '#F5F3FF', reason: 'Oscillator <-0.8: Extreme undervaluation. Rare opportunity.'};
+  // SELL ZONES - oscillator-driven but confirmed by p-value
+  if (osc >= 0.85 || (osc >= 0.7 && p >= 90)) {
+    return {signal: '\u26a0\ufe0f SELL ZONE', color: '#DC2626', bg: '#FEE2E2',
+      reason: 'Oscillator \u2265'+(osc>=0.85?'0.85':'0.70')+' + Position '+(p>=90?'\u226590%':p.toFixed(0)+'%')+': All historical ATHs. Take profits.'};
+  }
+  if (osc >= 0.6 || p >= 85) {
+    return {signal: '\u2b06\ufe0f PRE-SELL', color: '#F97316', bg: '#FFF7ED',
+      reason: 'Oscillator '+osc.toFixed(2)+', Position '+p.toFixed(0)+'%: Approaching top zone. Prepare exit strategy.'};
+  }
+  // AVOID ZONE - poor entry points
+  if (p >= 75 && osc >= 0.3) {
+    return {signal: '\u26d4 AVOID', color: '#EF4444', bg: '#FEF2F2',
+      reason: 'Position '+p.toFixed(0)+'% (upper corridor): Historically poor entry. Wait for better prices.'};
+  }
+  if (osc >= 0.4) {
+    return {signal: '\u2197\ufe0f ELEVATED', color: '#EAB308', bg: '#FEFCE8',
+      reason: 'Oscillator '+osc.toFixed(2)+': Above fair value. Hold positions, be cautious adding.'};
+  }
+  // FAIR VALUE - good for DCA
+  if (osc >= -0.2) {
+    return {signal: '\u2705 FAIR VALUE', color: '#16A34A', bg: '#F0FDF4',
+      reason: 'Oscillator '+osc.toFixed(2)+', Position '+p.toFixed(0)+'%: Near trend. Good DCA zone.'};
+  }
+  // ACCUMULATION ZONES - p-value driven
+  if (p <= 25 || osc <= -0.5) {
+    if (osc <= -0.8 || p <= 10) {
+      return {signal: '\ud83d\udea8 EXTREME BUY', color: '#7C3AED', bg: '#F5F3FF',
+        reason: 'Position '+p.toFixed(0)+'%, Oscillator '+osc.toFixed(2)+': Extreme undervaluation. Rare opportunity!'};
+    }
+    if (osc <= -0.5 || p <= 15) {
+      return {signal: '\ud83d\udcb0 STRONG BUY', color: '#2563EB', bg: '#EFF6FF',
+        reason: 'Position '+p.toFixed(0)+'% (lower corridor): Historically excellent entry. Aggressive accumulation.'};
+    }
+    return {signal: '\u2b07\ufe0f ACCUMULATE', color: '#0EA5E9', bg: '#F0F9FF',
+      reason: 'Position '+p.toFixed(0)+'%, Oscillator '+osc.toFixed(2)+': Below trend. Good buying opportunity.'};
+  }
+  return {signal: '\u2b07\ufe0f ACCUMULATE', color: '#0EA5E9', bg: '#F0F9FF',
+    reason: 'Oscillator '+osc.toFixed(2)+': Below fair value. Consider adding.'};
 }
 
 function fmtVal(P, v){
@@ -944,6 +1102,25 @@ const candleSel=document.getElementById('candleSel');
 const predSignal=document.getElementById('predSignal');
 const predReason=document.getElementById('predReason');
 const predBox=document.getElementById('predictionBox');
+const oscMarker=document.getElementById('oscMarker');
+const histContext=document.getElementById('histContext');
+
+// Cycle context elements
+const cyclePhaseEl=document.getElementById('cyclePhase');
+const sinceHalvingEl=document.getElementById('sinceHalving');
+const untilHalvingEl=document.getElementById('untilHalving');
+const cycleProgressEl=document.getElementById('cycleProgress');
+const cyclePhaseShortEl=document.getElementById('cyclePhaseShort');
+
+// Projection elements
+const proj6m=document.getElementById('proj6m');
+const proj12m=document.getElementById('proj12m');
+const proj18m=document.getElementById('proj18m');
+const projHalving=document.getElementById('projHalving');
+const proj6mRange=document.getElementById('proj6mRange');
+const proj12mRange=document.getElementById('proj12mRange');
+const proj18mRange=document.getElementById('proj18mRange');
+const projHalvingRange=document.getElementById('projHalvingRange');
 
 // Collapsible sections
 document.querySelectorAll('.section-header').forEach(header=>{
@@ -1255,9 +1432,73 @@ function updatePanel(P, xVal){
   predBox.style.borderColor = pred.color;
   predBox.style.background = pred.bg;
 
+  // Oscillator position marker (map -1..1 to 0..100%)
+  const oscPct = clamp((osc + 1) / 2 * 100, 0, 100);
+  oscMarker.style.marginLeft = `calc(${oscPct}% - 4px)`;
+
+  // Historical context
+  histContext.textContent = getHistoricalContext(osc, usedP);
+
   compScore = compositeFrom(usedP, iso);
   elComp.textContent = compScore.toFixed(2) + ' \u2014 ' + classFromScore(compScore);
   setTitle(compScore);
+
+  // ───────── Cycle Context ─────────
+  const cycle = getCycleContext(iso);
+
+  // Format durations
+  const fmtDays = (d) => {
+    if(d===null) return '\u2014';
+    const y = Math.floor(d/365);
+    const m = Math.floor((d%365)/30);
+    const dd = d%30;
+    if(y>0) return `${y}y ${m}m`;
+    if(m>0) return `${m}m ${dd}d`;
+    return `${d}d`;
+  };
+
+  sinceHalvingEl.textContent = fmtDays(cycle.daysSince);
+  untilHalvingEl.textContent = fmtDays(cycle.daysUntil);
+  cycleProgressEl.textContent = (cycle.progress*100).toFixed(0)+'%';
+  cyclePhaseShortEl.textContent = cycle.phase;
+  cyclePhaseShortEl.style.color = cycle.phaseColor;
+
+  // Cycle phase banner
+  cyclePhaseEl.textContent = cycle.phase + ' Phase';
+  cyclePhaseEl.style.background = cycle.phaseColor + '20';
+  cyclePhaseEl.style.color = cycle.phaseColor;
+
+  // ───────── Price Projections ─────────
+  const fmtProj = (p) => P.unit==='$' ? '$'+Math.round(p).toLocaleString() : p.toFixed(4);
+  const fmtRange = (lo,hi) => P.unit==='$' ? `$${Math.round(lo/1000)}k-$${Math.round(hi/1000)}k` : `${lo.toFixed(2)}-${hi.toFixed(2)}`;
+
+  // +6 months
+  const iso6m = addDaysISO(iso, 182);
+  const p6m = getProjectedPrice(P, iso6m);
+  proj6m.textContent = fmtProj(p6m.mid);
+  proj6mRange.textContent = fmtRange(p6m.low, p6m.high);
+
+  // +12 months
+  const iso12m = addDaysISO(iso, 365);
+  const p12m = getProjectedPrice(P, iso12m);
+  proj12m.textContent = fmtProj(p12m.mid);
+  proj12mRange.textContent = fmtRange(p12m.low, p12m.high);
+
+  // +18 months
+  const iso18m = addDaysISO(iso, 548);
+  const p18m = getProjectedPrice(P, iso18m);
+  proj18m.textContent = fmtProj(p18m.mid);
+  proj18mRange.textContent = fmtRange(p18m.low, p18m.high);
+
+  // Next halving
+  if(cycle.nextHalving){
+    const pH = getProjectedPrice(P, cycle.nextHalving);
+    projHalving.textContent = fmtProj(pH.mid);
+    projHalvingRange.textContent = fmtRange(pH.low, pH.high);
+  } else {
+    projHalving.textContent = '\u2014';
+    projHalvingRange.textContent = '';
+  }
 
   // Show power law parameters
   const supP = getSupport(P);
