@@ -8,7 +8,7 @@ info modal, and user-defined horizontal Level lines (per denominator).
 Writes: docs/index.html
 """
 
-import os, io, glob, json
+import os, io, glob, json, re
 from datetime import datetime
 import numpy as np
 import pandas as pd
@@ -1979,6 +1979,8 @@ HTML = (HTML
 
 # ───────────────────────────── Write site ─────────────────────────────
 os.makedirs(os.path.dirname(OUTPUT_HTML), exist_ok=True)
+# Remove any surrogate characters that can't be encoded to UTF-8
+HTML_clean = re.sub(r'[\ud800-\udfff]', '', HTML)
 with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
-    f.write(HTML)
+    f.write(HTML_clean)
 print("Wrote", OUTPUT_HTML)
