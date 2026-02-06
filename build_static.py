@@ -360,16 +360,16 @@ fig = go.Figure(traces)
 fig.update_layout(
     template="plotly_white",
     hovermode="x",
-    showlegend=True,
-    title="BTC Purchase Indicator",
+    showlegend=False,
+    title=None,
     xaxis=dict(type="log", title=None, tickmode="array",
                tickvals=xtickvals, ticktext=xticktext,
-               tickangle=45,
+               tickangle=0,
                range=[np.log10(x_start), np.log10(x_end)]),
     yaxis=dict(type="log", title=P0["label"],
                tickmode="array", tickvals=ytickvals, ticktext=yticktext),
-    legend=dict(x=1.02, xanchor="left", y=1.0, yanchor="top"),
-    margin=dict(l=70, r=420, t=70, b=70),
+    margin=dict(l=60, r=20, t=20, b=50),
+    autosize=True,
 )
 
 # Ensure double-click resets axes (desktop + iOS Safari)
@@ -389,103 +389,121 @@ HTML = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>BTC Purchase Indicator</title>
+<title>BTC Power Law Indicator</title>
 <style>
-:root{--panelW:420px;}
-html,body{height:100%} body{margin:0;font-family:Inter,system-ui,Segoe UI,Arial,sans-serif}
-.layout{display:flex;min-height:100vh;width:100vw}
-.left{flex:0 0 auto;width:1100px;min-width:280px;padding:8px 0 8px 8px}
-.left .js-plotly-plot,.left .plotly-graph-div{width:100%!important}
-.right{flex:0 0 var(--panelW);border-left:1px solid #e5e7eb;padding:12px;display:flex;flex-direction:column;gap:12px;overflow:auto}
-#controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding-bottom:8px;border-bottom:1px solid #e5e7eb}
-select,input[type=date],input[type=number]{font-size:14px;padding:8px 10px;border-radius:8px;border:1px solid #d1d5db;background:#fff}
-.btn{font-size:14px;padding:8px 10px;border-radius:8px;border:1px solid #d1d5db;background:#fff;cursor:pointer;transition:background 120ms, box-shadow 120ms, border-color 120ms;user-select:none}
-.btn:hover{background:#f3f4f6}
-.btn:active{background:#e5e7eb; box-shadow:inset 0 1px 2px rgba(0,0,0,0.08)}
-.btn.active{background:#1d4ed8;color:#fff;border-color:#1d4ed8}
-.btn.active:hover{background:#2563eb}
-#readout{border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#fafafa;font-size:14px}
-#readout .date{font-weight:700;margin-bottom:6px;font-size:15px}
-#readout .row{display:flex;justify-content:space-between;align-items:baseline;gap:8px;padding:2px 0}
-#readout .num{font-family:ui-monospace,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums;text-align:right;min-width:12ch;white-space:pre}
-#oscRow{padding:4px 0;margin:2px 0;border-radius:6px;transition:background 200ms}
-#plParams{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;line-height:1.6}
-fieldset{border:1px solid #e5e7eb;border-radius:8px;padding:8px 10px}
-legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
-.rail-row{display:flex;align-items:center;gap:8px;margin:2px 0}
-.rail-row input[type=number]{width:90px}
-.rail-row button{padding:4px 8px;font-size:12px}
-.smallnote{font-size:12px;color:#6b7280}
-.info-btn{width:28px;height:28px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-weight:700}
-.info-modal{position:fixed;inset:0;background:rgba(0,0,0,0.35);display:none;align-items:center;justify-content:center;z-index:100}
-.info-card{background:#fff;border-radius:12px;max-width:680px;width:92%;padding:16px;border:1px solid #e5e7eb;box-shadow:0 12px 28px rgba(0,0,0,0.18)}
-.info-card h3{margin:0 0 8px 0}
-.info-card p{margin:6px 0}
-.info-modal.open{display:flex}
-@media (max-width:900px){
-  .layout{flex-direction:column}
-  .right{flex:0 0 auto;border-left:none;border-top:1px solid #e5e7eb}
-  .left{flex:0 0 auto;width:100%;padding:8px}
-}
-#chartWidthBox{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-#chartWpx{width:72px}
-#levelsBox{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-#levelsBox input[type=text]{font-size:14px;padding:8px 10px;border-radius:8px;border:1px solid #d1d5db;background:#fff;min-width:150px}
-.hidden{display:none}
+:root{--sidebar:300px;--topbar:48px}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;font-family:Inter,system-ui,-apple-system,sans-serif;background:#f8fafc}
 
-/* Indicator multi-select */
-.indicator-wrap{position:relative; display:inline-block;}
-.indicator-btn{padding:8px 10px; border:1px solid #d1d5db; border-radius:8px; background:#fff; cursor:pointer; font-size:14px; transition:background 120ms, border-color 120ms}
-.indicator-btn:hover{background:#f3f4f6}
-.indicator-btn:active{background:#e5e7eb}
-.indicator-btn.active{background:#1d4ed8;color:#fff;border-color:#1d4ed8}
-.indicator-btn.active:hover{background:#2563eb}
-.indicator-menu{position:absolute; top:100%; left:0; z-index:50; min-width:220px; background:white; border:1px solid #e5e7eb; border-radius:10px; box-shadow:0 8px 24px rgba(0,0,0,0.08); padding:8px; display:none;}
-.indicator-menu.open{display:block;}
-.indicator-item{display:flex; align-items:center; gap:8px; padding:4px 6px; border-radius:6px; cursor:pointer;}
-.indicator-item:hover{background:#f3f4f6;}
-.indicator-actions{display:flex; justify-content:space-between; gap:8px; padding-top:6px;}
-.indicator-actions button{padding:6px 10px; font-size:12px;}
+/* Main layout */
+.app{display:flex;flex-direction:column;height:100vh;overflow:hidden}
+.topbar{height:var(--topbar);background:#fff;border-bottom:1px solid #e2e8f0;display:flex;align-items:center;padding:0 12px;gap:16px;flex-shrink:0}
+.topbar-title{font-weight:700;font-size:15px;color:#1e293b;white-space:nowrap}
+.topbar-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.main{display:flex;flex:1;overflow:hidden}
+.chart-area{flex:1;min-width:0;padding:8px;display:flex;flex-direction:column}
+.chart-area .js-plotly-plot,.chart-area .plotly-graph-div{width:100%!important;height:100%!important}
+.sidebar{width:var(--sidebar);border-left:1px solid #e2e8f0;background:#fff;display:flex;flex-direction:column;overflow:hidden;flex-shrink:0}
+
+/* Controls */
+select{font-size:13px;padding:6px 24px 6px 8px;border-radius:6px;border:1px solid #cbd5e1;background:#fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23475569' d='M2 4l4 4 4-4'/%3E%3C/svg%3E") no-repeat right 8px center;appearance:none;cursor:pointer}
+select:hover{border-color:#94a3b8}
+select:focus{outline:none;border-color:#3b82f6;box-shadow:0 0 0 2px rgba(59,130,246,0.15)}
+input[type=date],input[type=number],input[type=text]{font-size:13px;padding:6px 8px;border-radius:6px;border:1px solid #cbd5e1;background:#fff}
+input:focus{outline:none;border-color:#3b82f6;box-shadow:0 0 0 2px rgba(59,130,246,0.15)}
+.btn{font-size:13px;padding:6px 10px;border-radius:6px;border:1px solid #cbd5e1;background:#fff;cursor:pointer;transition:all 100ms;white-space:nowrap}
+.btn:hover{background:#f1f5f9;border-color:#94a3b8}
+.btn:active{background:#e2e8f0}
+.btn.active{background:#2563eb;color:#fff;border-color:#2563eb}
+.btn.active:hover{background:#1d4ed8}
+.btn-icon{width:32px;height:32px;padding:0;display:inline-flex;align-items:center;justify-content:center;font-weight:600}
+.btn-sm{font-size:12px;padding:4px 8px}
+
+/* Sidebar sections */
+.sidebar-section{padding:12px;border-bottom:1px solid #e2e8f0}
+.sidebar-section:last-child{border-bottom:none}
+.section-header{display:flex;align-items:center;justify-content:space-between;cursor:pointer;user-select:none}
+.section-title{font-weight:600;font-size:13px;color:#475569}
+.section-toggle{color:#94a3b8;font-size:11px}
+.section-content{margin-top:8px}
+.section-content.collapsed{display:none}
+
+/* Prediction box - prominent */
+#predictionBox{padding:12px;border-radius:10px;border:2px solid #e2e8f0;text-align:center;transition:all 200ms}
+#predSignal{font-weight:700;font-size:18px;margin-bottom:4px}
+#predReason{font-size:11px;color:#64748b;line-height:1.4}
+
+/* Readout */
+.readout-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px 12px;font-size:12px}
+.readout-item{display:flex;flex-direction:column}
+.readout-label{color:#64748b;font-size:11px}
+.readout-value{font-weight:600;font-family:ui-monospace,monospace;font-size:13px}
+.readout-date{font-weight:600;font-size:14px;color:#1e293b;margin-bottom:8px}
+
+/* Rails compact */
+.rails-list{font-size:11px;color:#64748b;margin-top:4px}
+.rail-row{display:flex;align-items:center;gap:6px;margin:3px 0}
+.rail-row input[type=number]{width:70px;font-size:12px;padding:4px 6px}
+.rail-row button{font-size:11px;padding:2px 6px}
+
+/* Advanced section */
+.adv-row{display:flex;align-items:center;gap:6px;margin:6px 0;flex-wrap:wrap}
+.adv-row label{font-size:12px;color:#64748b;min-width:50px}
+.adv-row input[type=range]{flex:1;min-width:80px}
+.adv-row input[type=number]{width:60px}
+
+/* Indicator dropdown */
+.indicator-wrap{position:relative}
+.indicator-menu{position:absolute;top:100%;right:0;z-index:50;min-width:180px;background:#fff;border:1px solid #e2e8f0;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,0.1);padding:6px;display:none;margin-top:4px}
+.indicator-menu.open{display:block}
+.indicator-item{display:flex;align-items:center;gap:6px;padding:4px 6px;border-radius:4px;cursor:pointer;font-size:12px}
+.indicator-item:hover{background:#f1f5f9}
+.indicator-actions{display:flex;gap:4px;padding-top:6px;border-top:1px solid #e2e8f0;margin-top:4px}
+.indicator-actions button{flex:1}
+
+/* Info modal */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.4);display:none;align-items:center;justify-content:center;z-index:100;padding:20px}
+.modal-overlay.open{display:flex}
+.modal-card{background:#fff;border-radius:12px;max-width:640px;width:100%;max-height:80vh;overflow-y:auto;padding:20px;box-shadow:0 20px 40px rgba(0,0,0,0.15)}
+.modal-card h3{margin:0 0 12px;font-size:18px}
+.modal-card p{margin:8px 0;font-size:13px;line-height:1.6;color:#334155}
+.modal-card code{display:block;margin:8px 0;padding:10px;background:#f1f5f9;border-radius:6px;font-size:12px}
+
+/* Responsive */
+@media (max-width:768px){
+  .main{flex-direction:column}
+  .sidebar{width:100%;max-height:40vh;border-left:none;border-top:1px solid #e2e8f0}
+  .topbar{flex-wrap:wrap;height:auto;padding:8px 12px;gap:8px}
+  .topbar-title{width:100%}
+}
+.hidden{display:none}
+.smallnote{font-size:11px;color:#64748b}
 </style>
 </head><body>
-<div id="capture" class="layout">
-  <div class="left" id="leftCol">__PLOT_HTML__</div>
-  <div class="right">
-    <div id="controls">
-      <label for="denomSel"><b>Denom:</b></label>
-      <select id="denomSel"></select>
-
-      <label for="periodSel"><b>Period:</b></label>
-      <select id="periodSel">
+<div class="app">
+  <!-- Top control bar -->
+  <div class="topbar">
+    <div class="topbar-title">BTC Power Law</div>
+    <div class="topbar-controls">
+      <select id="denomSel" title="Denominator"></select>
+      <select id="periodSel" title="Time Period">
         <option value="full">Full History</option>
-        <option value="cycle4">Cycle 4 (2020-24)</option>
-        <option value="cycle5">Cycle 5 (2024+)</option>
+        <option value="cycle4">Cycle 4</option>
+        <option value="cycle5">Cycle 5</option>
         <option value="modern">Modern (2017+)</option>
         <option value="recent">Recent (2020+)</option>
-        <option value="1y">Last Year</option>
-        <option value="6m">Last 6 Months</option>
-        <option value="3m">Last 3 Months</option>
+        <option value="1y">1 Year</option>
+        <option value="6m">6 Months</option>
+        <option value="3m">3 Months</option>
       </select>
-
-      <label for="xAxisSel"><b>X-Axis:</b></label>
-      <select id="xAxisSel">
+      <select id="xAxisSel" title="X-Axis Mode">
         <option value="years">Years</option>
         <option value="days">Days</option>
       </select>
-
-      <button id="halvingsBtn" class="btn" title="Toggle halving lines">Halvings</button>
+      <button id="halvingsBtn" class="btn" title="Toggle halvings">Halvings</button>
       <button id="liquidityBtn" class="btn" title="Toggle liquidity cycle">Liquidity</button>
-      <button id="infoBtn" class="btn info-btn" title="How it works">i</button>
-    </div>
-
-    <div id="controls2" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding-bottom:8px;border-bottom:1px solid #e5e7eb;">
-      <input type="date" id="datePick"/>
-      <button id="setDateBtn" class="btn">Set Date</button>
-      <button id="todayBtn" class="btn">Today</button>
-      <button id="copyBtn" class="btn" title="Copy current view to clipboard">Copy Chart</button>
-
       <div class="indicator-wrap">
-        <button id="indicatorBtn" class="indicator-btn">Indicator: All</button>
+        <button id="indicatorBtn" class="btn">Filter</button>
         <div id="indicatorMenu" class="indicator-menu">
           <label class="indicator-item"><input type="checkbox" value="SELL THE HOUSE"> SELL THE HOUSE</label>
           <label class="indicator-item"><input type="checkbox" value="Strong Buy"> Strong Buy</label>
@@ -495,105 +513,131 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
           <label class="indicator-item"><input type="checkbox" value="Frothy"> Frothy</label>
           <label class="indicator-item"><input type="checkbox" value="Top Inbound"> Top Inbound</label>
           <div class="indicator-actions">
-            <button id="indicatorClear" class="btn">Clear</button>
-            <button id="indicatorApply" class="btn">Apply</button>
+            <button id="indicatorClear" class="btn btn-sm">Clear</button>
+            <button id="indicatorApply" class="btn btn-sm">Apply</button>
           </div>
         </div>
       </div>
+      <button id="infoBtn" class="btn btn-icon" title="How it works">?</button>
     </div>
+  </div>
 
-    <div id="chartWidthBox">
-      <b>Chart Width:</b>
-      <input type="range" id="chartWslider" min="400" max="2400" step="10" value="1100" style="flex:1;min-width:100px;cursor:pointer;"/>
-      <input type="number" id="chartWpx" min="400" max="2400" step="10" value="1100" style="width:72px;"/>
-      <span class="smallnote">px</span>
-      <button id="fitBtn" class="btn" title="Make chart fill remaining space">Fit</button>
-    </div>
+  <div class="main">
+    <!-- Chart area -->
+    <div class="chart-area" id="leftCol">__PLOT_HTML__</div>
 
-    <!-- Levels: user-defined horizontal lines -->
-    <div id="levelsBox">
-      <b>Level:</b>
-      <input type="text" id="levelInput" placeholder="e.g. 50000 or 1.2"/>
-      <button id="addLevelBtn" class="btn">Add Level</button>
-      <button id="clearLevelsBtn" class="btn">Clear</button>
-    </div>
-
-    <!-- Trend lines -->
-    <div style="display:flex;gap:8px;align-items:center;">
-      <span class="smallnote">Right-click chart twice to draw a trend line.</span>
-      <button id="clearTrendBtn" class="btn">Clear Lines</button>
-    </div>
-
-    <fieldset id="railsBox">
-      <legend>Rails</legend>
-      <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
-        <button id="editBtn" class="btn">Edit Rails</button>
-        <span class="smallnote">Add/remove/change percents. Sorted automatically (high→low). 50% is dashed.</span>
-      </div>
-      <div id="railsView" class="smallnote">Current: <span id="railsListText"></span></div>
-
-      <div id="railsEditor" class="hidden">
-        <div id="railItems"></div>
-        <div class="rail-row" style="margin-top:6px;">
-          <input type="number" id="addPct" placeholder="Add % (e.g. 92.5)" step="0.1" min="0.1" max="99.9"/>
-          <button id="addBtn" class="btn">Add</button>
+    <!-- Sidebar -->
+    <div class="sidebar">
+      <!-- Prediction Signal -->
+      <div class="sidebar-section">
+        <div id="predictionBox">
+          <div id="predSignal">\u2014</div>
+          <div id="predReason"></div>
         </div>
       </div>
-    </fieldset>
 
-    <div class="smallnote">Detected denominators: <span id="denomsDetected"></span></div>
-
-    <div id="readout">
-      <div class="date">\u2014</div>
-      <div id="readoutRows"></div>
-      <div style="margin-top:10px;"><b id="mainLabel">BTC Price:</b> <span id="mainVal" class="num">\u2014</span></div>
-      <div><b>Position:</b> <span id="pPct" style="font-weight:600;">(p\u2248\u2014)</span></div>
-      <div id="oscRow"><b>Oscillator:</b> <span id="oscVal" style="font-weight:600;font-family:ui-monospace,Menlo,Consolas,monospace;">\u2014</span> <span id="oscLabel" class="smallnote"></span></div>
-      <div><b>Composite:</b> <span id="compLine" class="smallnote">\u2014</span></div>
-
-      <!-- Prediction Signal -->
-      <div id="predictionBox" style="margin-top:10px;padding:10px;border-radius:8px;border:2px solid #e5e7eb;background:#fafafa;">
-        <div style="font-weight:700;font-size:16px;margin-bottom:4px;" id="predSignal">\u2014</div>
-        <div class="smallnote" id="predReason"></div>
+      <!-- Current Values -->
+      <div class="sidebar-section">
+        <div class="readout-date" id="readoutDate">\u2014</div>
+        <div class="readout-grid">
+          <div class="readout-item"><span class="readout-label">Price</span><span class="readout-value" id="mainVal">\u2014</span></div>
+          <div class="readout-item"><span class="readout-label">Position</span><span class="readout-value" id="pPct">\u2014</span></div>
+          <div class="readout-item"><span class="readout-label">Oscillator</span><span class="readout-value" id="oscVal">\u2014</span></div>
+          <div class="readout-item"><span class="readout-label">Composite</span><span class="readout-value" id="compLine">\u2014</span></div>
+        </div>
+        <div id="readoutRows" style="margin-top:8px;font-size:11px"></div>
       </div>
 
-      <div id="plParams" class="smallnote" style="margin-top:8px;border-top:1px solid #e5e7eb;padding-top:8px;"></div>
+      <!-- Date Navigation -->
+      <div class="sidebar-section">
+        <div class="section-header" data-target="dateContent">
+          <span class="section-title">Navigate</span>
+          <span class="section-toggle">\u25BC</span>
+        </div>
+        <div class="section-content" id="dateContent">
+          <div class="adv-row">
+            <input type="date" id="datePick" style="flex:1"/>
+            <button id="setDateBtn" class="btn btn-sm">Go</button>
+            <button id="todayBtn" class="btn btn-sm">Today</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tools (collapsible) -->
+      <div class="sidebar-section">
+        <div class="section-header" data-target="toolsContent">
+          <span class="section-title">Tools</span>
+          <span class="section-toggle">\u25BC</span>
+        </div>
+        <div class="section-content" id="toolsContent">
+          <div class="adv-row">
+            <label>Level</label>
+            <input type="text" id="levelInput" placeholder="e.g. 50000" style="flex:1;min-width:80px"/>
+            <button id="addLevelBtn" class="btn btn-sm">Add</button>
+            <button id="clearLevelsBtn" class="btn btn-sm">Clear</button>
+          </div>
+          <div class="adv-row" style="margin-top:4px">
+            <span class="smallnote">Right-click twice to draw trend line</span>
+            <button id="clearTrendBtn" class="btn btn-sm">Clear</button>
+          </div>
+          <div class="adv-row" style="margin-top:4px">
+            <button id="copyBtn" class="btn btn-sm" style="flex:1">Copy Chart</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Rails (collapsible) -->
+      <div class="sidebar-section">
+        <div class="section-header" data-target="railsContent">
+          <span class="section-title">Rails</span>
+          <span class="section-toggle">\u25B6</span>
+        </div>
+        <div class="section-content collapsed" id="railsContent">
+          <div class="rails-list">Current: <span id="railsListText"></span></div>
+          <div id="railsEditor" class="hidden" style="margin-top:8px">
+            <div id="railItems"></div>
+            <div class="rail-row" style="margin-top:6px">
+              <input type="number" id="addPct" placeholder="%" step="0.1" min="0.1" max="99.9"/>
+              <button id="addBtn" class="btn btn-sm">Add</button>
+            </div>
+          </div>
+          <button id="editBtn" class="btn btn-sm" style="margin-top:6px">Edit</button>
+        </div>
+      </div>
+
+      <!-- Advanced (collapsible) -->
+      <div class="sidebar-section">
+        <div class="section-header" data-target="advContent">
+          <span class="section-title">Advanced</span>
+          <span class="section-toggle">\u25B6</span>
+        </div>
+        <div class="section-content collapsed" id="advContent">
+          <div class="adv-row">
+            <label>Width</label>
+            <input type="range" id="chartWslider" min="400" max="2400" step="10" value="1100"/>
+            <input type="number" id="chartWpx" min="400" max="2400" step="10" value="1100" style="width:60px"/>
+            <button id="fitBtn" class="btn btn-sm">Fit</button>
+          </div>
+          <div class="smallnote" style="margin-top:6px">Denominators: <span id="denomsDetected"></span></div>
+          <div id="plParams" class="smallnote" style="margin-top:6px"></div>
+        </div>
+      </div>
     </div>
   </div>
 </div>
 
 <!-- Info modal -->
-<div id="infoModal" class="info-modal" role="dialog" aria-modal="true">
-  <div class="info-card" style="max-width:780px;max-height:90vh;overflow-y:auto;">
-    <h3>How the Indicator Works</h3>
-
-    <p><b>The Bitcoin Power Law:</b> Bitcoin's price follows a power law relationship with time:
-    <code style="display:block;margin:6px 0;padding:8px;background:#f3f4f6;border-radius:6px;font-size:13px;">log\u2081\u2080(Price) = a + b \u00d7 log\u2081\u2080(years_since_genesis)</code>
-    This means Price = 10<sup>a</sup> \u00d7 t<sup>b</sup>, where the exponent b \u2248 5.8 reflects Bitcoin's decelerating (not exponential) growth. On a log-log chart, this is a straight line. The power law emerges from Bitcoin's recursive feedback loop: price attracts miners \u2192 hash rate grows \u2192 difficulty adjusts \u2192 security increases \u2192 adoption grows. (Santostasi, 2014; Burger, 2019; Perrenod, 2024)</p>
-
-    <p><b>Why Power Law, Not Exponential?</b> An exponential model (P = c \u00d7 e<sup>t/\u03c4</sup>) implies constant percentage growth, but Bitcoin's growth rate is clearly decelerating over 15+ years. On a log-linear chart, Bitcoin curves downward (ruling out exponential). On a log-log chart, it forms a remarkably straight line (R\u00b2 \u2248 0.95) \u2014 the hallmark of a power law.</p>
-
-    <p><b>Rails (Quantile Bands):</b> We fit a median quantile regression in log-log space and measure residuals. Fixed quantiles of those residuals become percentage rails (Floor \u2248 2.5% ... Ceiling \u2248 97.5%). These are analogous to Mezinskis's percentile corridors at <a href="https://porkopolis.io/thechart" target="_blank" rel="noopener">porkopolis.io</a>.</p>
-
-    <p><b>p-value (Position):</b> Your position within the Floor\u2192Ceiling corridor on a log scale (0\u2013100%). Low p = undervalued relative to the power law; high p = overvalued.</p>
-
-    <p><b>Power Law Oscillator:</b> The log-deviation from the trend line, normalized to [-1, +1] using historical min/max (per Burger's oscillator). All four historical ATHs occurred in the 0.8\u20130.9 band. Values below -0.5 have historically been strong accumulation zones.</p>
-
-    <p><b>Composite Score:</b> We blend three signals:
-    <br>(a) <b>Position z:</b> (50 - p) / 25, so undervalued = positive, overvalued = negative
-    <br>(b) <b>65-month liquidity cycle:</b> A cosine wave anchored at Feb 2015 (rising = tailwind, falling = headwind)
-    <br>(c) <b>Halving window:</b> +1.0 in the year before halving, +0.5 for ~18 months after, \u22120.5 late in cycle
-    <br>Each denominator (USD, GOLD, SPX, ETH) is scored independently \u2014 no cross-denominator voting.</p>
-
-    <p><b>Labels:</b> SELL THE HOUSE (\u22651.25) \u2192 Strong Buy (\u22650.75) \u2192 Buy (\u22650.25) \u2192 DCA (>\u22120.25) \u2192 Hold On (>\u22120.75) \u2192 Frothy (>\u22121.50) \u2192 Top Inbound. The goal: reduce emotional decision-making and anchor purchases to mathematical structure.</p>
-
-    <p class="smallnote" style="margin-top:10px;border-top:1px solid #e5e7eb;padding-top:8px;">
-    <b>Key sources:</b> Giovanni Santostasi (power law theory, 2014), Harold C. Burger (power law corridor &amp; oscillator, 2019), Stephen Perrenod (FGLS regression, block-year analysis), Matthew Mezinskis / Porkopolis Economics (percentile bands), Nik Bhatia / The Bitcoin Layer.
-    </p>
-
-    <div style="display:flex;justify-content:flex-end;margin-top:10px;">
-      <button id="infoClose" class="btn">Close</button>
-    </div>
+<div id="infoModal" class="modal-overlay" role="dialog" aria-modal="true">
+  <div class="modal-card">
+    <h3>Bitcoin Power Law Indicator</h3>
+    <p><b>The Power Law:</b> Bitcoin's price follows P = 10<sup>a</sup> \u00d7 t<sup>b</sup>, where b \u2248 5.8. On a log-log chart, this is a straight line (R\u00b2 \u2248 0.95).</p>
+    <code>log\u2081\u2080(Price) = a + b \u00d7 log\u2081\u2080(years_since_genesis)</code>
+    <p><b>Rails:</b> Quantile bands from median regression residuals. Floor (\u22482.5%) to Ceiling (\u224897.5%).</p>
+    <p><b>Position (p):</b> Your position within the corridor (0-100%). Low = undervalued, high = overvalued.</p>
+    <p><b>Oscillator:</b> Log-deviation normalized to [-1, +1]. ATHs occurred at 0.8-0.9. Values below -0.5 are accumulation zones.</p>
+    <p><b>Composite:</b> Blends position, 65-month liquidity cycle, and halving window signals.</p>
+    <p class="smallnote" style="margin-top:12px;padding-top:8px;border-top:1px solid #e2e8f0"><b>Sources:</b> Santostasi (2014), Burger (2019), Perrenod (2024), Mezinskis/Porkopolis</p>
+    <div style="text-align:right;margin-top:12px"><button id="infoClose" class="btn">Close</button></div>
   </div>
 </div>
 
@@ -684,8 +728,8 @@ function classFromScore(s){
 
 // DOM
 const leftCol=document.getElementById('leftCol');
-const rightCol=document.querySelector('.right');
-const plotDiv=(function(){ return document.querySelector('.left .js-plotly-plot') || document.querySelector('.left .plotly-graph-div'); })();
+const sidebar=document.querySelector('.sidebar');
+const plotDiv=(function(){ return document.querySelector('.chart-area .js-plotly-plot') || document.querySelector('.chart-area .plotly-graph-div'); })();
 const denomSel=document.getElementById('denomSel');
 const datePick=document.getElementById('datePick');
 const btnSet=document.getElementById('setDateBtn');
@@ -698,10 +742,9 @@ const infoBtn=document.getElementById('infoBtn');
 const infoModal=document.getElementById('infoModal');
 const infoClose=document.getElementById('infoClose');
 
-const elDate=document.querySelector('#readout .date');
+const elDate=document.getElementById('readoutDate');
 const elRows=document.getElementById('readoutRows');
 const elMain=document.getElementById('mainVal');
-const elMainLabel=document.getElementById('mainLabel');
 const elP=document.getElementById('pPct');
 const elComp=document.getElementById('compLine');
 const chartWpx=document.getElementById('chartWpx');
@@ -710,6 +753,22 @@ const xAxisSel=document.getElementById('xAxisSel');
 const predSignal=document.getElementById('predSignal');
 const predReason=document.getElementById('predReason');
 const predBox=document.getElementById('predictionBox');
+
+// Collapsible sections
+document.querySelectorAll('.section-header').forEach(header=>{
+  header.addEventListener('click',()=>{
+    const target=document.getElementById(header.dataset.target);
+    if(!target) return;
+    const toggle=header.querySelector('.section-toggle');
+    if(target.classList.contains('collapsed')){
+      target.classList.remove('collapsed');
+      if(toggle) toggle.textContent='\u25BC';
+    } else {
+      target.classList.add('collapsed');
+      if(toggle) toggle.textContent='\u25B6';
+    }
+  });
+});
 
 const editBtn=document.getElementById('editBtn');
 const railsView=document.getElementById('railsView');
@@ -784,36 +843,26 @@ function rebuildEditor(){
 document.getElementById('addBtn').addEventListener('click',()=>{ const v=Number(addPct.value); if(!isFinite(v)) return; rails.push(v); addPct.value=''; sortRails(); syncAll(); });
 editBtn.addEventListener('click',()=>{ railsEditor.classList.toggle('hidden'); railsView.classList.toggle('hidden'); editBtn.textContent = railsEditor.classList.contains('hidden') ? 'Edit Rails' : 'Done'; });
 
-// Sizing
-function applyChartWidthPx(px){
-  const v=clamp(Number(px)||1100, 400, 2400);
-  leftCol.style.flex='0 0 auto'; leftCol.style.width=v+'px';
-  // iOS Safari can require two-step resize to reflow canvas properly
+// Sizing - chart now fills available space by default
+const chartWslider=document.getElementById('chartWslider');
+function triggerResize(){
   if(window.Plotly&&plotDiv){
     Plotly.Plots.resize(plotDiv);
     requestAnimationFrame(()=>Plotly.Plots.resize(plotDiv));
   }
 }
-const chartWslider=document.getElementById('chartWslider');
-chartWpx.addEventListener('input',()=>{ chartWslider.value=chartWpx.value; applyChartWidthPx(chartWpx.value); });
-chartWpx.addEventListener('change',()=>{ chartWslider.value=chartWpx.value; applyChartWidthPx(chartWpx.value); });
-chartWslider.addEventListener('input',()=>{ chartWpx.value=chartWslider.value; applyChartWidthPx(chartWslider.value); });
+chartWpx.addEventListener('input',()=>{ chartWslider.value=chartWpx.value; });
+chartWpx.addEventListener('change',()=>{ chartWslider.value=chartWpx.value; });
+chartWslider.addEventListener('input',()=>{ chartWpx.value=chartWslider.value; });
 
-// Robust "Fit" that measures the right panel (fixes mobile Safari)
-btnFit.addEventListener('click',()=>{
-  const totalW = document.documentElement.clientWidth || window.innerWidth || screen.width || 1200;
-  const rightW = (rightCol && rightCol.getBoundingClientRect ? rightCol.getBoundingClientRect().width : 420);
-  const padding = 16;
-  const target = Math.max(400, Math.floor(totalW - rightW - padding));
-  chartWpx.value = target;
-  chartWslider.value = target;
-  applyChartWidthPx(target);
-});
+// Fit button triggers a resize
+btnFit.addEventListener('click',()=>{ triggerResize(); });
 
+// Auto-resize on window/container changes
 if(window.ResizeObserver){
-  // keep plot snug on orientation/keyboard changes on iOS
-  new ResizeObserver(()=>{ if(window.Plotly&&plotDiv) Plotly.Plots.resize(plotDiv); }).observe(leftCol);
+  new ResizeObserver(()=>triggerResize()).observe(leftCol);
 }
+window.addEventListener('resize',()=>triggerResize());
 
 // ───────── Rails math ─────────
 function logMidline(P){
@@ -963,7 +1012,6 @@ function applyIndicatorMask(P){
 
 // Panel update (future uses 50% for main value; p hidden)
 const elOsc = document.getElementById('oscVal');
-const elOscLabel = document.getElementById('oscLabel');
 const elPlParams = document.getElementById('plParams');
 
 function updatePanel(P, xVal){
@@ -986,18 +1034,17 @@ function updatePanel(P, xVal){
 
   if (xVal > lastX){
     mainTxt = fmtVal(P, v50) + ' (50%)';
-    elP.textContent = '(p\u2248\u2014)';
-    elMainLabel.textContent=(P.unit==='$'?'BTC Price:':'BTC Ratio:');
+    elP.textContent = '\u2014';
     usedP = 50;
     logDev = 0;
   } else {
     let idx=0,best=1e99; for(let i=0;i<xMain.length;i++){ const d=Math.abs(xMain[i]-xVal); if(d<best){best=d; idx=i;} }
-    const y=P.y_main[idx]; mainTxt = fmtVal(P,y); elMainLabel.textContent=(P.unit==='$'?'BTC Price:':'BTC Ratio:');
+    const y=P.y_main[idx]; mainTxt = fmtVal(P,y);
     const sup=getSupport(P), z=Math.log10(xMain[idx]);
     logDev = Math.log10(y) - (sup.a0 + sup.b*z);
     const off = logDev;
     usedP=clamp(percentFromOffset(P, off), 0, 100);
-    elP.textContent='(p\u2248'+usedP.toFixed(1)+'%)';
+    elP.textContent=usedP.toFixed(1)+'%';
   }
   elMain.textContent = mainTxt;
 
@@ -1006,8 +1053,6 @@ function updatePanel(P, xVal){
   const oscCol = oscillatorColor(osc);
   elOsc.textContent = osc.toFixed(3);
   elOsc.style.color = oscCol;
-  elOscLabel.textContent = oscillatorLabel(osc);
-  elOscLabel.style.color = oscCol;
 
   // Prediction Signal
   const pred = getPredictionSignal(osc, usedP);
