@@ -8,7 +8,7 @@ info modal, and user-defined horizontal Level lines (per denominator).
 Writes: docs/index.html
 """
 
-import os, io, glob, json
+import os, io, glob, json, re
 from datetime import datetime
 import numpy as np
 import pandas as pd
@@ -23,7 +23,8 @@ OUTPUT_HTML  = "docs/index.html"
 
 GENESIS_DATE = datetime(2009, 1, 3)
 END_PROJ     = datetime(2040, 12, 31)
-X_START_DATE = datetime(2011, 1, 1)
+# Chart starts from Genesis block, not an arbitrary later date
+X_START_DATE = GENESIS_DATE
 
 RESID_WINSOR     = 0.02
 EPS_LOG_SPACING  = 0.010
@@ -54,17 +55,60 @@ AUTO_DENOMS = {
 }
 UA = {"User-Agent":"btc-indicator/1.0"}
 
+# Smart caching: data older than this is considered stale and will be refreshed
+CACHE_MAX_AGE_HOURS = 12  # Refresh data every 12 hours
+
+def is_cache_stale(filepath, max_age_hours=CACHE_MAX_AGE_HOURS):
+    """Check if a cached file is older than max_age_hours."""
+    if not os.path.exists(filepath):
+        return True
+    file_mtime = os.path.getmtime(filepath)
+    age_hours = (datetime.now().timestamp() - file_mtime) / 3600
+    return age_hours > max_age_hours
+
+def data_needs_update(filepath, df=None):
+    """Check if data file is stale OR if the last data point is old."""
+    if is_cache_stale(filepath):
+        return True
+    # Also check if the data itself is outdated (last row is old)
+    if df is not None and "date" in df.columns:
+        last_date = pd.to_datetime(df["date"]).max()
+        days_old = (datetime.now() - last_date.to_pydatetime().replace(tzinfo=None)).days
+        if days_old > 2:  # Data is more than 2 days old
+            return True
+    return False
+
+# ───────────────────── Time Periods (for zoom presets) ─────────────────────
+# Cycle dates based on halving schedule
+CYCLE_1_START = "2009-01-03"  # Genesis
+CYCLE_2_START = "2012-11-28"  # 1st halving
+CYCLE_3_START = "2016-07-09"  # 2nd halving
+CYCLE_4_START = "2020-05-11"  # 3rd halving
+CYCLE_5_START = "2024-04-20"  # 4th halving
+
+TIME_PERIODS = {
+    "all": {"label": "All Data", "start": "2009-01-03"},
+    "10y": {"label": "Last 10 Years", "days_back": 3652},
+    "5y": {"label": "Last 5 Years", "days_back": 1826},
+    "2y": {"label": "Last 2 Years", "days_back": 730},
+    "1y": {"label": "Last 1 Year", "days_back": 365},
+    "cycle": {"label": "Current Cycle", "start": CYCLE_5_START},
+}
+
 # ───────────────────── Helpers / fetchers ─────────────────────
+def days_since_genesis(dates):
+    """Days since Bitcoin Genesis Block (Jan 3, 2009), starting at day 1."""
+    d = pd.to_datetime(dates)
+    delta_days = (d - GENESIS_DATE) / np.timedelta64(1, "D")
+    return delta_days.astype(float) + 1.0  # day 1 = genesis
+
 def years_since_genesis(dates):
     d = pd.to_datetime(dates)
     delta_days = (d - GENESIS_DATE) / np.timedelta64(1, "D")
     return (delta_days.astype(float) / 365.25) + (1.0/365.25)
 
-def fetch_btc_csv() -> pd.DataFrame:
-    os.makedirs(DATA_DIR, exist_ok=True)
-    if os.path.exists(BTC_FILE):
-        df = pd.read_csv(BTC_FILE, parse_dates=["date"])
-        return df.sort_values("date").dropna()
+def _fetch_btc_from_api() -> pd.DataFrame:
+    """Fetch BTC price data from blockchain.info API."""
     url = "https://api.blockchain.info/charts/market-price?timespan=all&format=csv&sampled=false"
     r = requests.get(url, timeout=30, headers=UA); r.raise_for_status()
     raw = r.text.strip()
@@ -77,7 +121,60 @@ def fetch_btc_csv() -> pd.DataFrame:
         df = pd.read_csv(io.StringIO(raw), header=None, names=["date","price"])
     df["date"] = pd.to_datetime(df["date"], utc=True).dt.tz_localize(None)
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
-    df = df.sort_values("date").dropna()
+    return df.sort_values("date").dropna()
+
+def _fetch_btc_from_coingecko() -> pd.DataFrame:
+    """Fallback: Fetch BTC price data from CoinGecko API."""
+    url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=max"
+    r = requests.get(url, timeout=30, headers=UA); r.raise_for_status()
+    js = r.json()
+    rows = js.get("prices") or []
+    if not rows: raise ValueError("CoinGecko returned no BTC data")
+    df = pd.DataFrame(rows, columns=["ms", "price"])
+    df["date"] = pd.to_datetime(df["ms"], unit="ms").dt.normalize()
+    out = df[["date","price"]].sort_values("date").dropna()
+    # CoinGecko can have multiple entries per day, take the last one
+    out = out.groupby("date", as_index=False).last()
+    return out
+
+def fetch_btc_csv() -> pd.DataFrame:
+    """
+    Fetch BTC/USD price data with smart caching.
+    - Returns cached data if fresh (< CACHE_MAX_AGE_HOURS old)
+    - Refreshes from API if cache is stale or data is outdated
+    - Falls back to CoinGecko if primary source fails
+    """
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+    # Check if we have fresh cached data
+    if os.path.exists(BTC_FILE):
+        df = pd.read_csv(BTC_FILE, parse_dates=["date"])
+        df = df.sort_values("date").dropna()
+        if not data_needs_update(BTC_FILE, df):
+            print(f"[cache] Using cached BTC data (last: {df['date'].max().date()})")
+            return df
+        print(f"[cache] BTC data is stale, refreshing...")
+
+    # Fetch fresh data
+    df = None
+    for fetch_fn, name in [(_fetch_btc_from_api, "blockchain.info"),
+                           (_fetch_btc_from_coingecko, "CoinGecko")]:
+        try:
+            df = fetch_fn()
+            if df is not None and not df.empty:
+                print(f"[fetch] Got {len(df)} rows from {name} (last: {df['date'].max().date()})")
+                break
+        except Exception as e:
+            print(f"[warn] {name} failed: {e}")
+            df = None
+
+    if df is None or df.empty:
+        # Last resort: use cached file even if stale
+        if os.path.exists(BTC_FILE):
+            print("[warn] All APIs failed, using stale cache")
+            return pd.read_csv(BTC_FILE, parse_dates=["date"]).sort_values("date").dropna()
+        raise ValueError("Could not fetch BTC data from any source")
+
     df.to_csv(BTC_FILE, index=False)
     return df
 
@@ -141,10 +238,28 @@ def _fetch_eth_from_binance() -> pd.DataFrame:
     return df[["date","price"]].sort_values("date").dropna()
 
 def ensure_auto_denominators():
+    """
+    Ensure denominator data files exist and are fresh.
+    Uses smart caching - refreshes if file is stale (> CACHE_MAX_AGE_HOURS old).
+    """
     os.makedirs(DATA_DIR, exist_ok=True)
     for key, info in AUTO_DENOMS.items():
         path = info["path"]
-        if os.path.exists(path): continue
+
+        # Check if we need to fetch (missing or stale)
+        needs_fetch = not os.path.exists(path) or is_cache_stale(path)
+        if not needs_fetch:
+            try:
+                df = pd.read_csv(path, parse_dates=["date"])
+                needs_fetch = data_needs_update(path, df)
+                if not needs_fetch:
+                    continue  # Cache is fresh
+            except Exception:
+                needs_fetch = True
+
+        if needs_fetch:
+            print(f"[cache] {key} data needs refresh...")
+
         try:
             if key == "ETH":
                 df=None
@@ -152,15 +267,19 @@ def ensure_auto_denominators():
                            _fetch_eth_from_cryptocompare, _fetch_eth_from_binance):
                     try:
                         df = fn()
-                        if df is not None and not df.empty: break
+                        if df is not None and not df.empty:
+                            print(f"[fetch] Got {len(df)} rows for ETH")
+                            break
                     except Exception:
                         df = None
                 if df is None or df.empty: raise ValueError("ETH fetchers returned no data")
             else:
                 df = _fetch_stooq_csv(info["url"]) if info["parser"]=="stooq" else None
+                if df is not None and not df.empty:
+                    print(f"[fetch] Got {len(df)} rows for {key}")
             if df is None or df.empty: raise ValueError(f"{key} returned no data")
             df.to_csv(path, index=False)
-            print(f"[auto-denom] wrote {path} ({len(df)} rows)")
+            print(f"[auto-denom] wrote {path} ({len(df)} rows, last: {df['date'].max().date()})")
         except Exception as e:
             print(f"[warn] could not fetch {key}: {e}")
 
@@ -223,24 +342,39 @@ for key, df in denoms.items():
     base = base.merge(df.rename(columns={"price": key.lower()}), on="date", how="left")
 
 base["x_years"]   = years_since_genesis(base["date"])
+base["x_days"]    = days_since_genesis(base["date"])
 base["date_iso"]  = base["date"].dt.strftime("%Y-%m-%d")
 
-first_dt = max(base["date"].iloc[0], X_START_DATE)
-max_dt   = END_PROJ
+# Grid always starts from Genesis block for consistent power law visualization
+# The actual data may start later, but the trend line extends to Genesis
+first_data_dt = base["date"].iloc[0]
+max_dt = END_PROJ
 
-x_start = float(years_since_genesis(pd.Series([first_dt])).iloc[0])
-x_end   = float(years_since_genesis(pd.Series([max_dt])).iloc[0])
-x_grid  = np.logspace(np.log10(max(1e-6, x_start)), np.log10(x_end), 700)
+# Years-based: Genesis = ~0.00274 years (1/365.25) to avoid log(0)
+x_genesis_years = 1.0 / 365.25  # Day 1 in years
+x_end_years = float(years_since_genesis(pd.Series([max_dt])).iloc[0])
+x_grid = np.logspace(np.log10(x_genesis_years), np.log10(x_end_years), 700)
 
-def year_ticks_log(first_dt, last_dt):
+# Days-based: Genesis = day 1
+x_genesis_days = 1.0
+x_end_days = float(days_since_genesis(pd.Series([max_dt])).iloc[0])
+x_grid_days = np.logspace(np.log10(x_genesis_days), np.log10(x_end_days), 700)
+
+# For chart initial range, start from first actual data point
+x_start = float(years_since_genesis(pd.Series([first_data_dt])).iloc[0])
+
+def year_ticks_log(last_dt):
+    """Generate x-axis tick values and labels starting from Genesis year (2009)."""
     vals, labs = [], []
-    for y in range(first_dt.year, last_dt.year+1):
-        d = datetime(y,1,1)
-        if y > 2020 and (y % 2 == 1):  # hide odd years after 2020
+    for y in range(GENESIS_DATE.year, last_dt.year+1):
+        d = datetime(y, 1, 1)
+        if y > 2020 and (y % 2 == 1):  # hide odd years after 2020 for clarity
             continue
         vy = float(years_since_genesis(pd.Series([d])).iloc[0])
-        if vy <= 0: continue
-        vals.append(vy); labs.append(str(y))
+        if vy <= 0:
+            continue
+        vals.append(vy)
+        labs.append(str(y))
     return vals, labs
 
 def y_ticks():
@@ -248,7 +382,7 @@ def y_ticks():
     labs = [f"{int(10**e):,}" for e in range(0,9)]
     return vals, labs
 
-xtickvals, xticktext = year_ticks_log(first_dt, max_dt)
+xtickvals, xticktext = year_ticks_log(max_dt)
 ytickvals, yticktext = y_ticks()
 
 def series_for_denom(df, key):
@@ -259,19 +393,72 @@ def series_for_denom(df, key):
         return df["btc"]/df[k], f"BTC / {key.upper()}", "", 6
     return df["btc"], "BTC / USD", "$", 2
 
+def resample_ohlc(df, y_col, freq='W'):
+    """Resample to weekly or monthly OHLC candles."""
+    df = df.set_index('date')
+    ohlc = df[y_col].resample(freq).ohlc()
+    ohlc = ohlc.dropna()
+    ohlc = ohlc.reset_index()
+    return ohlc
+
 def build_payload(df, denom_key=None):
     y, label, unit, decimals = series_for_denom(df, denom_key)
     mask = np.isfinite(df["x_years"].values) & np.isfinite(y.values)
-    xs = df["x_years"].values[mask]
+    xs_years = df["x_years"].values[mask]
+    xs_days = df["x_days"].values[mask]
     ys = y.values[mask]
     dates = df["date_iso"].values[mask]
-    support = build_support_constant_rails(xs, ys)
+    support = build_support_constant_rails(xs_years, ys)
+
+    # Also fit in days-space for display
+    support_days = build_support_constant_rails(xs_days, ys)
+
+    # Build OHLC for different candle intervals
+    # CRITICAL: Use the properly denominated price series, not raw USD price
+    df_ohlc = df.copy()
+    df_ohlc['_denom_price'] = y.values  # This is already BTC/USD or BTC/GOLD etc.
+
+    # Weekly OHLC (using correctly denominated price)
+    ohlc_w = resample_ohlc(df_ohlc, '_denom_price', 'W')
+    ohlc_w['x_years'] = years_since_genesis(ohlc_w['date'])
+    ohlc_w['x_days'] = days_since_genesis(ohlc_w['date'])
+    ohlc_w['date_iso'] = ohlc_w['date'].dt.strftime('%Y-%m-%d')
+
+    # Monthly OHLC (using correctly denominated price)
+    ohlc_m = resample_ohlc(df_ohlc, '_denom_price', 'ME')
+    ohlc_m['x_years'] = years_since_genesis(ohlc_m['date'])
+    ohlc_m['x_days'] = days_since_genesis(ohlc_m['date'])
+    ohlc_m['date_iso'] = ohlc_m['date'].dt.strftime('%Y-%m-%d')
+
     return {
         "label": label, "unit": unit, "decimals": decimals,
-        "x_main": xs.tolist(), "y_main": ys.tolist(),
+        "x_main": xs_years.tolist(), "y_main": ys.tolist(),
+        "x_days": xs_days.tolist(),
         "date_iso_main": dates.tolist(),
         "x_grid": x_grid.tolist(),
-        "support": support
+        "x_grid_days": x_grid_days.tolist(),
+        "support": support,
+        "support_days": support_days,
+        # Weekly candles
+        "ohlc_w": {
+            "x_years": ohlc_w["x_years"].tolist(),
+            "x_days": ohlc_w["x_days"].tolist(),
+            "date_iso": ohlc_w["date_iso"].tolist(),
+            "open": ohlc_w["open"].tolist(),
+            "high": ohlc_w["high"].tolist(),
+            "low": ohlc_w["low"].tolist(),
+            "close": ohlc_w["close"].tolist()
+        },
+        # Monthly candles
+        "ohlc_m": {
+            "x_years": ohlc_m["x_years"].tolist(),
+            "x_days": ohlc_m["x_days"].tolist(),
+            "date_iso": ohlc_m["date_iso"].tolist(),
+            "open": ohlc_m["open"].tolist(),
+            "high": ohlc_m["high"].tolist(),
+            "low": ohlc_m["low"].tolist(),
+            "close": ohlc_m["close"].tolist()
+        }
     }
 
 PRECOMP = {"USD": build_payload(base, None)}
@@ -310,19 +497,35 @@ traces += [
 ]
 
 fig = go.Figure(traces)
+# Genesis block x-coordinate for reference
+x_genesis_ref = 1.0 / 365.25  # Years since Genesis at day 1
+
 fig.update_layout(
     template="plotly_white",
     hovermode="x",
-    showlegend=True,
-    title="BTC Purchase Indicator",
+    showlegend=False,
+    title=None,
     xaxis=dict(type="log", title=None, tickmode="array",
                tickvals=xtickvals, ticktext=xticktext,
-               tickangle=45,
-               range=[np.log10(x_start), np.log10(x_end)]),
+               tickangle=0,
+               range=[np.log10(x_start), np.log10(x_end_years)]),
     yaxis=dict(type="log", title=P0["label"],
                tickmode="array", tickvals=ytickvals, ticktext=yticktext),
-    legend=dict(x=1.02, xanchor="left", y=1.0, yanchor="top"),
-    margin=dict(l=70, r=420, t=70, b=70),
+    margin=dict(l=60, r=20, t=20, b=50),
+    autosize=True,
+    # Add Genesis block reference line
+    shapes=[dict(
+        type="line", xref="x", yref="paper",
+        x0=x_genesis_ref, x1=x_genesis_ref, y0=0, y1=1,
+        line=dict(color="#F59E0B", width=1.5, dash="dot"),
+        layer="below"
+    )],
+    annotations=[dict(
+        x=np.log10(x_genesis_ref), y=1, xref="x", yref="paper",
+        text="Genesis<br>Jan 3, 2009", showarrow=False,
+        font=dict(size=10, color="#F59E0B"),
+        xanchor="left", yanchor="top", xshift=5
+    )]
 )
 
 # Ensure double-click resets axes (desktop + iOS Safari)
@@ -342,77 +545,163 @@ HTML = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>BTC Purchase Indicator</title>
+<title>BTC Power Law Indicator</title>
 <style>
-:root{--panelW:420px;}
-html,body{height:100%} body{margin:0;font-family:Inter,system-ui,Segoe UI,Arial,sans-serif}
-.layout{display:flex;min-height:100vh;width:100vw}
-.left{flex:0 0 auto;width:1100px;min-width:280px;padding:8px 0 8px 8px}
-.left .js-plotly-plot,.left .plotly-graph-div{width:100%!important}
-.right{flex:0 0 var(--panelW);border-left:1px solid #e5e7eb;padding:12px;display:flex;flex-direction:column;gap:12px;overflow:auto}
-#controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding-bottom:8px;border-bottom:1px solid #e5e7eb}
-select,input[type=date],input[type=number]{font-size:14px;padding:8px 10px;border-radius:8px;border:1px solid #d1d5db;background:#fff}
-.btn{font-size:14px;padding:8px 10px;border-radius:8px;border:1px solid #d1d5db;background:#fff;cursor:pointer;transition:background 120ms, box-shadow 120ms, border-color 120ms;user-select:none}
-.btn:hover{background:#f3f4f6}
-.btn:active{background:#e5e7eb; box-shadow:inset 0 1px 2px rgba(0,0,0,0.08)}
-.btn.active{background:#1d4ed8;color:#fff;border-color:#1d4ed8}
-.btn.active:hover{background:#2563eb}
-#readout{border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#fafafa;font-size:14px}
-#readout .date{font-weight:700;margin-bottom:6px;font-size:15px}
-#readout .row{display:flex;justify-content:space-between;align-items:baseline;gap:8px;padding:2px 0}
-#readout .num{font-family:ui-monospace,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums;text-align:right;min-width:12ch;white-space:pre}
-#oscRow{padding:4px 0;margin:2px 0;border-radius:6px;transition:background 200ms}
-#plParams{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;line-height:1.6}
-fieldset{border:1px solid #e5e7eb;border-radius:8px;padding:8px 10px}
-legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
-.rail-row{display:flex;align-items:center;gap:8px;margin:2px 0}
-.rail-row input[type=number]{width:90px}
-.rail-row button{padding:4px 8px;font-size:12px}
-.smallnote{font-size:12px;color:#6b7280}
-.info-btn{width:28px;height:28px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-weight:700}
-.info-modal{position:fixed;inset:0;background:rgba(0,0,0,0.35);display:none;align-items:center;justify-content:center;z-index:100}
-.info-card{background:#fff;border-radius:12px;max-width:680px;width:92%;padding:16px;border:1px solid #e5e7eb;box-shadow:0 12px 28px rgba(0,0,0,0.18)}
-.info-card h3{margin:0 0 8px 0}
-.info-card p{margin:6px 0}
-.info-modal.open{display:flex}
-@media (max-width:900px){
-  .layout{flex-direction:column}
-  .right{flex:0 0 auto;border-left:none;border-top:1px solid #e5e7eb}
-  .left{flex:0 0 auto;width:100%;padding:8px}
-}
-#chartWidthBox{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-#chartWpx{width:72px}
-#levelsBox{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-#levelsBox input[type=text]{font-size:14px;padding:8px 10px;border-radius:8px;border:1px solid #d1d5db;background:#fff;min-width:150px}
-.hidden{display:none}
+:root{--sidebar:300px;--topbar:48px}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;font-family:Inter,system-ui,-apple-system,sans-serif;background:#f8fafc}
 
-/* Indicator multi-select */
-.indicator-wrap{position:relative; display:inline-block;}
-.indicator-btn{padding:8px 10px; border:1px solid #d1d5db; border-radius:8px; background:#fff; cursor:pointer; font-size:14px; transition:background 120ms, border-color 120ms}
-.indicator-btn:hover{background:#f3f4f6}
-.indicator-btn:active{background:#e5e7eb}
-.indicator-btn.active{background:#1d4ed8;color:#fff;border-color:#1d4ed8}
-.indicator-btn.active:hover{background:#2563eb}
-.indicator-menu{position:absolute; top:100%; left:0; z-index:50; min-width:220px; background:white; border:1px solid #e5e7eb; border-radius:10px; box-shadow:0 8px 24px rgba(0,0,0,0.08); padding:8px; display:none;}
-.indicator-menu.open{display:block;}
-.indicator-item{display:flex; align-items:center; gap:8px; padding:4px 6px; border-radius:6px; cursor:pointer;}
-.indicator-item:hover{background:#f3f4f6;}
-.indicator-actions{display:flex; justify-content:space-between; gap:8px; padding-top:6px;}
-.indicator-actions button{padding:6px 10px; font-size:12px;}
+/* Main layout */
+.app{display:flex;flex-direction:column;height:100vh;overflow:hidden}
+.topbar{height:var(--topbar);background:#fff;border-bottom:1px solid #e2e8f0;display:flex;align-items:center;padding:0 12px;gap:16px;flex-shrink:0}
+.topbar-title{font-weight:700;font-size:15px;color:#1e293b;white-space:nowrap}
+.topbar-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.main{display:flex;flex:1;overflow:hidden}
+.chart-area{flex:1;min-width:0;padding:8px;display:flex;flex-direction:column}
+.chart-area .js-plotly-plot,.chart-area .plotly-graph-div{width:100%!important;height:100%!important}
+.sidebar{width:var(--sidebar);border-left:1px solid #e2e8f0;background:#fff;display:flex;flex-direction:column;overflow:hidden;flex-shrink:0}
+
+/* Controls */
+select{font-size:13px;padding:6px 24px 6px 8px;border-radius:6px;border:1px solid #cbd5e1;background:#fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23475569' d='M2 4l4 4 4-4'/%3E%3C/svg%3E") no-repeat right 8px center;appearance:none;cursor:pointer}
+select:hover{border-color:#94a3b8}
+select:focus{outline:none;border-color:#3b82f6;box-shadow:0 0 0 2px rgba(59,130,246,0.15)}
+input[type=date],input[type=number],input[type=text]{font-size:13px;padding:6px 8px;border-radius:6px;border:1px solid #cbd5e1;background:#fff}
+input:focus{outline:none;border-color:#3b82f6;box-shadow:0 0 0 2px rgba(59,130,246,0.15)}
+.btn{font-size:13px;padding:6px 10px;border-radius:6px;border:1px solid #cbd5e1;background:#fff;cursor:pointer;transition:all 100ms;white-space:nowrap}
+.btn:hover{background:#f1f5f9;border-color:#94a3b8}
+.btn:active{background:#e2e8f0}
+.btn.active{background:#2563eb;color:#fff;border-color:#2563eb}
+.btn.active:hover{background:#1d4ed8}
+.btn-icon{width:32px;height:32px;padding:0;display:inline-flex;align-items:center;justify-content:center;font-weight:600}
+.btn-sm{font-size:12px;padding:4px 8px}
+
+/* Sidebar sections */
+.sidebar-section{padding:12px;border-bottom:1px solid #e2e8f0}
+.sidebar-section:last-child{border-bottom:none}
+.section-header{display:flex;align-items:center;justify-content:space-between;cursor:pointer;user-select:none}
+.section-title{font-weight:600;font-size:13px;color:#475569}
+.section-toggle{color:#94a3b8;font-size:11px}
+.section-content{margin-top:8px}
+.section-content.collapsed{display:none}
+
+/* Prediction box - prominent */
+#predictionBox{padding:12px;border-radius:10px;border:2px solid #e2e8f0;text-align:center;transition:all 200ms}
+#predSignal{font-weight:700;font-size:18px;margin-bottom:4px}
+#predReason{font-size:11px;color:#64748b;line-height:1.4}
+
+/* Cycle & Projections */
+.cycle-info{display:grid;grid-template-columns:1fr 1fr;gap:4px 8px;font-size:11px;margin-top:8px}
+.cycle-item{display:flex;flex-direction:column}
+.cycle-label{color:#64748b;font-size:10px}
+.cycle-value{font-weight:600;font-size:12px}
+.cycle-phase{text-align:center;padding:6px;border-radius:6px;font-weight:600;font-size:12px;margin-bottom:8px}
+.proj-table{width:100%;font-size:11px;border-collapse:collapse}
+.proj-table th,.proj-table td{padding:4px 6px;text-align:left;border-bottom:1px solid #e2e8f0}
+.proj-table th{color:#64748b;font-weight:500}
+.proj-table td{font-family:ui-monospace,monospace}
+.proj-range{font-size:10px;color:#64748b}
+.signal-bar{height:6px;border-radius:3px;margin-top:4px;background:linear-gradient(to right,#7C3AED 0%,#2563EB 15%,#0EA5E9 25%,#16A34A 40%,#EAB308 60%,#F97316 75%,#DC2626 100%)}
+.signal-marker{width:8px;height:8px;background:#1e293b;border-radius:50%;border:2px solid #fff;box-shadow:0 1px 3px rgba(0,0,0,0.3);position:relative;top:-7px;transition:margin-left 300ms}
+.hist-context{font-size:11px;color:#475569;line-height:1.5;padding:8px;background:#f8fafc;border-radius:6px;margin-top:8px}
+
+/* Readout */
+.readout-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px 12px;font-size:12px}
+.readout-item{display:flex;flex-direction:column}
+.readout-label{color:#64748b;font-size:11px}
+.readout-value{font-weight:600;font-family:ui-monospace,monospace;font-size:13px}
+.readout-date{font-weight:600;font-size:14px;color:#1e293b;margin-bottom:8px}
+
+/* Rails compact */
+.rails-list{font-size:11px;color:#64748b;margin-top:4px}
+.rail-row{display:flex;align-items:center;gap:6px;margin:3px 0}
+.rail-row input[type=number]{width:70px;font-size:12px;padding:4px 6px}
+.rail-row button{font-size:11px;padding:2px 6px}
+
+/* Advanced section */
+.adv-row{display:flex;align-items:center;gap:6px;margin:6px 0;flex-wrap:wrap}
+.adv-row label{font-size:12px;color:#64748b;min-width:50px}
+.adv-row input[type=range]{flex:1;min-width:80px}
+.adv-row input[type=number]{width:60px}
+
+/* Indicator dropdown */
+.indicator-wrap{position:relative}
+.indicator-menu{position:absolute;top:100%;right:0;z-index:50;min-width:180px;background:#fff;border:1px solid #e2e8f0;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,0.1);padding:6px;display:none;margin-top:4px}
+.indicator-menu.open{display:block}
+.indicator-item{display:flex;align-items:center;gap:6px;padding:4px 6px;border-radius:4px;cursor:pointer;font-size:12px}
+.indicator-item:hover{background:#f1f5f9}
+.indicator-actions{display:flex;gap:4px;padding-top:6px;border-top:1px solid #e2e8f0;margin-top:4px}
+.indicator-actions button{flex:1}
+
+/* Info modal */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.4);display:none;align-items:center;justify-content:center;z-index:100;padding:20px}
+.modal-overlay.open{display:flex}
+.modal-card{background:#fff;border-radius:12px;max-width:640px;width:100%;max-height:80vh;overflow-y:auto;padding:20px;box-shadow:0 20px 40px rgba(0,0,0,0.15)}
+.modal-card h3{margin:0 0 12px;font-size:18px}
+.modal-card p{margin:8px 0;font-size:13px;line-height:1.6;color:#334155}
+.modal-card code{display:block;margin:8px 0;padding:10px;background:#f1f5f9;border-radius:6px;font-size:12px}
+
+/* Responsive */
+@media (max-width:1024px){
+  :root{--sidebar:260px}
+}
+@media (max-width:768px){
+  .main{flex-direction:column}
+  .sidebar{width:100%;max-height:45vh;border-left:none;border-top:1px solid #e2e8f0;overflow-y:auto}
+  .topbar{flex-wrap:wrap;height:auto;padding:8px 12px;gap:6px}
+  .topbar-title{width:100%;margin-bottom:4px}
+  .topbar-controls{width:100%;justify-content:flex-start}
+  .topbar-controls select,.topbar-controls .btn{font-size:12px;padding:5px 8px}
+  .chart-area{min-height:50vh}
+}
+@media (max-width:480px){
+  .topbar-controls select{max-width:100px}
+  .readout-grid{grid-template-columns:1fr}
+  .cycle-info{grid-template-columns:1fr}
+  .proj-table{font-size:10px}
+  #predSignal{font-size:16px}
+}
+/* Focus styles for accessibility */
+:focus{outline:2px solid #3b82f6;outline-offset:2px}
+:focus:not(:focus-visible){outline:none}
+:focus-visible{outline:2px solid #3b82f6;outline-offset:2px}
+/* Skip link for keyboard users */
+.skip-link{position:absolute;top:-40px;left:0;background:#1e293b;color:#fff;padding:8px 16px;z-index:1000;transition:top 200ms}
+.skip-link:focus{top:0}
+.hidden{display:none}
+.smallnote{font-size:11px;color:#64748b}
+/* Screen reader only */
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 </style>
 </head><body>
-<div id="capture" class="layout">
-  <div class="left" id="leftCol">__PLOT_HTML__</div>
-  <div class="right">
-    <div id="controls">
-      <label for="denomSel"><b>Denominator:</b></label>
-      <select id="denomSel"></select>
-      <input type="date" id="datePick"/>
-      <button id="setDateBtn" class="btn">Set Date</button>
-      <button id="todayBtn" class="btn">Today</button>
-
+<a href="#leftCol" class="skip-link">Skip to chart</a>
+<div class="app">
+  <!-- Top control bar -->
+  <div class="topbar">
+    <div class="topbar-title">BTC Power Law</div>
+    <div class="topbar-controls">
+      <select id="denomSel" title="Denominator" aria-label="Select price denominator"></select>
+      <select id="periodSel" title="Time Period" aria-label="Select time period">
+        <option value="all">All Data</option>
+        <option value="10y">Last 10 Years</option>
+        <option value="5y">Last 5 Years</option>
+        <option value="2y">Last 2 Years</option>
+        <option value="1y">Last 1 Year</option>
+        <option value="cycle">Current Cycle</option>
+      </select>
+      <select id="xAxisSel" title="X-Axis Mode" aria-label="Select X-axis display mode">
+        <option value="days">Days Since Genesis</option>
+        <option value="years">Years Since Genesis</option>
+        <option value="date">Calendar Date</option>
+      </select>
+      <select id="candleSel" title="Candle Interval" aria-label="Select candle interval">
+        <option value="D">Daily</option>
+        <option value="W">Weekly</option>
+        <option value="M">Monthly</option>
+      </select>
+      <button id="halvingsBtn" class="btn" title="Toggle halvings" aria-pressed="false">Halvings</button>
+      <button id="liquidityBtn" class="btn" title="Toggle liquidity cycle" aria-pressed="false">Liquidity</button>
       <div class="indicator-wrap">
-        <button id="indicatorBtn" class="indicator-btn">Indicator: All</button>
+        <button id="indicatorBtn" class="btn">Filter</button>
         <div id="indicatorMenu" class="indicator-menu">
           <label class="indicator-item"><input type="checkbox" value="SELL THE HOUSE"> SELL THE HOUSE</label>
           <label class="indicator-item"><input type="checkbox" value="Strong Buy"> Strong Buy</label>
@@ -422,103 +711,170 @@ legend{padding:0 6px;color:#374151;font-weight:600;font-size:13px}
           <label class="indicator-item"><input type="checkbox" value="Frothy"> Frothy</label>
           <label class="indicator-item"><input type="checkbox" value="Top Inbound"> Top Inbound</label>
           <div class="indicator-actions">
-            <button id="indicatorClear" class="btn">Clear</button>
-            <button id="indicatorApply" class="btn">Apply</button>
+            <button id="indicatorClear" class="btn btn-sm">Clear</button>
+            <button id="indicatorApply" class="btn btn-sm">Apply</button>
+          </div>
+        </div>
+      </div>
+      <button id="infoBtn" class="btn btn-icon" title="How it works">?</button>
+    </div>
+  </div>
+
+  <div class="main">
+    <!-- Chart area -->
+    <div class="chart-area" id="leftCol">__PLOT_HTML__</div>
+
+    <!-- Sidebar -->
+    <div class="sidebar">
+      <!-- Prediction Signal -->
+      <div class="sidebar-section">
+        <div id="predictionBox">
+          <div id="predSignal">\u2014</div>
+          <div id="predReason"></div>
+        </div>
+        <!-- Oscillator position bar -->
+        <div style="margin-top:8px">
+          <div class="signal-bar"></div>
+          <div class="signal-marker" id="oscMarker"></div>
+        </div>
+        <!-- Historical context -->
+        <div class="hist-context" id="histContext"></div>
+      </div>
+
+      <!-- Current Values -->
+      <div class="sidebar-section">
+        <div class="readout-date" id="readoutDate">\u2014</div>
+        <div class="readout-grid">
+          <div class="readout-item"><span class="readout-label">Price</span><span class="readout-value" id="mainVal">\u2014</span></div>
+          <div class="readout-item"><span class="readout-label">Position</span><span class="readout-value" id="pPct">\u2014</span></div>
+          <div class="readout-item"><span class="readout-label">Oscillator</span><span class="readout-value" id="oscVal">\u2014</span></div>
+          <div class="readout-item"><span class="readout-label">Composite</span><span class="readout-value" id="compLine">\u2014</span></div>
+        </div>
+        <div id="readoutRows" style="margin-top:8px;font-size:11px"></div>
+      </div>
+
+      <!-- Cycle Context (collapsible) -->
+      <div class="sidebar-section">
+        <div class="section-header" data-target="cycleContent">
+          <span class="section-title">Cycle & Projections</span>
+          <span class="section-toggle">\u25BC</span>
+        </div>
+        <div class="section-content" id="cycleContent">
+          <div class="cycle-phase" id="cyclePhase">Loading...</div>
+          <div class="cycle-info">
+            <div class="cycle-item"><span class="cycle-label">Since Last Halving</span><span class="cycle-value" id="sinceHalving">\u2014</span></div>
+            <div class="cycle-item"><span class="cycle-label">Until Next Halving</span><span class="cycle-value" id="untilHalving">\u2014</span></div>
+            <div class="cycle-item"><span class="cycle-label">Cycle Progress</span><span class="cycle-value" id="cycleProgress">\u2014</span></div>
+            <div class="cycle-item"><span class="cycle-label">Current Phase</span><span class="cycle-value" id="cyclePhaseShort">\u2014</span></div>
+          </div>
+          <div style="margin-top:10px;font-size:11px;font-weight:600;color:#475569">Price Projections (50% trend)</div>
+          <table class="proj-table">
+            <tr><th>Date</th><th>Projected</th><th>Range</th></tr>
+            <tr><td>+6 months</td><td id="proj6m">\u2014</td><td class="proj-range" id="proj6mRange"></td></tr>
+            <tr><td>+12 months</td><td id="proj12m">\u2014</td><td class="proj-range" id="proj12mRange"></td></tr>
+            <tr><td>+18 months</td><td id="proj18m">\u2014</td><td class="proj-range" id="proj18mRange"></td></tr>
+            <tr><td>Next Halving</td><td id="projHalving">\u2014</td><td class="proj-range" id="projHalvingRange"></td></tr>
+          </table>
+        </div>
+      </div>
+
+      <!-- Date Navigation -->
+      <div class="sidebar-section">
+        <div class="section-header" data-target="dateContent">
+          <span class="section-title">Navigate</span>
+          <span class="section-toggle">\u25BC</span>
+        </div>
+        <div class="section-content" id="dateContent">
+          <div class="adv-row">
+            <label for="datePick" class="sr-only">Select date</label>
+            <input type="date" id="datePick" aria-label="Select date to view" style="flex:1"/>
+            <button id="setDateBtn" class="btn btn-sm">Go</button>
+            <button id="todayBtn" class="btn btn-sm">Today</button>
           </div>
         </div>
       </div>
 
-      <button id="halvingsBtn" class="btn" title="Toggle halving lines">Halvings</button>
-      <button id="liquidityBtn" class="btn" title="Toggle liquidity cycle">Liquidity</button>
-      <button id="copyBtn" class="btn" title="Copy current view to clipboard">Copy Chart</button>
-
-      <button id="infoBtn" class="btn info-btn" title="How it works">i</button>
-    </div>
-
-    <div id="chartWidthBox">
-      <b>Chart Width:</b>
-      <input type="range" id="chartWslider" min="400" max="2400" step="10" value="1100" style="flex:1;min-width:100px;cursor:pointer;"/>
-      <input type="number" id="chartWpx" min="400" max="2400" step="10" value="1100" style="width:72px;"/>
-      <span class="smallnote">px</span>
-      <button id="fitBtn" class="btn" title="Make chart fill remaining space">Fit</button>
-    </div>
-
-    <!-- Levels: user-defined horizontal lines -->
-    <div id="levelsBox">
-      <b>Level:</b>
-      <input type="text" id="levelInput" placeholder="e.g. 50000 or 1.2"/>
-      <button id="addLevelBtn" class="btn">Add Level</button>
-      <button id="clearLevelsBtn" class="btn">Clear</button>
-    </div>
-
-    <fieldset id="railsBox">
-      <legend>Rails</legend>
-      <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
-        <button id="editBtn" class="btn">Edit Rails</button>
-        <span class="smallnote">Add/remove/change percents. Sorted automatically (high→low). 50% is dashed.</span>
-      </div>
-      <div id="railsView" class="smallnote">Current: <span id="railsListText"></span></div>
-
-      <div id="railsEditor" class="hidden">
-        <div id="railItems"></div>
-        <div class="rail-row" style="margin-top:6px;">
-          <input type="number" id="addPct" placeholder="Add % (e.g. 92.5)" step="0.1" min="0.1" max="99.9"/>
-          <button id="addBtn" class="btn">Add</button>
+      <!-- Tools (collapsible) -->
+      <div class="sidebar-section">
+        <div class="section-header" data-target="toolsContent">
+          <span class="section-title">Tools</span>
+          <span class="section-toggle">\u25BC</span>
+        </div>
+        <div class="section-content" id="toolsContent">
+          <div class="adv-row">
+            <label for="levelInput">Level</label>
+            <input type="text" id="levelInput" placeholder="e.g. 50000" aria-label="Enter price level to draw horizontal line" style="flex:1;min-width:80px"/>
+            <button id="addLevelBtn" class="btn btn-sm">Add</button>
+            <button id="clearLevelsBtn" class="btn btn-sm">Clear</button>
+          </div>
+          <div class="adv-row" style="margin-top:4px">
+            <span class="smallnote">Right-click twice to draw trend line</span>
+            <button id="clearTrendBtn" class="btn btn-sm">Clear</button>
+          </div>
+          <div class="adv-row" style="margin-top:4px">
+            <button id="copyBtn" class="btn btn-sm" style="flex:1">Copy Chart</button>
+          </div>
         </div>
       </div>
-    </fieldset>
 
-    <div class="smallnote">Detected denominators: <span id="denomsDetected"></span></div>
+      <!-- Rails (collapsible) -->
+      <div class="sidebar-section">
+        <div class="section-header" data-target="railsContent">
+          <span class="section-title">Rails</span>
+          <span class="section-toggle">\u25B6</span>
+        </div>
+        <div class="section-content collapsed" id="railsContent">
+          <div class="rails-list">Current: <span id="railsListText"></span></div>
+          <div id="railsEditor" class="hidden" style="margin-top:8px">
+            <div id="railItems"></div>
+            <div class="rail-row" style="margin-top:6px">
+              <input type="number" id="addPct" placeholder="%" step="0.1" min="0.1" max="99.9"/>
+              <button id="addBtn" class="btn btn-sm">Add</button>
+            </div>
+          </div>
+          <button id="editBtn" class="btn btn-sm" style="margin-top:6px">Edit</button>
+        </div>
+      </div>
 
-    <div id="readout">
-      <div class="date">\u2014</div>
-      <div id="readoutRows"></div>
-      <div style="margin-top:10px;"><b id="mainLabel">BTC Price:</b> <span id="mainVal" class="num">\u2014</span></div>
-      <div><b>Position:</b> <span id="pPct" style="font-weight:600;">(p\u2248\u2014)</span></div>
-      <div id="oscRow"><b>Oscillator:</b> <span id="oscVal" style="font-weight:600;font-family:ui-monospace,Menlo,Consolas,monospace;">\u2014</span> <span id="oscLabel" class="smallnote"></span></div>
-      <div><b>Composite:</b> <span id="compLine" class="smallnote">\u2014</span></div>
-      <div id="plParams" class="smallnote" style="margin-top:8px;border-top:1px solid #e5e7eb;padding-top:8px;"></div>
+      <!-- Advanced (collapsible) -->
+      <div class="sidebar-section">
+        <div class="section-header" data-target="advContent">
+          <span class="section-title">Advanced</span>
+          <span class="section-toggle">\u25B6</span>
+        </div>
+        <div class="section-content collapsed" id="advContent">
+          <div class="adv-row">
+            <label>Width</label>
+            <input type="range" id="chartWslider" min="400" max="2400" step="10" value="1100"/>
+            <input type="number" id="chartWpx" min="400" max="2400" step="10" value="1100" style="width:60px"/>
+            <button id="fitBtn" class="btn btn-sm">Fit</button>
+          </div>
+          <div class="smallnote" style="margin-top:6px">Denominators: <span id="denomsDetected"></span></div>
+          <div id="plParams" class="smallnote" style="margin-top:6px"></div>
+        </div>
+      </div>
     </div>
   </div>
 </div>
 
 <!-- Info modal -->
-<div id="infoModal" class="info-modal" role="dialog" aria-modal="true">
-  <div class="info-card" style="max-width:780px;max-height:90vh;overflow-y:auto;">
-    <h3>How the Indicator Works</h3>
-
-    <p><b>The Bitcoin Power Law:</b> Bitcoin's price follows a power law relationship with time:
-    <code style="display:block;margin:6px 0;padding:8px;background:#f3f4f6;border-radius:6px;font-size:13px;">log\u2081\u2080(Price) = a + b \u00d7 log\u2081\u2080(years_since_genesis)</code>
-    This means Price = 10<sup>a</sup> \u00d7 t<sup>b</sup>, where the exponent b \u2248 5.8 reflects Bitcoin's decelerating (not exponential) growth. On a log-log chart, this is a straight line. The power law emerges from Bitcoin's recursive feedback loop: price attracts miners \u2192 hash rate grows \u2192 difficulty adjusts \u2192 security increases \u2192 adoption grows. (Santostasi, 2014; Burger, 2019; Perrenod, 2024)</p>
-
-    <p><b>Why Power Law, Not Exponential?</b> An exponential model (P = c \u00d7 e<sup>t/\u03c4</sup>) implies constant percentage growth, but Bitcoin's growth rate is clearly decelerating over 15+ years. On a log-linear chart, Bitcoin curves downward (ruling out exponential). On a log-log chart, it forms a remarkably straight line (R\u00b2 \u2248 0.95) \u2014 the hallmark of a power law.</p>
-
-    <p><b>Rails (Quantile Bands):</b> We fit a median quantile regression in log-log space and measure residuals. Fixed quantiles of those residuals become percentage rails (Floor \u2248 2.5% ... Ceiling \u2248 97.5%). These are analogous to Mezinskis's percentile corridors at <a href="https://porkopolis.io/thechart" target="_blank" rel="noopener">porkopolis.io</a>.</p>
-
-    <p><b>p-value (Position):</b> Your position within the Floor\u2192Ceiling corridor on a log scale (0\u2013100%). Low p = undervalued relative to the power law; high p = overvalued.</p>
-
-    <p><b>Power Law Oscillator:</b> The log-deviation from the trend line, normalized to [-1, +1] using historical min/max (per Burger's oscillator). All four historical ATHs occurred in the 0.8\u20130.9 band. Values below -0.5 have historically been strong accumulation zones.</p>
-
-    <p><b>Composite Score:</b> We blend three signals:
-    <br>(a) <b>Position z:</b> (50 - p) / 25, so undervalued = positive, overvalued = negative
-    <br>(b) <b>65-month liquidity cycle:</b> A cosine wave anchored at Feb 2015 (rising = tailwind, falling = headwind)
-    <br>(c) <b>Halving window:</b> +1.0 in the year before halving, +0.5 for ~18 months after, \u22120.5 late in cycle
-    <br>Each denominator (USD, GOLD, SPX, ETH) is scored independently \u2014 no cross-denominator voting.</p>
-
-    <p><b>Labels:</b> SELL THE HOUSE (\u22651.25) \u2192 Strong Buy (\u22650.75) \u2192 Buy (\u22650.25) \u2192 DCA (>\u22120.25) \u2192 Hold On (>\u22120.75) \u2192 Frothy (>\u22121.50) \u2192 Top Inbound. The goal: reduce emotional decision-making and anchor purchases to mathematical structure.</p>
-
-    <p class="smallnote" style="margin-top:10px;border-top:1px solid #e5e7eb;padding-top:8px;">
-    <b>Key sources:</b> Giovanni Santostasi (power law theory, 2014), Harold C. Burger (power law corridor &amp; oscillator, 2019), Stephen Perrenod (FGLS regression, block-year analysis), Matthew Mezinskis / Porkopolis Economics (percentile bands), Nik Bhatia / The Bitcoin Layer.
-    </p>
-
-    <div style="display:flex;justify-content:flex-end;margin-top:10px;">
-      <button id="infoClose" class="btn">Close</button>
-    </div>
+<div id="infoModal" class="modal-overlay" role="dialog" aria-modal="true">
+  <div class="modal-card">
+    <h3>Bitcoin Power Law Indicator</h3>
+    <p><b>The Power Law:</b> Bitcoin's price follows P = 10<sup>a</sup> \u00d7 t<sup>b</sup>, where b \u2248 5.8. On a log-log chart, this is a straight line (R\u00b2 \u2248 0.95).</p>
+    <code>log\u2081\u2080(Price) = a + b \u00d7 log\u2081\u2080(years_since_genesis)</code>
+    <p><b>Rails:</b> Quantile bands from median regression residuals. Floor (\u22482.5%) to Ceiling (\u224897.5%).</p>
+    <p><b>Position (p):</b> Your position within the corridor (0-100%). Low = undervalued, high = overvalued.</p>
+    <p><b>Oscillator:</b> Log-deviation normalized to [-1, +1]. ATHs occurred at 0.8-0.9. Values below -0.5 are accumulation zones.</p>
+    <p><b>Composite:</b> Blends position, 65-month liquidity cycle, and halving window signals.</p>
+    <p class="smallnote" style="margin-top:12px;padding-top:8px;border-top:1px solid #e2e8f0"><b>Sources:</b> Santostasi (2014), Burger (2019), Perrenod (2024), Mezinskis/Porkopolis</p>
+    <div style="text-align:right;margin-top:12px"><button id="infoClose" class="btn">Close</button></div>
   </div>
 </div>
 
 <script>
 const PRECOMP = __PRECOMP__;
+const TIME_PERIODS = __TIME_PERIODS__;
 const GENESIS = new Date('__GENESIS__T00:00:00Z');
 const END_ISO = '__END_ISO__';
 const LAST_PRICE_ISO = '__LAST_PRICE_ISO__';
@@ -540,16 +896,182 @@ const W_P   = __W_P__;
 const W_LIQ = __W_LIQ__;
 const W_HALV= __W_HALV__;
 
+// X-axis mode: 'years' or 'days'
+let xAxisMode = 'days';
+let candleMode = 'D';  // D=daily, W=weekly, M=monthly
+
 const MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 function yearsFromISO(iso){ const d=new Date(iso+'T00:00:00Z'); return ((d-GENESIS)/86400000)/365.25 + (1.0/365.25); }
+function daysFromISO(iso){ const d=new Date(iso+'T00:00:00Z'); return ((d-GENESIS)/86400000) + 1; }
 function shortDateFromYears(y){ const ms=(y-(1.0/365.25))*365.25*86400000; const d=new Date(GENESIS.getTime()+ms); return `${MONTHS[d.getUTCMonth()]}-${String(d.getUTCDate()).padStart(2,'0')}-${String(d.getUTCFullYear()).slice(-2)}`; }
+function shortDateFromDays(days){ const ms=(days-1)*86400000; const d=new Date(GENESIS.getTime()+ms); return `${MONTHS[d.getUTCMonth()]}-${String(d.getUTCDate()).padStart(2,'0')}-${String(d.getUTCFullYear()).slice(-2)}`; }
 function isoFromYears(y){ const ms=(y-(1.0/365.25))*365.25*86400000; const d=new Date(GENESIS.getTime()+ms); return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`; }
+function isoFromDays(days){ const ms=(days-1)*86400000; const d=new Date(GENESIS.getTime()+ms); return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`; }
+function timestampFromISO(iso){ return new Date(iso+'T00:00:00Z').getTime(); }
+function isoFromTimestamp(ts){ const d=new Date(ts); return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`; }
+function shortDateFromTimestamp(ts){ const d=new Date(ts); return `${MONTHS[d.getUTCMonth()]}-${String(d.getUTCDate()).padStart(2,'0')}-${String(d.getUTCFullYear()).slice(-2)}`; }
 function interp(xs, ys, x){ let lo=0,hi=xs.length-1; if(x<=xs[0]) return ys[0]; if(x>=xs[hi]) return ys[hi];
   while(hi-lo>1){ const m=(hi+lo)>>1; if(xs[m]<=x) lo=m; else hi=m; }
   const t=(x-xs[lo])/(xs[hi]-xs[lo]); return ys[lo]+t*(ys[hi]-ys[lo]); }
 function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
 function daysBetweenISO(a,b){ return Math.round((new Date(b+'T00:00:00Z') - new Date(a+'T00:00:00Z'))/86400000); }
 function monthsBetweenISO(a,b){ return (new Date(b+'T00:00:00Z') - new Date(a+'T00:00:00Z'))/(86400000*30.4375); }
+
+// Get x-values based on current mode
+function getXMain(P){
+  // For candle modes, use OHLC data
+  if(candleMode==='W' && P.ohlc_w) return xAxisMode==='days' ? P.ohlc_w.x_days : (xAxisMode==='years' ? P.ohlc_w.x_years : P.ohlc_w.date_iso.map(timestampFromISO));
+  if(candleMode==='M' && P.ohlc_m) return xAxisMode==='days' ? P.ohlc_m.x_days : (xAxisMode==='years' ? P.ohlc_m.x_years : P.ohlc_m.date_iso.map(timestampFromISO));
+  // Daily
+  if(xAxisMode==='date') return P.date_iso_main.map(timestampFromISO);
+  return xAxisMode==='days' ? P.x_days : P.x_main;
+}
+function getYMain(P){
+  if(candleMode==='W' && P.ohlc_w) return P.ohlc_w.close;
+  if(candleMode==='M' && P.ohlc_m) return P.ohlc_m.close;
+  return P.y_main;
+}
+function getOHLC(P){
+  if(candleMode==='W' && P.ohlc_w) return P.ohlc_w;
+  if(candleMode==='M' && P.ohlc_m) return P.ohlc_m;
+  return null;
+}
+function getXGrid(P){ return xAxisMode==='days' ? P.x_grid_days : P.x_grid; }
+function getSupport(P){ return xAxisMode==='days' ? P.support_days : P.support; }
+function xToISO(x){
+  if(xAxisMode==='date') return isoFromTimestamp(x);
+  return xAxisMode==='days' ? isoFromDays(x) : isoFromYears(x);
+}
+function xToShortDate(x){
+  if(xAxisMode==='date') return shortDateFromTimestamp(x);
+  return xAxisMode==='days' ? shortDateFromDays(x) : shortDateFromYears(x);
+}
+function isoToX(iso){
+  if(xAxisMode==='date') return timestampFromISO(iso);
+  return xAxisMode==='days' ? daysFromISO(iso) : yearsFromISO(iso);
+}
+
+// ───────── Cycle Context & Projections ─────────
+function getNextHalving(fromISO){
+  const all = PAST_HALVINGS.concat(FUTURE_HALVINGS).sort();
+  for(const h of all){ if(h > fromISO) return h; }
+  return null;
+}
+function getPrevHalving(fromISO){
+  const all = PAST_HALVINGS.concat(FUTURE_HALVINGS).sort().reverse();
+  for(const h of all){ if(h <= fromISO) return h; }
+  return PAST_HALVINGS[0];
+}
+function daysBetween(iso1, iso2){
+  return Math.round((new Date(iso2+'T00:00:00Z') - new Date(iso1+'T00:00:00Z')) / 86400000);
+}
+function addDaysISO(iso, days){
+  const d = new Date(iso+'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0,10);
+}
+
+function getCycleContext(iso){
+  const prev = getPrevHalving(iso);
+  const next = getNextHalving(iso);
+  const daysSince = daysBetween(prev, iso);
+  const daysUntil = next ? daysBetween(iso, next) : null;
+  const cycleLength = next && prev ? daysBetween(prev, next) : 1460; // ~4 years
+  const progress = daysSince / cycleLength;
+
+  // Cycle phases based on typical halving cycle behavior
+  let phase, phaseColor;
+  if(progress < 0.25){
+    phase = 'Accumulation'; phaseColor = '#16A34A';
+  } else if(progress < 0.50){
+    phase = 'Bull Run'; phaseColor = '#2563EB';
+  } else if(progress < 0.65){
+    phase = 'Euphoria/Top'; phaseColor = '#DC2626';
+  } else if(progress < 0.85){
+    phase = 'Bear Market'; phaseColor = '#F97316';
+  } else {
+    phase = 'Recovery'; phaseColor = '#0EA5E9';
+  }
+
+  return {
+    prevHalving: prev, nextHalving: next,
+    daysSince, daysUntil, cycleLength, progress,
+    phase, phaseColor
+  };
+}
+
+function getProjectedPrice(P, futureISO){
+  const sup = getSupport(P);
+  const xFuture = xAxisMode==='days' ? daysFromISO(futureISO) : yearsFromISO(futureISO);
+  const logMid = sup.a0 + sup.b * Math.log10(xFuture);
+  const mid = Math.pow(10, logMid);
+  // Use quantile offsets for range
+  const q25 = mid * Math.pow(10, sup.off_grid[Math.floor(sup.off_grid.length*0.25)]);
+  const q75 = mid * Math.pow(10, sup.off_grid[Math.floor(sup.off_grid.length*0.75)]);
+  return { mid, low: q25, high: q75 };
+}
+
+function getHistoricalContext(osc, p){
+  // Historical patterns based on oscillator and p-value zones
+  if(osc >= 0.8){
+    return '\ud83d\udcca Historical: All 4 cycle tops occurred at oscillator >0.8. Average decline after: -75% to -85%. Consider defensive positioning.';
+  } else if(osc >= 0.6){
+    return '\ud83d\udcca Historical: Oscillator 0.6-0.8 preceded tops by 1-6 months in past cycles. Volatility increases significantly in this zone.';
+  } else if(osc >= 0.3){
+    return '\ud83d\udcca Historical: Mid-cycle consolidation zone. Price often trades sideways for extended periods before next major move.';
+  } else if(osc >= -0.2){
+    return '\ud83d\udcca Historical: Fair value zone. DCA strategies have performed well historically. Average time in this zone: 40% of cycle.';
+  } else if(osc >= -0.5){
+    return '\ud83d\udcca Historical: Below-trend zone. Past cycles showed 2-4x returns within 18 months from similar positions.';
+  } else if(osc >= -0.8){
+    return '\ud83d\udcca Historical: Deep value zone. Only ~5% of Bitcoin\u2019s history spent here. 3-10x returns typical over following 2 years.';
+  } else {
+    return '\ud83d\udcca Historical: Extreme undervaluation (bottom 2%). Occurred during 2011, 2015, 2019, 2022 capitulation events. 10x+ returns followed.';
+  }
+}
+
+// Prediction signal based on oscillator AND p-value (position in corridor)
+// More refined signals using both metrics
+function getPredictionSignal(osc, p){
+  // SELL ZONES - oscillator-driven but confirmed by p-value
+  if (osc >= 0.85 || (osc >= 0.7 && p >= 90)) {
+    return {signal: '\u26a0\ufe0f SELL ZONE', color: '#DC2626', bg: '#FEE2E2',
+      reason: 'Oscillator \u2265'+(osc>=0.85?'0.85':'0.70')+' + Position '+(p>=90?'\u226590%':p.toFixed(0)+'%')+': All historical ATHs. Take profits.'};
+  }
+  if (osc >= 0.6 || p >= 85) {
+    return {signal: '\u2b06\ufe0f PRE-SELL', color: '#F97316', bg: '#FFF7ED',
+      reason: 'Oscillator '+osc.toFixed(2)+', Position '+p.toFixed(0)+'%: Approaching top zone. Prepare exit strategy.'};
+  }
+  // AVOID ZONE - poor entry points
+  if (p >= 75 && osc >= 0.3) {
+    return {signal: '\u26d4 AVOID', color: '#EF4444', bg: '#FEF2F2',
+      reason: 'Position '+p.toFixed(0)+'% (upper corridor): Historically poor entry. Wait for better prices.'};
+  }
+  if (osc >= 0.4) {
+    return {signal: '\u2197\ufe0f ELEVATED', color: '#EAB308', bg: '#FEFCE8',
+      reason: 'Oscillator '+osc.toFixed(2)+': Above fair value. Hold positions, be cautious adding.'};
+  }
+  // FAIR VALUE - good for DCA
+  if (osc >= -0.2) {
+    return {signal: '\u2705 FAIR VALUE', color: '#16A34A', bg: '#F0FDF4',
+      reason: 'Oscillator '+osc.toFixed(2)+', Position '+p.toFixed(0)+'%: Near trend. Good DCA zone.'};
+  }
+  // ACCUMULATION ZONES - p-value driven
+  if (p <= 25 || osc <= -0.5) {
+    if (osc <= -0.8 || p <= 10) {
+      return {signal: '\ud83d\udea8 EXTREME BUY', color: '#7C3AED', bg: '#F5F3FF',
+        reason: 'Position '+p.toFixed(0)+'%, Oscillator '+osc.toFixed(2)+': Extreme undervaluation. Rare opportunity!'};
+    }
+    if (osc <= -0.5 || p <= 15) {
+      return {signal: '\ud83d\udcb0 STRONG BUY', color: '#2563EB', bg: '#EFF6FF',
+        reason: 'Position '+p.toFixed(0)+'% (lower corridor): Historically excellent entry. Aggressive accumulation.'};
+    }
+    return {signal: '\u2b07\ufe0f ACCUMULATE', color: '#0EA5E9', bg: '#F0F9FF',
+      reason: 'Position '+p.toFixed(0)+'%, Oscillator '+osc.toFixed(2)+': Below trend. Good buying opportunity.'};
+  }
+  return {signal: '\u2b07\ufe0f ACCUMULATE', color: '#0EA5E9', bg: '#F0F9FF',
+    reason: 'Oscillator '+osc.toFixed(2)+': Below fair value. Consider adding.'};
+}
 
 function fmtVal(P, v){
   if(!isFinite(v)) return '—';
@@ -578,8 +1100,8 @@ function classFromScore(s){
 
 // DOM
 const leftCol=document.getElementById('leftCol');
-const rightCol=document.querySelector('.right');
-const plotDiv=(function(){ return document.querySelector('.left .js-plotly-plot') || document.querySelector('.left .plotly-graph-div'); })();
+const sidebar=document.querySelector('.sidebar');
+const plotDiv=(function(){ return document.querySelector('.chart-area .js-plotly-plot') || document.querySelector('.chart-area .plotly-graph-div'); })();
 const denomSel=document.getElementById('denomSel');
 const datePick=document.getElementById('datePick');
 const btnSet=document.getElementById('setDateBtn');
@@ -592,13 +1114,53 @@ const infoBtn=document.getElementById('infoBtn');
 const infoModal=document.getElementById('infoModal');
 const infoClose=document.getElementById('infoClose');
 
-const elDate=document.querySelector('#readout .date');
+const elDate=document.getElementById('readoutDate');
 const elRows=document.getElementById('readoutRows');
 const elMain=document.getElementById('mainVal');
-const elMainLabel=document.getElementById('mainLabel');
 const elP=document.getElementById('pPct');
 const elComp=document.getElementById('compLine');
 const chartWpx=document.getElementById('chartWpx');
+const periodSel=document.getElementById('periodSel');
+const xAxisSel=document.getElementById('xAxisSel');
+const candleSel=document.getElementById('candleSel');
+const predSignal=document.getElementById('predSignal');
+const predReason=document.getElementById('predReason');
+const predBox=document.getElementById('predictionBox');
+const oscMarker=document.getElementById('oscMarker');
+const histContext=document.getElementById('histContext');
+
+// Cycle context elements
+const cyclePhaseEl=document.getElementById('cyclePhase');
+const sinceHalvingEl=document.getElementById('sinceHalving');
+const untilHalvingEl=document.getElementById('untilHalving');
+const cycleProgressEl=document.getElementById('cycleProgress');
+const cyclePhaseShortEl=document.getElementById('cyclePhaseShort');
+
+// Projection elements
+const proj6m=document.getElementById('proj6m');
+const proj12m=document.getElementById('proj12m');
+const proj18m=document.getElementById('proj18m');
+const projHalving=document.getElementById('projHalving');
+const proj6mRange=document.getElementById('proj6mRange');
+const proj12mRange=document.getElementById('proj12mRange');
+const proj18mRange=document.getElementById('proj18mRange');
+const projHalvingRange=document.getElementById('projHalvingRange');
+
+// Collapsible sections
+document.querySelectorAll('.section-header').forEach(header=>{
+  header.addEventListener('click',()=>{
+    const target=document.getElementById(header.dataset.target);
+    if(!target) return;
+    const toggle=header.querySelector('.section-toggle');
+    if(target.classList.contains('collapsed')){
+      target.classList.remove('collapsed');
+      if(toggle) toggle.textContent='\u25BC';
+    } else {
+      target.classList.add('collapsed');
+      if(toggle) toggle.textContent='\u25B6';
+    }
+  });
+});
 
 const editBtn=document.getElementById('editBtn');
 const railsView=document.getElementById('railsView');
@@ -673,41 +1235,35 @@ function rebuildEditor(){
 document.getElementById('addBtn').addEventListener('click',()=>{ const v=Number(addPct.value); if(!isFinite(v)) return; rails.push(v); addPct.value=''; sortRails(); syncAll(); });
 editBtn.addEventListener('click',()=>{ railsEditor.classList.toggle('hidden'); railsView.classList.toggle('hidden'); editBtn.textContent = railsEditor.classList.contains('hidden') ? 'Edit Rails' : 'Done'; });
 
-// Sizing
-function applyChartWidthPx(px){
-  const v=clamp(Number(px)||1100, 400, 2400);
-  leftCol.style.flex='0 0 auto'; leftCol.style.width=v+'px';
-  // iOS Safari can require two-step resize to reflow canvas properly
+// Sizing - chart now fills available space by default
+const chartWslider=document.getElementById('chartWslider');
+function triggerResize(){
   if(window.Plotly&&plotDiv){
     Plotly.Plots.resize(plotDiv);
     requestAnimationFrame(()=>Plotly.Plots.resize(plotDiv));
   }
 }
-const chartWslider=document.getElementById('chartWslider');
-chartWpx.addEventListener('input',()=>{ chartWslider.value=chartWpx.value; applyChartWidthPx(chartWpx.value); });
-chartWpx.addEventListener('change',()=>{ chartWslider.value=chartWpx.value; applyChartWidthPx(chartWpx.value); });
-chartWslider.addEventListener('input',()=>{ chartWpx.value=chartWslider.value; applyChartWidthPx(chartWslider.value); });
+chartWpx.addEventListener('input',()=>{ chartWslider.value=chartWpx.value; });
+chartWpx.addEventListener('change',()=>{ chartWslider.value=chartWpx.value; });
+chartWslider.addEventListener('input',()=>{ chartWpx.value=chartWslider.value; });
 
-// Robust "Fit" that measures the right panel (fixes mobile Safari)
-btnFit.addEventListener('click',()=>{
-  const totalW = document.documentElement.clientWidth || window.innerWidth || screen.width || 1200;
-  const rightW = (rightCol && rightCol.getBoundingClientRect ? rightCol.getBoundingClientRect().width : 420);
-  const padding = 16;
-  const target = Math.max(400, Math.floor(totalW - rightW - padding));
-  chartWpx.value = target;
-  chartWslider.value = target;
-  applyChartWidthPx(target);
-});
+// Fit button triggers a resize
+btnFit.addEventListener('click',()=>{ triggerResize(); });
 
+// Auto-resize on window/container changes
 if(window.ResizeObserver){
-  // keep plot snug on orientation/keyboard changes on iOS
-  new ResizeObserver(()=>{ if(window.Plotly&&plotDiv) Plotly.Plots.resize(plotDiv); }).observe(leftCol);
+  new ResizeObserver(()=>triggerResize()).observe(leftCol);
 }
+window.addEventListener('resize',()=>triggerResize());
 
 // ───────── Rails math ─────────
-function logMidline(P){ const d=P.support; return P.x_grid.map(x=> (d.a0 + d.b*Math.log10(x)) ); }
+function logMidline(P){
+  const d=getSupport(P);
+  const xg=getXGrid(P);
+  return xg.map(x=> (d.a0 + d.b*Math.log10(x)) );
+}
 function offsetForPercent(P, percent){
-  const d=P.support; const q=d.q_grid, off=d.off_grid;
+  const d=getSupport(P); const q=d.q_grid, off=d.off_grid;
   const p01=clamp(percent/100, q[0], q[q.length-1]);
   let lo=0, hi=q.length-1;
   while(hi-lo>1){ const m=(hi+lo)>>1; if(q[m]<=p01) lo=m; else hi=m; }
@@ -720,7 +1276,7 @@ function seriesForPercent(P, percent){
   return logM.map(v=>Math.pow(10, v+off+(percent>=50?eps:-eps)));
 }
 function percentFromOffset(P, off){
-  const d=P.support; const q=d.q_grid, offg=d.off_grid;
+  const d=getSupport(P); const q=d.q_grid, offg=d.off_grid;
   if (off<=offg[0]) return 100*q[0];
   if (off>=offg[offg.length-1]) return 100*q[offg.length-1];
   let lo=0, hi=offg.length-1;
@@ -764,8 +1320,9 @@ function compositeFrom(p, iso){
 }
 // Power Law Oscillator: normalize log-deviation from trend to [-1, +1]
 function oscillatorFromDeviation(P, logDev){
-  const rmin = P.support.resid_min;
-  const rmax = P.support.resid_max;
+  const sup = getSupport(P);
+  const rmin = sup.resid_min;
+  const rmax = sup.resid_max;
   if (rmax === rmin) return 0;
   return (2 * (logDev - rmin) / (rmax - rmin)) - 1;
 }
@@ -792,6 +1349,7 @@ function setTitle(s){ Plotly.relayout(plotDiv, {'title.text': titleForScore(s)})
 
 // Render rails
 function renderRails(P){
+  const xg = getXGrid(P);
   const n=Math.min(rails.length, MAX_SLOTS);
   for(let i=0;i<MAX_SLOTS;i++){
     const visible=(i<n); let restyle={visible};
@@ -799,12 +1357,12 @@ function renderRails(P){
       const p=rails[i], color=colorForPercent(p);
       const nm=(p===2.5?'Floor':(p===97.5?'Ceiling':(p+'%')));
       const is50 = (Math.abs(p - 50) < 0.01);
-      restyle=Object.assign(restyle,{x:[P.x_grid], y:[seriesForPercent(P,p)], name:nm,
+      restyle=Object.assign(restyle,{x:[xg], y:[seriesForPercent(P,p)], name:nm,
         line:{color: is50 ? '#4B5563' : color, width: is50 ? 2.2 : 1.6, dash: is50 ? 'solid' : 'dot'}});
     }
     Plotly.restyle(plotDiv, restyle, [i]);
   }
-  Plotly.restyle(plotDiv, {x:[P.x_grid], y:[seriesForPercent(P,50)]}, [IDX_CARRY]);
+  Plotly.restyle(plotDiv, {x:[xg], y:[seriesForPercent(P,50)]}, [IDX_CARRY]);
   railsListText.textContent=railsText();
 }
 
@@ -828,56 +1386,59 @@ function computeSeriesForMask(P){
   P._pSeries=pSeries; P._scoreSeries=scores; P._classSeries=classes;
 }
 function applyIndicatorMask(P){
+  const xMain = getXMain(P);
+  const yMain = getYMain(P);
   if (!selectedIndicators || selectedIndicators.length===0){
-    Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main], name:[P.label]}, [IDX_MAIN]);
-    Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main]},                [IDX_CLICK]);
+    Plotly.restyle(plotDiv, {x:[xMain], y:[yMain], name:[P.label]}, [IDX_MAIN]);
+    Plotly.restyle(plotDiv, {x:[xMain], y:[yMain]},                [IDX_CLICK]);
   } else {
     computeSeriesForMask(P);
     const set=new Set(selectedIndicators);
-    const ym = P.y_main.map((v,i)=> set.has(P._classSeries[i]) ? v : null);
-    const nm = P.label+' — '+Array.from(set).join(' + ');
-    Plotly.restyle(plotDiv, {x:[P.x_main], y:[ym], name:[nm]}, [IDX_MAIN]);
-    Plotly.restyle(plotDiv, {x:[P.x_main], y:[ym]},            [IDX_CLICK]);
+    const ym = yMain.map((v,i)=> set.has(P._classSeries[i]) ? v : null);
+    const nm = P.label+' \u2014 '+Array.from(set).join(' + ');
+    Plotly.restyle(plotDiv, {x:[xMain], y:[ym], name:[nm]}, [IDX_MAIN]);
+    Plotly.restyle(plotDiv, {x:[xMain], y:[ym]},            [IDX_CLICK]);
   }
-  const tt = (P.unit === '$') ? "%{x|%b-%d-%Y}<br>$%{y:.2f}<extra></extra>" : "%{x|%b-%d-%Y}<br>%{y:.6f}<extra></extra>";
-  Plotly.restyle(plotDiv, {x:[P.x_main], y:[P.y_main], hovertemplate:[tt], line:[{width:0}]}, [IDX_TT]);
+  const tt = (P.unit === '$') ? '%{customdata}<br>$%{y:.2f}<extra></extra>' : '%{customdata}<br>%{y:.6f}<extra></extra>';
+  Plotly.restyle(plotDiv, {x:[xMain], y:[yMain], customdata:[P.date_iso_main], hovertemplate:[tt], line:[{width:0}]}, [IDX_TT]);
 }
 
 // Panel update (future uses 50% for main value; p hidden)
 const elOsc = document.getElementById('oscVal');
-const elOscLabel = document.getElementById('oscLabel');
 const elPlParams = document.getElementById('plParams');
 
-function updatePanel(P,xYears){
-  const iso = isoFromYears(xYears);
-  elDate.textContent=shortDateFromYears(xYears);
+function updatePanel(P, xVal){
+  const iso = xToISO(xVal);
+  elDate.textContent = xToShortDate(xVal);
 
+  const xg = getXGrid(P);
   const v50series = seriesForPercent(P,50);
-  const v50 = interp(P.x_grid, v50series, xYears);
+  const v50 = interp(xg, v50series, xVal);
 
   rails.forEach(p=>{
-    const v=interp(P.x_grid, seriesForPercent(P,p), xYears);
+    const v=interp(xg, seriesForPercent(P,p), xVal);
     const el=document.getElementById(idFor(p)); if(!el) return;
     const mult=(v50>0&&isFinite(v50))?` (${(v/v50).toFixed(1)}x)`:''; el.textContent=fmtVal(P,v)+mult;
   });
 
-  const lastX=P.x_main[P.x_main.length-1];
+  const xMain = getXMain(P);
+  const lastX = xMain[xMain.length-1];
   let usedP=null, mainTxt='', compScore=null, logDev=0;
 
-  if (xYears>lastX){
+  if (xVal > lastX){
     mainTxt = fmtVal(P, v50) + ' (50%)';
-    elP.textContent = '(p\u2248\u2014)';
-    elMainLabel.textContent=(P.unit==='$'?'BTC Price:':'BTC Ratio:');
+    elP.textContent = '\u2014';
     usedP = 50;
     logDev = 0;
   } else {
-    let idx=0,best=1e99; for(let i=0;i<P.x_main.length;i++){ const d=Math.abs(P.x_main[i]-xYears); if(d<best){best=d; idx=i;} }
-    const y=P.y_main[idx]; mainTxt = fmtVal(P,y); elMainLabel.textContent=(P.unit==='$'?'BTC Price:':'BTC Ratio:');
-    const d=P.support, z=Math.log10(P.x_main[idx]);
-    logDev = Math.log10(y) - (d.a0 + d.b*z);
+    const yMain = getYMain(P);
+    let idx=0,best=1e99; for(let i=0;i<xMain.length;i++){ const d=Math.abs(xMain[i]-xVal); if(d<best){best=d; idx=i;} }
+    const y=yMain[idx]; mainTxt = fmtVal(P,y);
+    const sup=getSupport(P), z=Math.log10(xMain[idx]);
+    logDev = Math.log10(y) - (sup.a0 + sup.b*z);
     const off = logDev;
     usedP=clamp(percentFromOffset(P, off), 0, 100);
-    elP.textContent='(p\u2248'+usedP.toFixed(1)+'%)';
+    elP.textContent=usedP.toFixed(1)+'%';
   }
   elMain.textContent = mainTxt;
 
@@ -886,19 +1447,90 @@ function updatePanel(P,xYears){
   const oscCol = oscillatorColor(osc);
   elOsc.textContent = osc.toFixed(3);
   elOsc.style.color = oscCol;
-  elOscLabel.textContent = oscillatorLabel(osc);
-  elOscLabel.style.color = oscCol;
+
+  // Prediction Signal
+  const pred = getPredictionSignal(osc, usedP);
+  predSignal.textContent = pred.signal;
+  predSignal.style.color = pred.color;
+  predReason.textContent = pred.reason;
+  predBox.style.borderColor = pred.color;
+  predBox.style.background = pred.bg;
+
+  // Oscillator position marker (map -1..1 to 0..100%)
+  const oscPct = clamp((osc + 1) / 2 * 100, 0, 100);
+  oscMarker.style.marginLeft = `calc(${oscPct}% - 4px)`;
+
+  // Historical context
+  histContext.textContent = getHistoricalContext(osc, usedP);
 
   compScore = compositeFrom(usedP, iso);
   elComp.textContent = compScore.toFixed(2) + ' \u2014 ' + classFromScore(compScore);
   setTitle(compScore);
 
+  // ───────── Cycle Context ─────────
+  const cycle = getCycleContext(iso);
+
+  // Format durations
+  const fmtDays = (d) => {
+    if(d===null) return '\u2014';
+    const y = Math.floor(d/365);
+    const m = Math.floor((d%365)/30);
+    const dd = d%30;
+    if(y>0) return `${y}y ${m}m`;
+    if(m>0) return `${m}m ${dd}d`;
+    return `${d}d`;
+  };
+
+  sinceHalvingEl.textContent = fmtDays(cycle.daysSince);
+  untilHalvingEl.textContent = fmtDays(cycle.daysUntil);
+  cycleProgressEl.textContent = (cycle.progress*100).toFixed(0)+'%';
+  cyclePhaseShortEl.textContent = cycle.phase;
+  cyclePhaseShortEl.style.color = cycle.phaseColor;
+
+  // Cycle phase banner
+  cyclePhaseEl.textContent = cycle.phase + ' Phase';
+  cyclePhaseEl.style.background = cycle.phaseColor + '20';
+  cyclePhaseEl.style.color = cycle.phaseColor;
+
+  // ───────── Price Projections ─────────
+  const fmtProj = (p) => P.unit==='$' ? '$'+Math.round(p).toLocaleString() : p.toFixed(4);
+  const fmtRange = (lo,hi) => P.unit==='$' ? `$${Math.round(lo/1000)}k-$${Math.round(hi/1000)}k` : `${lo.toFixed(2)}-${hi.toFixed(2)}`;
+
+  // +6 months
+  const iso6m = addDaysISO(iso, 182);
+  const p6m = getProjectedPrice(P, iso6m);
+  proj6m.textContent = fmtProj(p6m.mid);
+  proj6mRange.textContent = fmtRange(p6m.low, p6m.high);
+
+  // +12 months
+  const iso12m = addDaysISO(iso, 365);
+  const p12m = getProjectedPrice(P, iso12m);
+  proj12m.textContent = fmtProj(p12m.mid);
+  proj12mRange.textContent = fmtRange(p12m.low, p12m.high);
+
+  // +18 months
+  const iso18m = addDaysISO(iso, 548);
+  const p18m = getProjectedPrice(P, iso18m);
+  proj18m.textContent = fmtProj(p18m.mid);
+  proj18mRange.textContent = fmtRange(p18m.low, p18m.high);
+
+  // Next halving
+  if(cycle.nextHalving){
+    const pH = getProjectedPrice(P, cycle.nextHalving);
+    projHalving.textContent = fmtProj(pH.mid);
+    projHalvingRange.textContent = fmtRange(pH.low, pH.high);
+  } else {
+    projHalving.textContent = '\u2014';
+    projHalvingRange.textContent = '';
+  }
+
   // Show power law parameters
-  const sup = P.support;
-  const slope = sup.b.toFixed(4);
-  const intercept = sup.a0.toFixed(4);
-  const fairVal = Math.pow(10, sup.a0 + sup.b * Math.log10(xYears));
-  elPlParams.innerHTML = 'Power Law: log\u2081\u2080(P) = '+intercept+' + '+slope+' \u00d7 log\u2081\u2080(t)<br>Fair Value (50%): '+fmtVal(P, fairVal) + (xYears<=lastX ? '<br>Deviation: '+(logDev>=0?'+':'')+logDev.toFixed(4)+' log units' : '');
+  const supP = getSupport(P);
+  const slope = supP.b.toFixed(4);
+  const intercept = supP.a0.toFixed(4);
+  const fairVal = Math.pow(10, supP.a0 + supP.b * Math.log10(xVal));
+  const xLabel = xAxisMode==='days' ? 'days' : 't';
+  elPlParams.innerHTML = 'Power Law: log\u2081\u2080(P) = '+intercept+' + '+slope+' \u00d7 log\u2081\u2080('+xLabel+')<br>Fair Value (50%): '+fmtVal(P, fairVal) + (xVal<=lastX ? '<br>Deviation: '+(logDev>=0?'+':'')+logDev.toFixed(4)+' log units' : '');
 }
 
 // NOTE: single-click should do NOTHING → no plotly_click handler
@@ -910,20 +1542,181 @@ plotDiv.on('plotly_hover', ev=>{
 });
 
 // Date lock
-datePick.value = LAST_PRICE_ISO;
+// Initialize date picker to actual today (user's local date)
+function getTodayISO(){
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+datePick.value = getTodayISO();
+datePick.max = getTodayISO();  // Can't select future dates
+
 btnSet.addEventListener('click',()=>{
   if(!datePick.value) return;
   const P=PRECOMP[denomSel.value];
-  const y = yearsFromISO(datePick.value);
-  updatePanel(P, y);
+  const xVal = isoToX(datePick.value);
+  updatePanel(P, xVal);
 });
 datePick.addEventListener('keydown',(e)=>{
   if(e.key==='Enter'){ e.preventDefault(); btnSet.click(); }
 });
 btnToday.addEventListener('click',()=>{
   const P=PRECOMP[denomSel.value];
-  datePick.value = LAST_PRICE_ISO;
-  updatePanel(P, P.x_main[P.x_main.length-1]);
+  const today = getTodayISO();
+  datePick.value = today;
+  // Use actual today or latest data point, whichever is earlier
+  const todayX = isoToX(today);
+  const xMain = getXMain(P);
+  const lastDataX = xMain[xMain.length-1];
+  updatePanel(P, Math.min(todayX, lastDataX));
+});
+
+// ───────── X-Axis mode switching ─────────
+function fullRedraw(){
+  const P = PRECOMP[denomSel.value];
+  delete P._classSeries; delete P._pSeries; delete P._scoreSeries;
+  const xMain = getXMain(P);
+  const yMain = getYMain(P);
+  const xg = getXGrid(P);
+
+  // Axis labels and type based on mode
+  let xLabel, xType;
+  if(xAxisMode==='date'){
+    xLabel = 'Date';
+    xType = 'date';
+  } else if(xAxisMode==='days'){
+    xLabel = 'Log\u2081\u2080 Days from Genesis';
+    xType = 'log';
+  } else {
+    xLabel = 'Log\u2081\u2080 Years from Genesis';
+    xType = 'log';
+  }
+
+  Plotly.restyle(plotDiv,{x:[xMain], y:[yMain], name:[P.label]}, [IDX_MAIN]);
+  Plotly.restyle(plotDiv,{x:[xMain], y:[yMain]},                 [IDX_CLICK]);
+  Plotly.restyle(plotDiv,{x:[xg], y:[seriesForPercent(P,50)]},   [IDX_CARRY]);
+  Plotly.relayout(plotDiv,{
+    'xaxis.title': xLabel,
+    'xaxis.type': xType,
+    'yaxis.title': P.label,
+    'xaxis.autorange': true,
+    'yaxis.autorange': true
+  });
+  renderRails(P); applyIndicatorMask(P);
+  redrawLevels(P); redrawTrendLines();
+  updatePanel(P, xMain[xMain.length-1]);
+}
+
+xAxisSel.addEventListener('change',()=>{
+  xAxisMode = xAxisSel.value;
+  fullRedraw();
+});
+
+candleSel.addEventListener('change',()=>{
+  candleMode = candleSel.value;
+  fullRedraw();
+});
+
+// ───────── Period (zoom preset) switching ─────────
+periodSel.addEventListener('change',()=>{
+  const key = periodSel.value;
+  const per = TIME_PERIODS[key];
+  if (!per) return;
+  const P = PRECOMP[denomSel.value];
+  const xMain = getXMain(P);
+  let xlo, xhi;
+  if (per.days_back) {
+    xhi = xMain[xMain.length-1];
+    const isoStart = isoFromDays(daysFromISO(LAST_PRICE_ISO) - per.days_back);
+    xlo = isoToX(isoStart);
+  } else {
+    xlo = isoToX(per.start);
+    xhi = per.end ? isoToX(per.end) : (key==='all' ? undefined : xMain[xMain.length-1] * 1.05);
+  }
+  if (key==='all'){
+    Plotly.relayout(plotDiv,{'xaxis.autorange':true,'yaxis.autorange':true});
+  } else if (xAxisMode==='date') {
+    // For calendar date mode, use timestamps directly
+    Plotly.relayout(plotDiv,{'xaxis.range':[xlo, xhi], 'yaxis.autorange':true});
+  } else {
+    Plotly.relayout(plotDiv,{'xaxis.range':[Math.log10(Math.max(1e-6,xlo)), Math.log10(xhi)], 'yaxis.autorange':true});
+  }
+});
+
+// ───────── Right-click trend line drawing ─────────
+let trendLinePoints = [];
+let trendLines = [];
+const TREND_LINE_META = 'user-trend';
+
+plotDiv.addEventListener('contextmenu', (e)=>{
+  e.preventDefault();
+  const bb = plotDiv.getBoundingClientRect();
+  const fl = plotDiv._fullLayout;
+  if (!fl || !fl.xaxis || !fl.yaxis) return;
+  const xa = fl.xaxis, ya = fl.yaxis;
+  const px = e.clientX - bb.left - fl.margin.l;
+  const py = e.clientY - bb.top - fl.margin.t;
+  if (px < 0 || py < 0 || px > xa._length || py > ya._length) return;
+  const logx = xa.range[0] + (px / xa._length) * (xa.range[1] - xa.range[0]);
+  const logy = ya.range[0] + ((ya._length - py) / ya._length) * (ya.range[1] - ya.range[0]);
+  const xVal = Math.pow(10, logx);
+  const yVal = Math.pow(10, logy);
+  trendLinePoints.push({x: xVal, y: yVal, logx: logx, logy: logy});
+  if (trendLinePoints.length === 2) {
+    const p1 = trendLinePoints[0], p2 = trendLinePoints[1];
+    const slope = (p2.logy - p1.logy) / (p2.logx - p1.logx);
+    const intercept = p1.logy - slope * p1.logx;
+    const xRange = xa.range;
+    const x0log = xRange[0] - 0.5;
+    const x1log = xRange[1] + 0.5;
+    const y0log = intercept + slope * x0log;
+    const y1log = intercept + slope * x1log;
+    const line = {
+      type:'line', xref:'x', yref:'y',
+      x0: Math.pow(10, x0log), x1: Math.pow(10, x1log),
+      y0: Math.pow(10, y0log), y1: Math.pow(10, y1log),
+      line:{color:'#6366F1', width:1.8, dash:'solid'},
+      layer:'above', meta: TREND_LINE_META,
+      _slope: slope, _intercept: intercept
+    };
+    trendLines.push(line);
+    const shapes = (plotDiv.layout.shapes||[]).concat([line]);
+    Plotly.relayout(plotDiv, {shapes: shapes});
+    trendLinePoints = [];
+  }
+});
+
+function redrawTrendLines(){
+  const shapes = (plotDiv.layout.shapes||[]).filter(s => s.meta !== TREND_LINE_META);
+  const fl = plotDiv._fullLayout;
+  if (!fl || !fl.xaxis) { Plotly.relayout(plotDiv, {shapes: shapes}); return; }
+  const xRange = fl.xaxis.range;
+  const extended = trendLines.map(tl => {
+    const x0log = xRange[0] - 0.5;
+    const x1log = xRange[1] + 0.5;
+    const y0log = tl._intercept + tl._slope * x0log;
+    const y1log = tl._intercept + tl._slope * x1log;
+    return Object.assign({}, tl, {
+      x0: Math.pow(10, x0log), x1: Math.pow(10, x1log),
+      y0: Math.pow(10, y0log), y1: Math.pow(10, y1log)
+    });
+  });
+  Plotly.relayout(plotDiv, {shapes: shapes.concat(extended)});
+}
+
+// Re-extend trend lines on pan/zoom
+plotDiv.on('plotly_relayout', (e)=>{
+  if (!e) return;
+  const touchedX = Object.keys(e).some(k => k.startsWith('xaxis.'));
+  if (!touchedX || trendLines.length === 0) return;
+  requestAnimationFrame(()=> redrawTrendLines());
+});
+
+// Clear trend lines button
+document.getElementById('clearTrendBtn').addEventListener('click',()=>{
+  trendLines = [];
+  trendLinePoints = [];
+  const shapes = (plotDiv.layout.shapes||[]).filter(s => s.meta !== TREND_LINE_META);
+  Plotly.relayout(plotDiv, {shapes: shapes});
 });
 
 // Copy chart
@@ -1042,30 +1835,31 @@ plotDiv.on('plotly_doubleclick', ()=>{
 });
 
 // Denominator change
-denomSel.addEventListener('change',()=>{ const key=denomSel.value, P=PRECOMP[key];
-  // Clear cached class series to force recalculation for new denominator
-  delete P._classSeries; delete P._pSeries; delete P._scoreSeries;
-  Plotly.restyle(plotDiv,{x:[P.x_main], y:[P.y_main], name:[P.label]}, [IDX_MAIN]);
-  Plotly.restyle(plotDiv,{x:[P.x_main], y:[P.y_main]},                 [IDX_CLICK]);
-  Plotly.restyle(plotDiv,{x:[P.x_grid], y:[seriesForPercent(P,50)]},   [IDX_CARRY]);
-  Plotly.relayout(plotDiv,{'yaxis.title':P.label, annotations:(plotDiv.layout.annotations||[]).filter(a=>a.meta!=='halving' && a.meta!=='liquidity')});
-  renderRails(P); applyIndicatorMask(P);
-  redrawLevels(P);
-  updatePanel(P, P.x_main[P.x_main.length-1]);
+denomSel.addEventListener('change',()=>{
+  fullRedraw();
 });
 
 // Sync all
-function syncAll(){ sortRails(); rebuildEditor(); const P=PRECOMP[denomSel.value]; renderRails(P); applyIndicatorMask(P); redrawLevels(P); updatePanel(P, P.x_main[P.x_main.length-1]); }
+function syncAll(){
+  sortRails(); rebuildEditor();
+  const P=PRECOMP[denomSel.value];
+  const xMain = getXMain(P);
+  renderRails(P); applyIndicatorMask(P); redrawLevels(P);
+  updatePanel(P, xMain[xMain.length-1]);
+}
 
 // Init
 (function init(){
   rebuildReadoutRows(); rebuildEditor();
-  renderRails(PRECOMP['USD']); applyIndicatorMask(PRECOMP['USD']);
   const P=PRECOMP['USD'];
-  Plotly.restyle(plotDiv,{x:[P.x_grid], y:[seriesForPercent(P,50)]},[IDX_CARRY]);
-  const tt="%{x|%b-%d-%Y}<br>$%{y:.2f}<extra></extra>";
-  Plotly.restyle(plotDiv,{x:[P.x_main], y:[P.y_main], hovertemplate:[tt], line:[{width:0}]},[IDX_TT]);
-  updatePanel(P, P.x_main[P.x_main.length-1]);
+  const xMain = getXMain(P);
+  const yMain = getYMain(P);
+  const xg = getXGrid(P);
+  renderRails(P); applyIndicatorMask(P);
+  Plotly.restyle(plotDiv,{x:[xg], y:[seriesForPercent(P,50)]},[IDX_CARRY]);
+  const tt='%{customdata}<br>$%{y:.2f}<extra></extra>';
+  Plotly.restyle(plotDiv,{x:[xMain], y:[yMain], customdata:[P.date_iso_main], hovertemplate:[tt], line:[{width:0}]},[IDX_TT]);
+  updatePanel(P, xMain[xMain.length-1]);
   redrawLevels(P);
 })();
 
@@ -1073,12 +1867,13 @@ function syncAll(){ sortRails(); rebuildEditor(); const P=PRECOMP[denomSel.value
 let halvingsOn=false;
 function makeHalvingShapes(){
   const shapes=[];
-  function lineAt(xYears, dashed){
-    return {type:'line', xref:'x', yref:'paper', x0:xYears, x1:xYears, y0:0, y1:1,
+  function lineAt(iso, dashed){
+    const xVal = isoToX(iso);
+    return {type:'line', xref:'x', yref:'paper', x0:xVal, x1:xVal, y0:0, y1:1,
             line:{color:'#9CA3AF', width:1.2, dash:(dashed?'dash':'solid')}, layer:'below', meta:'halving'};
   }
-  PAST_HALVINGS.forEach(iso=>{ shapes.push(lineAt(yearsFromISO(iso), false)); });
-  FUTURE_HALVINGS.forEach(iso=>{ shapes.push(lineAt(yearsFromISO(iso), true)); });
+  PAST_HALVINGS.forEach(iso=>{ shapes.push(lineAt(iso, false)); });
+  FUTURE_HALVINGS.forEach(iso=>{ shapes.push(lineAt(iso, true)); });
   return shapes;
 }
 btnHalvings.onclick=()=>{ halvingsOn=!halvingsOn;
@@ -1086,12 +1881,12 @@ btnHalvings.onclick=()=>{ halvingsOn=!halvingsOn;
   if(halvingsOn){
     Plotly.relayout(plotDiv, {shapes:[].concat(curr, makeHalvingShapes())});
     btnHalvings.classList.add('active');
-    btnHalvings.textContent='Halvings';
+    btnHalvings.setAttribute('aria-pressed', 'true');
   }else{
     const remain=(plotDiv.layout.shapes||[]).filter(s=>s.meta!=='halving');
     Plotly.relayout(plotDiv, {shapes:remain});
     btnHalvings.classList.remove('active');
-    btnHalvings.textContent='Halvings';
+    btnHalvings.setAttribute('aria-pressed', 'false');
   }
 };
 
@@ -1124,8 +1919,9 @@ function makeLiquidityShapes(){
 
   function vline(iso, color){
     const dashed = compareISO(iso, lastIso) > 0;
+    const xVal = isoToX(iso);
     return { type:'line', xref:'x', yref:'paper',
-      x0: yearsFromISO(iso), x1: yearsFromISO(iso), y0:0, y1:1,
+      x0: xVal, x1: xVal, y0:0, y1:1,
       line:{color:color, width:1.4, dash: dashed ? 'dash' : 'solid'},
       layer:'below', meta:'liquidity' };
   }
@@ -1140,12 +1936,12 @@ btnLiquidity.onclick = () => {
   if (liquidityOn){
     Plotly.relayout(plotDiv, {shapes:[].concat(curr, makeLiquidityShapes())});
     btnLiquidity.classList.add('active');
-    btnLiquidity.textContent = 'Liquidity';
+    btnLiquidity.setAttribute('aria-pressed', 'true');
   } else {
     const remain = (plotDiv.layout.shapes||[]).filter(s => s.meta!=='liquidity');
     Plotly.relayout(plotDiv, {shapes:remain});
     btnLiquidity.classList.remove('active');
-    btnLiquidity.textContent = 'Liquidity';
+    btnLiquidity.setAttribute('aria-pressed', 'false');
   }
 };
 
@@ -1161,6 +1957,7 @@ infoModal.addEventListener('click', (e)=>{ if(e.target===infoModal) infoModal.cl
 HTML = (HTML
     .replace("__PLOT_HTML__", plot_html)
     .replace("__PRECOMP__", json.dumps(PRECOMP))
+    .replace("__TIME_PERIODS__", json.dumps(TIME_PERIODS))
     .replace("__GENESIS__", GENESIS_DATE.strftime("%Y-%m-%d"))
     .replace("__END_ISO__", END_PROJ.strftime("%Y-%m-%d"))
     .replace("__LAST_PRICE_ISO__", LAST_PRICE_ISO)
@@ -1177,11 +1974,13 @@ HTML = (HTML
     .replace("__LIQ_START_ISO__", LIQ_START_ISO)
     .replace("__W_P__", str(W_P))
     .replace("__W_LIQ__", str(W_LIQ))
-    .replace("__W_HALV__", str(W_HALV))   # fixed typo here
+    .replace("__W_HALV__", str(W_HALV))
 )
 
 # ───────────────────────────── Write site ─────────────────────────────
 os.makedirs(os.path.dirname(OUTPUT_HTML), exist_ok=True)
+# Remove any surrogate characters that can't be encoded to UTF-8
+HTML_clean = re.sub(r'[\ud800-\udfff]', '', HTML)
 with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
-    f.write(HTML)
+    f.write(HTML_clean)
 print("Wrote", OUTPUT_HTML)
