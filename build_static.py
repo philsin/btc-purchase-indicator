@@ -414,18 +414,18 @@ def build_payload(df, denom_key=None):
     support_days = build_support_constant_rails(xs_days, ys)
 
     # Build OHLC for different candle intervals
-    y_col = "price" if denom_key is None else f"price_{denom_key.lower()}"
-    if y_col not in df.columns:
-        y_col = "price"
+    # CRITICAL: Use the properly denominated price series, not raw USD price
+    df_ohlc = df.copy()
+    df_ohlc['_denom_price'] = y.values  # This is already BTC/USD or BTC/GOLD etc.
 
-    # Weekly OHLC
-    ohlc_w = resample_ohlc(df.copy(), y_col, 'W')
+    # Weekly OHLC (using correctly denominated price)
+    ohlc_w = resample_ohlc(df_ohlc, '_denom_price', 'W')
     ohlc_w['x_years'] = years_since_genesis(ohlc_w['date'])
     ohlc_w['x_days'] = days_since_genesis(ohlc_w['date'])
     ohlc_w['date_iso'] = ohlc_w['date'].dt.strftime('%Y-%m-%d')
 
-    # Monthly OHLC
-    ohlc_m = resample_ohlc(df.copy(), y_col, 'ME')
+    # Monthly OHLC (using correctly denominated price)
+    ohlc_m = resample_ohlc(df_ohlc, '_denom_price', 'ME')
     ohlc_m['x_years'] = years_since_genesis(ohlc_m['date'])
     ohlc_m['x_days'] = days_since_genesis(ohlc_m['date'])
     ohlc_m['date_iso'] = ohlc_m['date'].dt.strftime('%Y-%m-%d')
@@ -641,23 +641,46 @@ input:focus{outline:none;border-color:#3b82f6;box-shadow:0 0 0 2px rgba(59,130,2
 .modal-card code{display:block;margin:8px 0;padding:10px;background:#f1f5f9;border-radius:6px;font-size:12px}
 
 /* Responsive */
+@media (max-width:1024px){
+  :root{--sidebar:260px}
+}
 @media (max-width:768px){
   .main{flex-direction:column}
-  .sidebar{width:100%;max-height:40vh;border-left:none;border-top:1px solid #e2e8f0}
-  .topbar{flex-wrap:wrap;height:auto;padding:8px 12px;gap:8px}
-  .topbar-title{width:100%}
+  .sidebar{width:100%;max-height:45vh;border-left:none;border-top:1px solid #e2e8f0;overflow-y:auto}
+  .topbar{flex-wrap:wrap;height:auto;padding:8px 12px;gap:6px}
+  .topbar-title{width:100%;margin-bottom:4px}
+  .topbar-controls{width:100%;justify-content:flex-start}
+  .topbar-controls select,.topbar-controls .btn{font-size:12px;padding:5px 8px}
+  .chart-area{min-height:50vh}
 }
+@media (max-width:480px){
+  .topbar-controls select{max-width:100px}
+  .readout-grid{grid-template-columns:1fr}
+  .cycle-info{grid-template-columns:1fr}
+  .proj-table{font-size:10px}
+  #predSignal{font-size:16px}
+}
+/* Focus styles for accessibility */
+:focus{outline:2px solid #3b82f6;outline-offset:2px}
+:focus:not(:focus-visible){outline:none}
+:focus-visible{outline:2px solid #3b82f6;outline-offset:2px}
+/* Skip link for keyboard users */
+.skip-link{position:absolute;top:-40px;left:0;background:#1e293b;color:#fff;padding:8px 16px;z-index:1000;transition:top 200ms}
+.skip-link:focus{top:0}
 .hidden{display:none}
 .smallnote{font-size:11px;color:#64748b}
+/* Screen reader only */
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 </style>
 </head><body>
+<a href="#leftCol" class="skip-link">Skip to chart</a>
 <div class="app">
   <!-- Top control bar -->
   <div class="topbar">
     <div class="topbar-title">BTC Power Law</div>
     <div class="topbar-controls">
-      <select id="denomSel" title="Denominator"></select>
-      <select id="periodSel" title="Time Period">
+      <select id="denomSel" title="Denominator" aria-label="Select price denominator"></select>
+      <select id="periodSel" title="Time Period" aria-label="Select time period">
         <option value="all">All Data</option>
         <option value="10y">Last 10 Years</option>
         <option value="5y">Last 5 Years</option>
@@ -665,18 +688,18 @@ input:focus{outline:none;border-color:#3b82f6;box-shadow:0 0 0 2px rgba(59,130,2
         <option value="1y">Last 1 Year</option>
         <option value="cycle">Current Cycle</option>
       </select>
-      <select id="xAxisSel" title="X-Axis Mode">
+      <select id="xAxisSel" title="X-Axis Mode" aria-label="Select X-axis display mode">
         <option value="days">Days Since Genesis</option>
         <option value="years">Years Since Genesis</option>
         <option value="date">Calendar Date</option>
       </select>
-      <select id="candleSel" title="Candle Interval">
+      <select id="candleSel" title="Candle Interval" aria-label="Select candle interval">
         <option value="D">Daily</option>
         <option value="W">Weekly</option>
         <option value="M">Monthly</option>
       </select>
-      <button id="halvingsBtn" class="btn" title="Toggle halvings">Halvings</button>
-      <button id="liquidityBtn" class="btn" title="Toggle liquidity cycle">Liquidity</button>
+      <button id="halvingsBtn" class="btn" title="Toggle halvings" aria-pressed="false">Halvings</button>
+      <button id="liquidityBtn" class="btn" title="Toggle liquidity cycle" aria-pressed="false">Liquidity</button>
       <div class="indicator-wrap">
         <button id="indicatorBtn" class="btn">Filter</button>
         <div id="indicatorMenu" class="indicator-menu">
@@ -763,7 +786,8 @@ input:focus{outline:none;border-color:#3b82f6;box-shadow:0 0 0 2px rgba(59,130,2
         </div>
         <div class="section-content" id="dateContent">
           <div class="adv-row">
-            <input type="date" id="datePick" style="flex:1"/>
+            <label for="datePick" class="sr-only">Select date</label>
+            <input type="date" id="datePick" aria-label="Select date to view" style="flex:1"/>
             <button id="setDateBtn" class="btn btn-sm">Go</button>
             <button id="todayBtn" class="btn btn-sm">Today</button>
           </div>
@@ -778,8 +802,8 @@ input:focus{outline:none;border-color:#3b82f6;box-shadow:0 0 0 2px rgba(59,130,2
         </div>
         <div class="section-content" id="toolsContent">
           <div class="adv-row">
-            <label>Level</label>
-            <input type="text" id="levelInput" placeholder="e.g. 50000" style="flex:1;min-width:80px"/>
+            <label for="levelInput">Level</label>
+            <input type="text" id="levelInput" placeholder="e.g. 50000" aria-label="Enter price level to draw horizontal line" style="flex:1;min-width:80px"/>
             <button id="addLevelBtn" class="btn btn-sm">Add</button>
             <button id="clearLevelsBtn" class="btn btn-sm">Clear</button>
           </div>
@@ -1857,12 +1881,12 @@ btnHalvings.onclick=()=>{ halvingsOn=!halvingsOn;
   if(halvingsOn){
     Plotly.relayout(plotDiv, {shapes:[].concat(curr, makeHalvingShapes())});
     btnHalvings.classList.add('active');
-    btnHalvings.textContent='Halvings';
+    btnHalvings.setAttribute('aria-pressed', 'true');
   }else{
     const remain=(plotDiv.layout.shapes||[]).filter(s=>s.meta!=='halving');
     Plotly.relayout(plotDiv, {shapes:remain});
     btnHalvings.classList.remove('active');
-    btnHalvings.textContent='Halvings';
+    btnHalvings.setAttribute('aria-pressed', 'false');
   }
 };
 
@@ -1912,12 +1936,12 @@ btnLiquidity.onclick = () => {
   if (liquidityOn){
     Plotly.relayout(plotDiv, {shapes:[].concat(curr, makeLiquidityShapes())});
     btnLiquidity.classList.add('active');
-    btnLiquidity.textContent = 'Liquidity';
+    btnLiquidity.setAttribute('aria-pressed', 'true');
   } else {
     const remain = (plotDiv.layout.shapes||[]).filter(s => s.meta!=='liquidity');
     Plotly.relayout(plotDiv, {shapes:remain});
     btnLiquidity.classList.remove('active');
-    btnLiquidity.textContent = 'Liquidity';
+    btnLiquidity.setAttribute('aria-pressed', 'false');
   }
 };
 
