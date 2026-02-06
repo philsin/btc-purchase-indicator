@@ -23,7 +23,8 @@ OUTPUT_HTML  = "docs/index.html"
 
 GENESIS_DATE = datetime(2009, 1, 3)
 END_PROJ     = datetime(2040, 12, 31)
-X_START_DATE = datetime(2011, 1, 1)
+# Chart starts from Genesis block, not an arbitrary later date
+X_START_DATE = GENESIS_DATE
 
 RESID_WINSOR     = 0.02
 EPS_LOG_SPACING  = 0.010
@@ -249,27 +250,36 @@ base["x_years"]   = years_since_genesis(base["date"])
 base["x_days"]    = days_since_genesis(base["date"])
 base["date_iso"]  = base["date"].dt.strftime("%Y-%m-%d")
 
-first_dt = max(base["date"].iloc[0], X_START_DATE)
-max_dt   = END_PROJ
+# Grid always starts from Genesis block for consistent power law visualization
+# The actual data may start later, but the trend line extends to Genesis
+first_data_dt = base["date"].iloc[0]
+max_dt = END_PROJ
 
-x_start = float(years_since_genesis(pd.Series([first_dt])).iloc[0])
-x_end   = float(years_since_genesis(pd.Series([max_dt])).iloc[0])
-x_grid  = np.logspace(np.log10(max(1e-6, x_start)), np.log10(x_end), 700)
+# Years-based: Genesis = ~0.00274 years (1/365.25) to avoid log(0)
+x_genesis_years = 1.0 / 365.25  # Day 1 in years
+x_end_years = float(years_since_genesis(pd.Series([max_dt])).iloc[0])
+x_grid = np.logspace(np.log10(x_genesis_years), np.log10(x_end_years), 700)
 
-# Days-based grid (starting from day 1 = genesis)
-d_start = float(days_since_genesis(pd.Series([first_dt])).iloc[0])
-d_end   = float(days_since_genesis(pd.Series([max_dt])).iloc[0])
-x_grid_days = np.logspace(np.log10(max(1, d_start)), np.log10(d_end), 700)
+# Days-based: Genesis = day 1
+x_genesis_days = 1.0
+x_end_days = float(days_since_genesis(pd.Series([max_dt])).iloc[0])
+x_grid_days = np.logspace(np.log10(x_genesis_days), np.log10(x_end_days), 700)
 
-def year_ticks_log(first_dt, last_dt):
+# For chart initial range, start from first actual data point
+x_start = float(years_since_genesis(pd.Series([first_data_dt])).iloc[0])
+
+def year_ticks_log(last_dt):
+    """Generate x-axis tick values and labels starting from Genesis year (2009)."""
     vals, labs = [], []
-    for y in range(first_dt.year, last_dt.year+1):
-        d = datetime(y,1,1)
-        if y > 2020 and (y % 2 == 1):  # hide odd years after 2020
+    for y in range(GENESIS_DATE.year, last_dt.year+1):
+        d = datetime(y, 1, 1)
+        if y > 2020 and (y % 2 == 1):  # hide odd years after 2020 for clarity
             continue
         vy = float(years_since_genesis(pd.Series([d])).iloc[0])
-        if vy <= 0: continue
-        vals.append(vy); labs.append(str(y))
+        if vy <= 0:
+            continue
+        vals.append(vy)
+        labs.append(str(y))
     return vals, labs
 
 def y_ticks():
@@ -277,7 +287,7 @@ def y_ticks():
     labs = [f"{int(10**e):,}" for e in range(0,9)]
     return vals, labs
 
-xtickvals, xticktext = year_ticks_log(first_dt, max_dt)
+xtickvals, xticktext = year_ticks_log(max_dt)
 ytickvals, yticktext = y_ticks()
 
 def series_for_denom(df, key):
@@ -392,6 +402,9 @@ traces += [
 ]
 
 fig = go.Figure(traces)
+# Genesis block x-coordinate for reference
+x_genesis_ref = 1.0 / 365.25  # Years since Genesis at day 1
+
 fig.update_layout(
     template="plotly_white",
     hovermode="x",
@@ -400,11 +413,24 @@ fig.update_layout(
     xaxis=dict(type="log", title=None, tickmode="array",
                tickvals=xtickvals, ticktext=xticktext,
                tickangle=0,
-               range=[np.log10(x_start), np.log10(x_end)]),
+               range=[np.log10(x_start), np.log10(x_end_years)]),
     yaxis=dict(type="log", title=P0["label"],
                tickmode="array", tickvals=ytickvals, ticktext=yticktext),
     margin=dict(l=60, r=20, t=20, b=50),
     autosize=True,
+    # Add Genesis block reference line
+    shapes=[dict(
+        type="line", xref="x", yref="paper",
+        x0=x_genesis_ref, x1=x_genesis_ref, y0=0, y1=1,
+        line=dict(color="#F59E0B", width=1.5, dash="dot"),
+        layer="below"
+    )],
+    annotations=[dict(
+        x=np.log10(x_genesis_ref), y=1, xref="x", yref="paper",
+        text="Genesis<br>Jan 3, 2009", showarrow=False,
+        font=dict(size=10, color="#F59E0B"),
+        xanchor="left", yanchor="top", xshift=5
+    )]
 )
 
 # Ensure double-click resets axes (desktop + iOS Safari)
