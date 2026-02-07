@@ -34,15 +34,21 @@ COL_BTC          = "#000000"
 PAST_HALVINGS   = ["2012-11-28", "2016-07-09", "2020-05-11", "2024-04-20"]
 FUTURE_HALVINGS = ["2028-04-20", "2032-04-20", "2036-04-19", "2040-04-19"]
 
-# Liquidity (65-month wave)
+# Liquidity (65-month wave) - visual overlay only, not in composite
 LIQ_PEAK_ANCHOR_ISO = "2015-02-01"  # PEAK (red)
 LIQ_PERIOD_MONTHS   = 65
 LIQ_START_ISO       = "2009-01-03"
 
-# Composite weights (tweakable)
-W_P   = 1.00   # rails p (centered at 50)
-W_LIQ = 0.60   # liquidity rising/falling (cosine of phase)
-W_HALV= 0.60   # halving window (+1 pre, +0.5 post, −0.5 late)
+# Fourier Fundamental Wave (Perrenod analysis)
+# Based on Stephen Perrenod's research predicting ~2027 peak
+# Cycle period ~4 years, amplitude modulated by power law growth
+FOURIER_PERIOD_YEARS = 4.0  # Approximate halving cycle
+FOURIER_PHASE_OFFSET = 0.75  # Phase offset to align with historical tops
+FOURIER_PEAK_2027 = "2027-10-01"  # Projected peak from Perrenod's analysis
+
+# NEW Composite weights: Oscillator + Position only (no liquidity/halving)
+W_OSC = 0.60   # Primary signal: Power Law Oscillator
+W_POS = 0.40   # Secondary: Position percentile (normalized)
 
 # Auto denominators
 AUTO_DENOMS = {
@@ -311,10 +317,15 @@ def quantile_fit_loglog(x_years, y_vals, q=0.5):
     res = QuantReg(ylog, X).fit(q=q)
     a0 = float(res.params["const"]); b = float(res.params["logx"])
     resid = ylog - (a0 + b*xlog)
-    return a0, b, resid
+    # Calculate R² (coefficient of determination) for model fit quality
+    y_pred = a0 + b*xlog
+    ss_res = np.sum(resid**2)
+    ss_tot = np.sum((ylog - np.mean(ylog))**2)
+    r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+    return a0, b, resid, float(r_squared)
 
 def build_support_constant_rails(x_years, y_vals):
-    a0, b, resid = quantile_fit_loglog(x_years, y_vals, q=0.5)
+    a0, b, resid, r_squared = quantile_fit_loglog(x_years, y_vals, q=0.5)
     r = winsorize(resid, RESID_WINSOR) if RESID_WINSOR else resid
     med = float(np.nanmedian(r))
     q_grid = np.linspace(0.01, 0.99, 99)
@@ -330,7 +341,8 @@ def build_support_constant_rails(x_years, y_vals):
             "q_grid":[float(q) for q in q_grid],
             "off_grid":[float(v) for v in off_grid],
             "resid_min": resid_min,
-            "resid_max": resid_max}
+            "resid_max": resid_max,
+            "r_squared": r_squared}
 
 # ───────────────────────── Build model ─────────────────────────
 btc = fetch_btc_csv().rename(columns={"price":"btc"})
@@ -360,8 +372,10 @@ x_genesis_days = 1.0
 x_end_days = float(days_since_genesis(pd.Series([max_dt])).iloc[0])
 x_grid_days = np.logspace(np.log10(x_genesis_days), np.log10(x_end_days), 700)
 
-# For chart initial range, start from first actual data point
-x_start = float(years_since_genesis(pd.Series([first_data_dt])).iloc[0])
+# For chart initial range, start from 2011 to avoid visual drop from early low prices
+MIN_CHART_START = datetime(2011, 1, 1)
+chart_start_dt = max(first_data_dt, MIN_CHART_START)
+x_start = float(years_since_genesis(pd.Series([chart_start_dt])).iloc[0])
 
 def year_ticks_log(last_dt):
     """Generate x-axis tick values and labels starting from Genesis year (2009)."""
@@ -680,11 +694,18 @@ select:focus,input:focus{outline:none;border-color:#3b82f6}
         </div>
         <div class="signal-bar"></div>
         <div class="signal-marker" id="oscMarker"></div>
+      </div>
+
+      <!-- Stats Panel -->
+      <div class="sidebar-section">
         <div class="readout-compact">
           <div class="readout-item"><span class="readout-label">Date</span><span class="readout-value" id="readoutDate">\u2014</span></div>
           <div class="readout-item"><span class="readout-label">Price</span><span class="readout-value" id="mainVal">\u2014</span></div>
+          <div class="readout-item"><span class="readout-label">Power Law</span><span class="readout-value" id="plPrice">\u2014</span></div>
+          <div class="readout-item"><span class="readout-label">R\u00b2</span><span class="readout-value" id="rSquared">\u2014</span></div>
           <div class="readout-item"><span class="readout-label">Position</span><span class="readout-value" id="pPct">\u2014</span></div>
           <div class="readout-item"><span class="readout-label">Oscillator</span><span class="readout-value" id="oscVal">\u2014</span></div>
+          <div class="readout-item"><span class="readout-label">Composite</span><span class="readout-value" id="compVal">\u2014</span></div>
         </div>
       </div>
 
@@ -728,8 +749,14 @@ select:focus,input:focus{outline:none;border-color:#3b82f6}
             </select>
           </div>
           <div class="setting-row">
+            <label>Overlays</label>
+          </div>
+          <div class="setting-row">
             <button id="halvingsBtn" class="btn" style="flex:1">Halvings</button>
             <button id="liquidityBtn" class="btn" style="flex:1">Liquidity</button>
+          </div>
+          <div class="setting-row">
+            <button id="fourierBtn" class="btn" style="flex:1">Fourier Wave</button>
           </div>
         </div>
       </div>
@@ -740,12 +767,14 @@ select:focus,input:focus{outline:none;border-color:#3b82f6}
 <!-- Info modal -->
 <div id="infoModal" class="modal-overlay">
   <div class="modal-card">
-    <h3>Bitcoin Power Law</h3>
-    <p>Bitcoin's price follows a power law: <b>P = 10^a x t^b</b> where b is approximately 5.8. On a log-log chart, this creates a straight line with R squared of about 0.95.</p>
-    <code>log(Price) = a + b x log(years_since_genesis)</code>
-    <p><b>Position:</b> Where price sits within the power law corridor (0-100%). Low = undervalued, high = overvalued.</p>
-    <p><b>Oscillator:</b> Normalized deviation from trend (-1 to +1). Historical tops occur at 0.8-0.9.</p>
-    <p style="font-size:10px;color:#64748b;margin-top:16px">Sources: Santostasi, Burger, Perrenod</p>
+    <h3>Bitcoin Power Law Indicator</h3>
+    <p><b>The Power Law:</b> Bitcoin's price follows P = 10^a \u00d7 t^b where b \u2248 5.8. On a log-log chart, this forms a straight line.</p>
+    <code>log(Price) = a + b \u00d7 log(years_since_genesis)</code>
+    <p><b>Position (p):</b> Location within the power law corridor (0-100%). Low = undervalued, high = overvalued.</p>
+    <p><b>Oscillator:</b> Normalized log-deviation from trend (-1 to +1). All 4 historical ATHs occurred at 0.8-0.9.</p>
+    <p><b>Composite Signal:</b> 60% Oscillator + 40% Position. Removes noise from liquidity/halving timing.</p>
+    <p><b>Fourier Wave:</b> Fundamental mode from Perrenod's analysis, projecting ~2027 cycle peak.</p>
+    <p style="font-size:10px;color:#64748b;margin-top:16px;border-top:1px solid #334155;padding-top:8px"><b>Sources:</b> Santostasi (2014), Burger (2019), Perrenod (2024)</p>
     <div style="text-align:right;margin-top:12px"><button id="infoClose" class="btn">Close</button></div>
   </div>
 </div>
@@ -770,12 +799,16 @@ const LIQ_PEAK_ANCHOR_ISO = '__LIQ_PEAK_ANCHOR_ISO__';
 const LIQ_PERIOD_MONTHS   = __LIQ_PERIOD_MONTHS__;
 const LIQ_START_ISO       = '__LIQ_START_ISO__';
 
-const W_P   = __W_P__;
-const W_LIQ = __W_LIQ__;
-const W_HALV= __W_HALV__;
+// NEW Composite weights: Oscillator + Position only
+const W_OSC = __W_OSC__;  // 0.60 - Primary: Oscillator
+const W_POS = __W_POS__;  // 0.40 - Secondary: Position
+
+// Fourier wave parameters (Perrenod analysis)
+const FOURIER_PERIOD_YEARS = __FOURIER_PERIOD_YEARS__;
+const FOURIER_PEAK_2027 = '__FOURIER_PEAK_2027__';
 
 // X-axis mode: 'years' or 'days'
-let xAxisMode = 'days';
+let xAxisMode = 'years';  // Default to years for better power law visualization
 let candleMode = 'D';  // D=daily, W=weekly, M=monthly
 
 const MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -908,47 +941,56 @@ function getHistoricalContext(osc, p){
   }
 }
 
-// Prediction signal based on oscillator AND p-value (position in corridor)
-// More refined signals using both metrics
+// NEW Composite Score: Oscillator (60%) + Position (40%)
+// Position is normalized: (50 - p) / 50, so low p = positive, high p = negative
+function computeComposite(osc, p){
+  const normalizedPos = (50 - p) / 50;  // +1 at p=0, 0 at p=50, -1 at p=100
+  return W_OSC * osc + W_POS * normalizedPos;
+}
+
+// Signal thresholds - check extremes FIRST, then use composite for middle zone
 function getPredictionSignal(osc, p){
-  // SELL ZONES - oscillator-driven but confirmed by p-value
-  if (osc >= 0.85 || (osc >= 0.7 && p >= 90)) {
-    return {signal: '\u26a0\ufe0f SELL ZONE', color: '#DC2626', bg: '#FEE2E2',
-      reason: 'Oscillator \u2265'+(osc>=0.85?'0.85':'0.70')+' + Position '+(p>=90?'\u226590%':p.toFixed(0)+'%')+': All historical ATHs. Take profits.'};
+  const comp = computeComposite(osc, p);
+
+  // === EXTREME SELL SIGNALS (check first) ===
+  // TOP INBOUND: Oscillator > 0.8 AND Position > 85%
+  if (osc > 0.8 && p > 85) {
+    return {signal: 'TOP INBOUND', color: '#DC2626', bg: '#450a0a',
+      reason: 'Osc '+osc.toFixed(2)+' + Pos '+p.toFixed(0)+'%: All 4 ATHs occurred here. SELL.', comp};
   }
-  if (osc >= 0.6 || p >= 85) {
-    return {signal: '\u2b06\ufe0f PRE-SELL', color: '#F97316', bg: '#FFF7ED',
-      reason: 'Oscillator '+osc.toFixed(2)+', Position '+p.toFixed(0)+'%: Approaching top zone. Prepare exit strategy.'};
+  // FROTHY: Oscillator > 0.6 AND Position > 75%
+  if (osc > 0.6 && p > 75) {
+    return {signal: 'FROTHY', color: '#F97316', bg: '#431407',
+      reason: 'Osc '+osc.toFixed(2)+' + Pos '+p.toFixed(0)+'%: Nearing cycle top. Take profits.', comp};
   }
-  // AVOID ZONE - poor entry points
-  if (p >= 75 && osc >= 0.3) {
-    return {signal: '\u26d4 AVOID', color: '#EF4444', bg: '#FEF2F2',
-      reason: 'Position '+p.toFixed(0)+'% (upper corridor): Historically poor entry. Wait for better prices.'};
+
+  // === EXTREME BUY SIGNALS (check BEFORE DCA!) ===
+  // SELL THE HOUSE: Oscillator < -0.7 AND Position < 15%
+  if (osc < -0.7 && p < 15) {
+    return {signal: 'SELL THE HOUSE', color: '#A855F7', bg: '#3b0764',
+      reason: 'Osc '+osc.toFixed(2)+' + Pos '+p.toFixed(0)+'%: Extreme undervalue. MAX BUY!', comp};
   }
-  if (osc >= 0.4) {
-    return {signal: '\u2197\ufe0f ELEVATED', color: '#EAB308', bg: '#FEFCE8',
-      reason: 'Oscillator '+osc.toFixed(2)+': Above fair value. Hold positions, be cautious adding.'};
+  // STRONG BUY: Oscillator < -0.5 AND Position < 25%
+  if (osc < -0.5 && p < 25) {
+    return {signal: 'STRONG BUY', color: '#3B82F6', bg: '#1e3a8a',
+      reason: 'Osc '+osc.toFixed(2)+' + Pos '+p.toFixed(0)+'%: Deep value. Aggressive accumulation.', comp};
   }
-  // FAIR VALUE - good for DCA
-  if (osc >= -0.2) {
-    return {signal: '\u2705 FAIR VALUE', color: '#16A34A', bg: '#F0FDF4',
-      reason: 'Oscillator '+osc.toFixed(2)+', Position '+p.toFixed(0)+'%: Near trend. Good DCA zone.'};
+
+  // === MODERATE SIGNALS ===
+  // HOLD ON: Oscillator > 0.4 OR Position > 65%
+  if (osc > 0.4 || p > 65) {
+    return {signal: 'HOLD ON', color: '#EAB308', bg: '#422006',
+      reason: 'Osc '+osc.toFixed(2)+', Pos '+p.toFixed(0)+'%: Above trend. Hold, don\u2019t add.', comp};
   }
-  // ACCUMULATION ZONES - p-value driven
-  if (p <= 25 || osc <= -0.5) {
-    if (osc <= -0.8 || p <= 10) {
-      return {signal: '\ud83d\udea8 EXTREME BUY', color: '#7C3AED', bg: '#F5F3FF',
-        reason: 'Position '+p.toFixed(0)+'%, Oscillator '+osc.toFixed(2)+': Extreme undervaluation. Rare opportunity!'};
-    }
-    if (osc <= -0.5 || p <= 15) {
-      return {signal: '\ud83d\udcb0 STRONG BUY', color: '#2563EB', bg: '#EFF6FF',
-        reason: 'Position '+p.toFixed(0)+'% (lower corridor): Historically excellent entry. Aggressive accumulation.'};
-    }
-    return {signal: '\u2b07\ufe0f ACCUMULATE', color: '#0EA5E9', bg: '#F0F9FF',
-      reason: 'Position '+p.toFixed(0)+'%, Oscillator '+osc.toFixed(2)+': Below trend. Good buying opportunity.'};
+  // BUY: Oscillator < -0.3 OR Position < 35%
+  if (osc < -0.3 || p < 35) {
+    return {signal: 'BUY', color: '#0EA5E9', bg: '#0c4a6e',
+      reason: 'Osc '+osc.toFixed(2)+', Pos '+p.toFixed(0)+'%: Below trend. Good entry.', comp};
   }
-  return {signal: '\u2b07\ufe0f ACCUMULATE', color: '#0EA5E9', bg: '#F0F9FF',
-    reason: 'Oscillator '+osc.toFixed(2)+': Below fair value. Consider adding.'};
+
+  // === DEFAULT: DCA ===
+  return {signal: 'DCA', color: '#22C55E', bg: '#14532d',
+    reason: 'Osc '+osc.toFixed(2)+', Pos '+p.toFixed(0)+'%: Fair value zone. Good for DCA.', comp};
 }
 
 function fmtVal(P, v){
@@ -987,15 +1029,20 @@ const btnToday=document.getElementById('todayBtn');
 const btnTodayMobile=document.getElementById('todayBtnMobile');
 const btnHalvings=document.getElementById('halvingsBtn');
 const btnLiquidity=document.getElementById('liquidityBtn');
+const btnFourier=document.getElementById('fourierBtn');
 const infoBtn=document.getElementById('infoBtn');
 const infoModal=document.getElementById('infoModal');
 const infoClose=document.getElementById('infoClose');
 const settingsBtn=document.getElementById('settingsBtn');
 
+// Stats panel elements
 const elDate=document.getElementById('readoutDate');
 const elMain=document.getElementById('mainVal');
+const elPlPrice=document.getElementById('plPrice');
+const elRSquared=document.getElementById('rSquared');
 const elP=document.getElementById('pPct');
 const oscValEl=document.getElementById('oscVal');
+const elCompVal=document.getElementById('compVal');
 const periodSel=document.getElementById('periodSel');
 const xAxisSel=document.getElementById('xAxisSel');
 const candleSel=document.getElementById('candleSel');
@@ -1095,39 +1142,6 @@ function percentFromOffset(P, off){
   return 100*(q[lo] + t*(q[hi]-q[lo]));
 }
 
-// Liquidity & halving utilities
-function liqCosAtISO(iso){
-  const m = monthsBetweenISO(LIQ_PEAK_ANCHOR_ISO, iso);
-  const ang = 2*Math.PI*m/LIQ_PERIOD_MONTHS;
-  return Math.cos(ang); // >0 rising; <0 falling
-}
-function halvingScoreAtISO(iso){
-  let last = null, next = null;
-  for (const h of PAST_HALVINGS.concat(FUTURE_HALVINGS)){
-    if (h <= iso) last = h;
-    if (h > iso){ next = h; break; }
-  }
-  let s = 0;
-  if (next){
-    const d = daysBetweenISO(iso, next);
-    if (d >= 0 && d <= 365) s += 1.0; // pre-halving year
-  }
-  if (last){
-    const d = daysBetweenISO(last, iso);
-    if (d > 0 && d <= 540) s += 0.5;   // early post-halving
-    if (d > 540)           s -= 0.5;   // late post-halving
-  }
-  return s;
-}
-
-// Composite
-function zFromP(p){ return (50 - p)/25; } // +1 at p=25, 0 at p=50, −1 at p=75
-function compositeFrom(p, iso){
-  const liq = liqCosAtISO(iso);       // −1..+1
-  const halv= halvingScoreAtISO(iso); // −0.5..+1.5
-  const score = W_P*zFromP(p) + W_LIQ*liq + W_HALV*halv;
-  return score;
-}
 // Power Law Oscillator: normalize log-deviation from trend to [-1, +1]
 function oscillatorFromDeviation(P, logDev){
   const sup = getSupport(P);
@@ -1175,7 +1189,7 @@ function renderRails(P){
   Plotly.restyle(plotDiv, {x:[xg], y:[seriesForPercent(P,50)]}, [IDX_CARRY]);
 }
 
-// Panel update (simplified)
+// Panel update with full stats
 function updatePanel(P, xVal){
   const iso = xToISO(xVal);
   elDate.textContent = xToShortDate(xVal);
@@ -1183,31 +1197,47 @@ function updatePanel(P, xVal){
   const xg = getXGrid(P);
   const v50series = seriesForPercent(P,50);
   const v50 = interp(xg, v50series, xVal);
+  const sup = getSupport(P);
 
   const xMain = getXMain(P);
   const lastX = xMain[xMain.length-1];
-  let usedP=null, mainTxt='', logDev=0;
+  let usedP=null, mainTxt='', logDev=0, actualPrice=0;
 
   if (xVal > lastX){
     mainTxt = fmtVal(P, v50) + ' (50%)';
     elP.textContent = '\u2014';
     usedP = 50;
     logDev = 0;
+    actualPrice = v50;
   } else {
     const yMain = getYMain(P);
     let idx=0,best=1e99; for(let i=0;i<xMain.length;i++){ const d=Math.abs(xMain[i]-xVal); if(d<best){best=d; idx=i;} }
     const y=yMain[idx]; mainTxt = fmtVal(P,y);
-    const sup=getSupport(P), z=Math.log10(xMain[idx]);
+    actualPrice = y;
+    const z=Math.log10(xMain[idx]);
     logDev = Math.log10(y) - (sup.a0 + sup.b*z);
     usedP=clamp(percentFromOffset(P, logDev), 0, 100);
     elP.textContent=usedP.toFixed(1)+'%';
   }
   elMain.textContent = mainTxt;
 
+  // Power Law Price (50th percentile = fair value)
+  if(elPlPrice) elPlPrice.textContent = fmtVal(P, v50);
+
+  // R\u00b2 value from regression
+  if(elRSquared) elRSquared.textContent = (sup.r_squared || 0.95).toFixed(3);
+
   // Power Law Oscillator
   const osc = oscillatorFromDeviation(P, logDev);
   const oscCol = oscillatorColor(osc);
   if(oscValEl){ oscValEl.textContent = osc.toFixed(3); oscValEl.style.color = oscCol; }
+
+  // Composite score (new formula: oscillator + position)
+  const comp = computeComposite(osc, usedP);
+  if(elCompVal){
+    elCompVal.textContent = comp.toFixed(2);
+    elCompVal.style.color = comp > 0.3 ? '#22C55E' : (comp < -0.3 ? '#EF4444' : '#EAB308');
+  }
 
   // Prediction Signal
   const pred = getPredictionSignal(osc, usedP);
@@ -1451,6 +1481,54 @@ btnLiquidity.onclick = () => {
   }
 };
 
+// Fourier Fundamental Wave toggle (Perrenod analysis)
+let fourierOn = false;
+function makeFourierWaveTrace(){
+  // Generate Fourier fundamental wave based on Perrenod's analysis
+  // Wave peaks around 2027, with ~4 year period matching halving cycles
+  const P = PRECOMP[denomSel.value];
+  const xg = getXGrid(P);
+  const sup = getSupport(P);
+
+  // Peak in late 2027 (Perrenod projection)
+  const peakYears = yearsFromISO(FOURIER_PEAK_2027);
+
+  // Wave parameters: amplitude based on historical deviation range
+  const amplitude = (sup.resid_max - sup.resid_min) * 0.3;  // 30% of range
+  const period = FOURIER_PERIOD_YEARS;
+
+  // Generate wave: sin function offset to peak at 2027
+  const waveY = xg.map(x => {
+    const phase = 2 * Math.PI * (x - peakYears) / period + Math.PI/2;  // Peak at 2027
+    const logWave = sup.a0 + sup.b * Math.log10(x) + amplitude * Math.sin(phase);
+    return Math.pow(10, logWave);
+  });
+
+  return {
+    x: xg,
+    y: waveY,
+    mode: 'lines',
+    name: 'Fourier Wave',
+    line: {color: 'rgba(168, 85, 247, 0.5)', width: 2, dash: 'dot'},
+    hoverinfo: 'skip',
+    showlegend: false
+  };
+}
+if(btnFourier) btnFourier.onclick = () => {
+  fourierOn = !fourierOn;
+  if (fourierOn){
+    const trace = makeFourierWaveTrace();
+    Plotly.addTraces(plotDiv, trace);
+    btnFourier.classList.add('active');
+  } else {
+    // Remove Fourier trace (it's the last one added)
+    const data = plotDiv.data;
+    const idx = data.findIndex(t => t.name === 'Fourier Wave');
+    if(idx >= 0) Plotly.deleteTraces(plotDiv, idx);
+    btnFourier.classList.remove('active');
+  }
+};
+
 // Info modal
 infoBtn.onclick = ()=>{ infoModal.classList.add('open'); };
 infoClose.onclick = ()=>{ infoModal.classList.remove('open'); };
@@ -1478,9 +1556,10 @@ HTML = (HTML
     .replace("__LIQ_PEAK_ANCHOR_ISO__", LIQ_PEAK_ANCHOR_ISO)
     .replace("__LIQ_PERIOD_MONTHS__", str(LIQ_PERIOD_MONTHS))
     .replace("__LIQ_START_ISO__", LIQ_START_ISO)
-    .replace("__W_P__", str(W_P))
-    .replace("__W_LIQ__", str(W_LIQ))
-    .replace("__W_HALV__", str(W_HALV))
+    .replace("__W_OSC__", str(W_OSC))
+    .replace("__W_POS__", str(W_POS))
+    .replace("__FOURIER_PERIOD_YEARS__", str(FOURIER_PERIOD_YEARS))
+    .replace("__FOURIER_PEAK_2027__", FOURIER_PEAK_2027)
 )
 
 # ───────────────────────────── Write site ─────────────────────────────
