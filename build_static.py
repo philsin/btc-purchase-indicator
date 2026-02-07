@@ -372,8 +372,10 @@ x_genesis_days = 1.0
 x_end_days = float(days_since_genesis(pd.Series([max_dt])).iloc[0])
 x_grid_days = np.logspace(np.log10(x_genesis_days), np.log10(x_end_days), 700)
 
-# For chart initial range, start from first actual data point
-x_start = float(years_since_genesis(pd.Series([first_data_dt])).iloc[0])
+# For chart initial range, start from 2011 to avoid visual drop from early low prices
+MIN_CHART_START = datetime(2011, 1, 1)
+chart_start_dt = max(first_data_dt, MIN_CHART_START)
+x_start = float(years_since_genesis(pd.Series([chart_start_dt])).iloc[0])
 
 def year_ticks_log(last_dt):
     """Generate x-axis tick values and labels starting from Genesis year (2009)."""
@@ -946,11 +948,11 @@ function computeComposite(osc, p){
   return W_OSC * osc + W_POS * normalizedPos;
 }
 
-// Signal thresholds based on composite score
-// Composite ranges from approx -1.0 (extreme sell) to +1.0 (extreme buy)
+// Signal thresholds - check extremes FIRST, then use composite for middle zone
 function getPredictionSignal(osc, p){
   const comp = computeComposite(osc, p);
 
+  // === EXTREME SELL SIGNALS (check first) ===
   // TOP INBOUND: Oscillator > 0.8 AND Position > 85%
   if (osc > 0.8 && p > 85) {
     return {signal: 'TOP INBOUND', color: '#DC2626', bg: '#450a0a',
@@ -961,34 +963,34 @@ function getPredictionSignal(osc, p){
     return {signal: 'FROTHY', color: '#F97316', bg: '#431407',
       reason: 'Osc '+osc.toFixed(2)+' + Pos '+p.toFixed(0)+'%: Nearing cycle top. Take profits.', comp};
   }
+
+  // === EXTREME BUY SIGNALS (check BEFORE DCA!) ===
+  // SELL THE HOUSE: Oscillator < -0.7 AND Position < 15%
+  if (osc < -0.7 && p < 15) {
+    return {signal: 'SELL THE HOUSE', color: '#A855F7', bg: '#3b0764',
+      reason: 'Osc '+osc.toFixed(2)+' + Pos '+p.toFixed(0)+'%: Extreme undervalue. MAX BUY!', comp};
+  }
+  // STRONG BUY: Oscillator < -0.5 AND Position < 25%
+  if (osc < -0.5 && p < 25) {
+    return {signal: 'STRONG BUY', color: '#3B82F6', bg: '#1e3a8a',
+      reason: 'Osc '+osc.toFixed(2)+' + Pos '+p.toFixed(0)+'%: Deep value. Aggressive accumulation.', comp};
+  }
+
+  // === MODERATE SIGNALS ===
   // HOLD ON: Oscillator > 0.4 OR Position > 65%
   if (osc > 0.4 || p > 65) {
     return {signal: 'HOLD ON', color: '#EAB308', bg: '#422006',
       reason: 'Osc '+osc.toFixed(2)+', Pos '+p.toFixed(0)+'%: Above trend. Hold, don\u2019t add.', comp};
   }
-  // DCA: Neutral zone (composite between -0.3 and +0.3)
-  if (comp >= -0.3 && comp <= 0.3) {
-    return {signal: 'DCA', color: '#22C55E', bg: '#14532d',
-      reason: 'Osc '+osc.toFixed(2)+', Pos '+p.toFixed(0)+'%: Fair value zone. Good for DCA.', comp};
-  }
   // BUY: Oscillator < -0.3 OR Position < 35%
   if (osc < -0.3 || p < 35) {
-    // STRONG BUY: Oscillator < -0.5 AND Position < 25%
-    if (osc < -0.5 && p < 25) {
-      // SELL THE HOUSE: Oscillator < -0.7 AND Position < 15%
-      if (osc < -0.7 && p < 15) {
-        return {signal: 'SELL THE HOUSE', color: '#A855F7', bg: '#3b0764',
-          reason: 'Osc '+osc.toFixed(2)+' + Pos '+p.toFixed(0)+'%: Extreme undervalue. MAX BUY!', comp};
-      }
-      return {signal: 'STRONG BUY', color: '#3B82F6', bg: '#1e3a8a',
-        reason: 'Osc '+osc.toFixed(2)+' + Pos '+p.toFixed(0)+'%: Deep value. Aggressive accumulation.', comp};
-    }
     return {signal: 'BUY', color: '#0EA5E9', bg: '#0c4a6e',
       reason: 'Osc '+osc.toFixed(2)+', Pos '+p.toFixed(0)+'%: Below trend. Good entry.', comp};
   }
-  // Default: DCA
+
+  // === DEFAULT: DCA ===
   return {signal: 'DCA', color: '#22C55E', bg: '#14532d',
-    reason: 'Osc '+osc.toFixed(2)+', Pos '+p.toFixed(0)+'%: Near fair value.', comp};
+    reason: 'Osc '+osc.toFixed(2)+', Pos '+p.toFixed(0)+'%: Fair value zone. Good for DCA.', comp};
 }
 
 function fmtVal(P, v){
